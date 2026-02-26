@@ -64,18 +64,15 @@ pub struct SymbolTable {
 }
 
 #[derive(Clone, Debug)]
-pub struct ResolvedModule<'a> {
+pub struct ResolvedModule {
     pub module_id: ModuleId,
     pub path: String,
-    pub ast: &'a AstFile,
+    pub ast: AstFile,
     pub symbol_table: SymbolTable,
     pub resolved_imports: Vec<(String, FQN)>,
 }
 
-pub fn resolve_modules<'a>(
-    files: &'a [AstFile],
-    diag: &mut DiagnosticBag,
-) -> Result<Vec<ResolvedModule<'a>>, ()> {
+pub fn resolve_modules(files: &[AstFile], diag: &mut DiagnosticBag) -> Result<Vec<ResolvedModule>, ()> {
     let before = diag.error_count();
 
     let mut seen_modules: HashMap<String, usize> = HashMap::new();
@@ -100,8 +97,8 @@ pub fn resolve_modules<'a>(
 
         modules.push(ResolvedModule {
             module_id: ModuleId(idx as u32),
-            path: module_fs_path(&file.header.node.module_path.node),
-            ast: file,
+            path: module_path.clone(),
+            ast: file.clone(),
             symbol_table,
             resolved_imports: default_lang_item_imports(),
         });
@@ -112,7 +109,7 @@ pub fn resolve_modules<'a>(
     let mut global_index: HashMap<(String, String), String> = HashMap::new();
 
     for module in &modules {
-        let module_path = module_path_str(module.ast);
+        let module_path = module_path_str(&module.ast);
         for (name, sym) in &module.symbol_table.functions {
             fn_index.insert((module_path.clone(), name.clone()), sym.fqn.clone());
         }
@@ -126,7 +123,7 @@ pub fn resolve_modules<'a>(
 
     for module in &mut modules {
         let mut imports = default_lang_item_import_map();
-        let module_path = module_path_str(module.ast);
+        let module_path = module_path_str(&module.ast);
 
         for group in &module.ast.header.node.imports {
             let imported_module = group.node.module_path.to_string();
@@ -225,13 +222,13 @@ pub fn resolve_modules<'a>(
     }
 
     for module in &mut modules {
-        let module_path = module_path_str(module.ast);
+        let module_path = module_path_str(&module.ast);
         let import_map: HashMap<String, String> = module
             .resolved_imports
             .iter()
             .cloned()
             .collect::<HashMap<_, _>>();
-        let value_types = collect_local_value_types(module.ast);
+        let value_types = collect_local_value_types(&module.ast);
         let mut type_ctx = TypeCtx::new();
 
         for decl in &module.ast.decls {
@@ -431,18 +428,18 @@ pub fn sig_digest(sig_core: &str) -> String {
 }
 
 pub fn lower_to_hir(
-    resolved: &ResolvedModule<'_>,
+    resolved: &ResolvedModule,
     type_ctx: &mut TypeCtx,
     diag: &mut DiagnosticBag,
 ) -> Result<HirModule, ()> {
     let before = diag.error_count();
-    let module_path = module_path_str(resolved.ast);
+    let module_path = module_path_str(&resolved.ast);
     let import_map: HashMap<String, String> = resolved
         .resolved_imports
         .iter()
         .cloned()
         .collect::<HashMap<_, _>>();
-    let value_types = collect_local_value_types(resolved.ast);
+    let value_types = collect_local_value_types(&resolved.ast);
 
     let mut type_decls = Vec::new();
     for decl in &resolved.ast.decls {
@@ -678,7 +675,7 @@ fn lower_instr(
     instr: &AstInstr,
     span: Span,
     module_path: &str,
-    resolved: &ResolvedModule<'_>,
+    resolved: &ResolvedModule,
     import_map: &HashMap<String, String>,
     value_types: &HashSet<String>,
     local_ids: &mut HashMap<String, LocalId>,
@@ -765,7 +762,7 @@ fn lower_instr(
 fn lower_op(
     op: &AstOp,
     module_path: &str,
-    resolved: &ResolvedModule<'_>,
+    resolved: &ResolvedModule,
     import_map: &HashMap<String, String>,
     value_types: &HashSet<String>,
     locals: &HashMap<String, LocalId>,
@@ -2048,7 +2045,7 @@ fn lower_op(
 fn lower_op_void(
     op: &AstOpVoid,
     module_path: &str,
-    resolved: &ResolvedModule<'_>,
+    resolved: &ResolvedModule,
     import_map: &HashMap<String, String>,
     value_types: &HashSet<String>,
     locals: &HashMap<String, LocalId>,
@@ -2467,7 +2464,7 @@ fn lower_op_void(
 fn lower_terminator(
     term: &AstTerminator,
     module_path: &str,
-    resolved: &ResolvedModule<'_>,
+    resolved: &ResolvedModule,
     import_map: &HashMap<String, String>,
     value_types: &HashSet<String>,
     locals: &HashMap<String, LocalId>,
@@ -3488,7 +3485,7 @@ fn insert_sig_symbol(
 fn resolve_fn_sid(
     callee: &str,
     module_path: &str,
-    resolved: &ResolvedModule<'_>,
+    resolved: &ResolvedModule,
     import_map: &HashMap<String, String>,
 ) -> Sid {
     if let Some(sym) = resolved.symbol_table.functions.get(callee) {
@@ -3527,7 +3524,7 @@ fn resolve_sig_sid(
     generate_sid('E', &fqn)
 }
 
-fn resolve_type_sid(name: &str, module_path: &str, resolved: &ResolvedModule<'_>) -> Sid {
+fn resolve_type_sid(name: &str, module_path: &str, resolved: &ResolvedModule) -> Sid {
     resolved
         .symbol_table
         .types
@@ -3591,4 +3588,1041 @@ fn emit_error(diag: &mut DiagnosticBag, code: &str, span: Option<Span>, message:
         why: None,
         suggested_fixes: Vec::new(),
     });
+}
+
+pub fn typecheck_module(
+    module: &HirModule,
+    type_ctx: &TypeCtx,
+    sym: &SymbolTable,
+    diag: &mut DiagnosticBag,
+) -> Result<(), ()> {
+    let before = diag.error_count();
+
+    let fn_by_sid: HashMap<String, &FnSymbol> = sym
+        .functions
+        .values()
+        .map(|f| (f.sid.0.clone(), f))
+        .collect();
+    let struct_fields = sema_struct_fields_by_sid(module);
+    let enum_variants = sema_enum_variants_by_sid(module);
+
+    for func in &module.functions {
+        let local_types = sema_collect_local_types(func);
+
+        for block in &func.blocks {
+            for instr in &block.instrs {
+                match &instr.op {
+                    HirOp::IAdd { lhs, rhs }
+                    | HirOp::ISub { lhs, rhs }
+                    | HirOp::IMul { lhs, rhs }
+                    | HirOp::ISDiv { lhs, rhs }
+                    | HirOp::IUDiv { lhs, rhs }
+                    | HirOp::ISRem { lhs, rhs }
+                    | HirOp::IURem { lhs, rhs }
+                    | HirOp::IAddWrap { lhs, rhs }
+                    | HirOp::ISubWrap { lhs, rhs }
+                    | HirOp::IMulWrap { lhs, rhs }
+                    | HirOp::IAddChecked { lhs, rhs }
+                    | HirOp::ISubChecked { lhs, rhs }
+                    | HirOp::IMulChecked { lhs, rhs }
+                    | HirOp::IAnd { lhs, rhs }
+                    | HirOp::IOr { lhs, rhs }
+                    | HirOp::IXor { lhs, rhs }
+                    | HirOp::IShl { lhs, rhs }
+                    | HirOp::ILshr { lhs, rhs }
+                    | HirOp::IAshr { lhs, rhs }
+                    | HirOp::ICmp { lhs, rhs, .. } => sema_check_binary_numeric(
+                        "integer",
+                        lhs,
+                        rhs,
+                        &local_types,
+                        type_ctx,
+                        diag,
+                    ),
+                    HirOp::FAdd { lhs, rhs }
+                    | HirOp::FSub { lhs, rhs }
+                    | HirOp::FMul { lhs, rhs }
+                    | HirOp::FDiv { lhs, rhs }
+                    | HirOp::FRem { lhs, rhs }
+                    | HirOp::FAddFast { lhs, rhs }
+                    | HirOp::FSubFast { lhs, rhs }
+                    | HirOp::FMulFast { lhs, rhs }
+                    | HirOp::FDivFast { lhs, rhs }
+                    | HirOp::FCmp { lhs, rhs, .. } => sema_check_binary_numeric(
+                        "float",
+                        lhs,
+                        rhs,
+                        &local_types,
+                        type_ctx,
+                        diag,
+                    ),
+                    HirOp::Call {
+                        callee_sid,
+                        inst,
+                        args,
+                    } => {
+                        if let Some(callee) = fn_by_sid.get(&callee_sid.0) {
+                            if callee.params.len() != args.len() {
+                                emit_error(
+                                    diag,
+                                    "MPT2001",
+                                    None,
+                                    format!(
+                                        "call arity mismatch: callee expects {} args, got {}.",
+                                        callee.params.len(),
+                                        args.len()
+                                    ),
+                                );
+                            }
+
+                            for (idx, arg) in args.iter().enumerate() {
+                                let Some(arg_ty) = sema_value_type(arg, &local_types) else {
+                                    emit_error(
+                                        diag,
+                                        "MPT2002",
+                                        None,
+                                        format!("call argument {} has unknown type.", idx),
+                                    );
+                                    continue;
+                                };
+                                if let Some(param_ty) = callee.params.get(idx) {
+                                    if arg_ty != *param_ty {
+                                        emit_error(
+                                            diag,
+                                            "MPT2003",
+                                            None,
+                                            format!(
+                                                "call argument {} type mismatch: expected {}, got {}.",
+                                                idx,
+                                                type_id_str(*param_ty, type_ctx),
+                                                type_id_str(arg_ty, type_ctx)
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            emit_error(
+                                diag,
+                                "MPT2004",
+                                None,
+                                format!(
+                                    "call target '{}' not found in symbol table.",
+                                    callee_sid.0
+                                ),
+                            );
+                        }
+
+                        for targ in inst {
+                            if type_ctx.lookup(*targ).is_none() {
+                                emit_error(
+                                    diag,
+                                    "MPT2005",
+                                    None,
+                                    format!("invalid generic type argument '{}'.", targ.0),
+                                );
+                            }
+                        }
+                    }
+                    HirOp::GetField { obj, field } => {
+                        let Some(obj_ty) = sema_value_type(obj, &local_types) else {
+                            emit_error(
+                                diag,
+                                "MPT2006",
+                                None,
+                                "getfield object has unknown type.".to_string(),
+                            );
+                            continue;
+                        };
+
+                        let Some(struct_sid) = sema_borrowed_struct_sid(obj_ty, type_ctx) else {
+                            emit_error(
+                                diag,
+                                "MPT2007",
+                                None,
+                                "getfield requires object type `borrow TStruct` or `mutborrow TStruct`."
+                                    .to_string(),
+                            );
+                            continue;
+                        };
+
+                        let Some(fields) = struct_fields.get(&struct_sid) else {
+                            emit_error(
+                                diag,
+                                "MPT2008",
+                                None,
+                                format!(
+                                    "getfield target type '{}' is not a struct.",
+                                    struct_sid
+                                ),
+                            );
+                            continue;
+                        };
+
+                        if !fields.contains_key(field) {
+                            emit_error(
+                                diag,
+                                "MPT2009",
+                                None,
+                                format!(
+                                    "struct '{}' has no field '{}'.",
+                                    struct_sid, field
+                                ),
+                            );
+                        }
+                    }
+                    HirOp::EnumNew { variant, args } => {
+                        sema_check_enum_new(
+                            instr.ty,
+                            variant,
+                            args,
+                            &local_types,
+                            type_ctx,
+                            &enum_variants,
+                            diag,
+                        );
+                    }
+                    HirOp::New { ty, fields } => {
+                        sema_check_new_struct(
+                            *ty,
+                            fields,
+                            &local_types,
+                            type_ctx,
+                            &struct_fields,
+                            diag,
+                        );
+                    }
+                    HirOp::Cast { to, v } => {
+                        let Some(from_ty) = sema_value_type(v, &local_types) else {
+                            emit_error(
+                                diag,
+                                "MPT2010",
+                                None,
+                                "cast operand has unknown type.".to_string(),
+                            );
+                            continue;
+                        };
+                        if !sema_is_primitive_type(from_ty, type_ctx)
+                            || !sema_is_primitive_type(*to, type_ctx)
+                        {
+                            emit_error(
+                                diag,
+                                "MPT2011",
+                                None,
+                                format!(
+                                    "cast is only allowed between primitive types (from {} to {}).",
+                                    type_id_str(from_ty, type_ctx),
+                                    type_id_str(*to, type_ctx)
+                                ),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if diag.error_count() > before {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn check_trait_impls(
+    module: &HirModule,
+    type_ctx: &TypeCtx,
+    sym: &SymbolTable,
+    diag: &mut DiagnosticBag,
+) -> Result<(), ()> {
+    let before = diag.error_count();
+
+    let local_type_names: HashMap<String, Sid> = module
+        .type_decls
+        .iter()
+        .map(|decl| match decl {
+            HirTypeDecl::Struct { sid, name, .. } => (name.clone(), sid.clone()),
+            HirTypeDecl::Enum { sid, name, .. } => (name.clone(), sid.clone()),
+        })
+        .collect();
+    let fn_names: HashSet<&str> = sym.functions.keys().map(String::as_str).collect();
+
+    let mut impls: HashSet<(String, String)> = HashSet::new();
+    sema_seed_builtin_trait_impls(&mut impls);
+
+    for func in &module.functions {
+        let trait_kind = if let Some(target) = func.name.strip_prefix("hash_") {
+            Some(("hash", target))
+        } else if let Some(target) = func.name.strip_prefix("eq_") {
+            Some(("eq", target))
+        } else if let Some(target) = func.name.strip_prefix("ord_") {
+            Some(("ord", target))
+        } else {
+            None
+        };
+
+        let Some((trait_name, target_name)) = trait_kind else {
+            continue;
+        };
+        if target_name.is_empty() {
+            continue;
+        }
+
+        if !fn_names.contains(func.name.as_str()) {
+            continue;
+        }
+
+        sema_check_trait_sig(func, trait_name, target_name, &local_type_names, type_ctx, diag);
+
+        if !local_type_names.contains_key(target_name) && !sema_is_lang_owned_type_name(target_name)
+        {
+            emit_error(
+                diag,
+                "MPT1200",
+                None,
+                format!(
+                    "orphan impl: trait '{}' for foreign type '{}'.",
+                    trait_name, target_name
+                ),
+            );
+        }
+
+        if let Some(key) = sema_trait_key_from_type_name(target_name, &local_type_names, type_ctx) {
+            impls.insert((trait_name.to_string(), key));
+        }
+    }
+
+    for func in &module.functions {
+        let local_types = sema_collect_local_types(func);
+
+        for block in &func.blocks {
+            for instr in &block.instrs {
+                match &instr.op {
+                    HirOp::ArrContains { arr, .. } => {
+                        if let Some(elem_ty) = sema_array_elem_type(arr, &local_types, type_ctx) {
+                            sema_require_trait_impl("eq", elem_ty, type_ctx, &impls, diag);
+                        }
+                    }
+                    HirOp::ArrSort { arr } => {
+                        if let Some(elem_ty) = sema_array_elem_type(arr, &local_types, type_ctx) {
+                            sema_require_trait_impl("ord", elem_ty, type_ctx, &impls, diag);
+                        }
+                    }
+                    HirOp::MapNew { key_ty, .. } => {
+                        sema_require_trait_impl("hash", *key_ty, type_ctx, &impls, diag);
+                        sema_require_trait_impl("eq", *key_ty, type_ctx, &impls, diag);
+                    }
+                    _ => {}
+                }
+            }
+
+            for op in &block.void_ops {
+                if let HirOpVoid::ArrSort { arr } = op {
+                    if let Some(elem_ty) = sema_array_elem_type(arr, &local_types, type_ctx) {
+                        sema_require_trait_impl("ord", elem_ty, type_ctx, &impls, diag);
+                    }
+                }
+            }
+        }
+    }
+
+    if diag.error_count() > before {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn check_v01_restrictions(
+    module: &HirModule,
+    type_ctx: &TypeCtx,
+    diag: &mut DiagnosticBag,
+) -> Result<(), ()> {
+    let before = diag.error_count();
+
+    for (_, kind) in &type_ctx.types {
+        if matches!(
+            kind,
+            TypeKind::Arr { .. } | TypeKind::Vec { .. } | TypeKind::Tuple { .. }
+        ) {
+            emit_error(
+                diag,
+                "MPT1021",
+                None,
+                format!(
+                    "aggregate type '{}' is deferred in v0.1.",
+                    type_str(kind, type_ctx)
+                ),
+            );
+        }
+    }
+
+    let value_sids: HashSet<String> = type_ctx
+        .types
+        .iter()
+        .filter_map(|(_, kind)| match kind {
+            TypeKind::ValueStruct { sid } => Some(sid.0.clone()),
+            _ => None,
+        })
+        .collect();
+
+    for decl in &module.type_decls {
+        match decl {
+            HirTypeDecl::Enum { sid, name, .. } => {
+                if value_sids.contains(&sid.0) {
+                    emit_error(
+                        diag,
+                        "MPT1020",
+                        None,
+                        format!("value enum '{}' is deferred in v0.1.", name),
+                    );
+                }
+            }
+            HirTypeDecl::Struct { sid, name, fields } => {
+                if !value_sids.contains(&sid.0) {
+                    continue;
+                }
+                for (field_name, field_ty) in fields {
+                    let mut visiting = HashSet::new();
+                    if sema_contains_heap_handle(*field_ty, type_ctx, &mut visiting) {
+                        emit_error(
+                            diag,
+                            "MPT1005",
+                            None,
+                            format!(
+                                "value struct '{}' field '{}' contains heap handle type '{}'.",
+                                name,
+                                field_name,
+                                type_id_str(*field_ty, type_ctx)
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let known_fn_sids: HashSet<&str> = module.functions.iter().map(|f| f.sid.0.as_str()).collect();
+    for func in &module.functions {
+        for block in &func.blocks {
+            for instr in &block.instrs {
+                if let HirOp::SuspendCall { callee_sid, .. } = &instr.op {
+                    if !known_fn_sids.contains(callee_sid.0.as_str()) {
+                        emit_error(
+                            diag,
+                            "MPT1030",
+                            None,
+                            format!(
+                                "`suspend.call` on non-function target '{}' (TCallable form) is forbidden in v0.1.",
+                                callee_sid.0
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if diag.error_count() > before {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+fn sema_collect_local_types(func: &HirFunction) -> HashMap<LocalId, TypeId> {
+    let mut locals = HashMap::new();
+    for (local, ty) in &func.params {
+        locals.insert(*local, *ty);
+    }
+    for block in &func.blocks {
+        for instr in &block.instrs {
+            locals.insert(instr.dst, instr.ty);
+        }
+    }
+    locals
+}
+
+fn sema_value_type(v: &HirValue, locals: &HashMap<LocalId, TypeId>) -> Option<TypeId> {
+    match v {
+        HirValue::Local(id) => locals.get(id).copied(),
+        HirValue::Const(c) => Some(c.ty),
+    }
+}
+
+fn sema_is_primitive_type(ty: TypeId, type_ctx: &TypeCtx) -> bool {
+    matches!(type_ctx.lookup(ty), Some(TypeKind::Prim(_)))
+}
+
+fn sema_check_binary_numeric(
+    family: &str,
+    lhs: &HirValue,
+    rhs: &HirValue,
+    local_types: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+    diag: &mut DiagnosticBag,
+) {
+    let Some(lhs_ty) = sema_value_type(lhs, local_types) else {
+        emit_error(
+            diag,
+            "MPT2012",
+            None,
+            format!("{} binary op lhs has unknown type.", family),
+        );
+        return;
+    };
+    let Some(rhs_ty) = sema_value_type(rhs, local_types) else {
+        emit_error(
+            diag,
+            "MPT2013",
+            None,
+            format!("{} binary op rhs has unknown type.", family),
+        );
+        return;
+    };
+
+    if lhs_ty != rhs_ty {
+        emit_error(
+            diag,
+            "MPT2014",
+            None,
+            format!(
+                "{} binary op requires both operands to have same type (lhs={}, rhs={}).",
+                family,
+                type_id_str(lhs_ty, type_ctx),
+                type_id_str(rhs_ty, type_ctx)
+            ),
+        );
+        return;
+    }
+
+    let ok = match type_ctx.lookup(lhs_ty) {
+        Some(TypeKind::Prim(p)) if family == "integer" => p.is_integer(),
+        Some(TypeKind::Prim(p)) if family == "float" => p.is_float(),
+        _ => false,
+    };
+    if !ok {
+        emit_error(
+            diag,
+            "MPT2015",
+            None,
+            format!(
+                "{} binary op requires {} primitive operands, got '{}'.",
+                family,
+                family,
+                type_id_str(lhs_ty, type_ctx)
+            ),
+        );
+    }
+}
+
+fn sema_struct_fields_by_sid(module: &HirModule) -> HashMap<String, HashMap<String, TypeId>> {
+    let mut out = HashMap::new();
+    for decl in &module.type_decls {
+        if let HirTypeDecl::Struct { sid, fields, .. } = decl {
+            out.insert(sid.0.clone(), fields.iter().cloned().collect());
+        }
+    }
+    out
+}
+
+fn sema_enum_variants_by_sid(
+    module: &HirModule,
+) -> HashMap<String, HashMap<String, HashMap<String, TypeId>>> {
+    let mut out = HashMap::new();
+    for decl in &module.type_decls {
+        if let HirTypeDecl::Enum { sid, variants, .. } = decl {
+            let mut by_variant = HashMap::new();
+            for v in variants {
+                by_variant.insert(v.name.clone(), v.fields.iter().cloned().collect());
+            }
+            out.insert(sid.0.clone(), by_variant);
+        }
+    }
+    out
+}
+
+fn sema_borrowed_struct_sid(ty: TypeId, type_ctx: &TypeCtx) -> Option<String> {
+    match type_ctx.lookup(ty) {
+        Some(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow | HandleKind::MutBorrow,
+            base: HeapBase::UserType { type_sid, .. },
+        }) => Some(type_sid.0.clone()),
+        _ => None,
+    }
+}
+
+fn sema_check_field_arg_list(
+    kind_name: &str,
+    owner_name: &str,
+    args: &[(String, HirValue)],
+    expected_fields: &HashMap<String, TypeId>,
+    local_types: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+    diag: &mut DiagnosticBag,
+) {
+    let mut seen = HashSet::new();
+    for (field, value) in args {
+        if !seen.insert(field.clone()) {
+            emit_error(
+                diag,
+                "MPT2016",
+                None,
+                format!(
+                    "{} '{}' has duplicate field argument '{}'.",
+                    kind_name, owner_name, field
+                ),
+            );
+            continue;
+        }
+
+        let Some(expected_ty) = expected_fields.get(field).copied() else {
+            emit_error(
+                diag,
+                "MPT2017",
+                None,
+                format!(
+                    "{} '{}' has no field '{}'.",
+                    kind_name, owner_name, field
+                ),
+            );
+            continue;
+        };
+
+        let Some(actual_ty) = sema_value_type(value, local_types) else {
+            emit_error(
+                diag,
+                "MPT2018",
+                None,
+                format!(
+                    "{} '{}' field '{}' value has unknown type.",
+                    kind_name, owner_name, field
+                ),
+            );
+            continue;
+        };
+
+        if actual_ty != expected_ty {
+            emit_error(
+                diag,
+                "MPT2019",
+                None,
+                format!(
+                    "{} '{}' field '{}' type mismatch: expected {}, got {}.",
+                    kind_name,
+                    owner_name,
+                    field,
+                    type_id_str(expected_ty, type_ctx),
+                    type_id_str(actual_ty, type_ctx)
+                ),
+            );
+        }
+    }
+
+    for field in expected_fields.keys() {
+        if !seen.contains(field) {
+            emit_error(
+                diag,
+                "MPT2020",
+                None,
+                format!(
+                    "{} '{}' is missing required field '{}'.",
+                    kind_name, owner_name, field
+                ),
+            );
+        }
+    }
+}
+
+fn sema_check_new_struct(
+    new_ty: TypeId,
+    fields: &[(String, HirValue)],
+    local_types: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+    struct_fields: &HashMap<String, HashMap<String, TypeId>>,
+    diag: &mut DiagnosticBag,
+) {
+    let sid = match type_ctx.lookup(new_ty) {
+        Some(TypeKind::HeapHandle {
+            base: HeapBase::UserType { type_sid, .. },
+            ..
+        }) => type_sid.0.clone(),
+        Some(TypeKind::ValueStruct { sid }) => sid.0.clone(),
+        _ => {
+            emit_error(
+                diag,
+                "MPT2021",
+                None,
+                format!(
+                    "`new` target must be a struct type, got '{}'.",
+                    type_id_str(new_ty, type_ctx)
+                ),
+            );
+            return;
+        }
+    };
+
+    let Some(expected) = struct_fields.get(&sid) else {
+        emit_error(
+            diag,
+            "MPT2022",
+            None,
+            format!("`new` target '{}' is not a known struct.", sid),
+        );
+        return;
+    };
+
+    sema_check_field_arg_list("struct", &sid, fields, expected, local_types, type_ctx, diag);
+}
+
+fn sema_check_enum_new(
+    enum_ty: TypeId,
+    variant: &str,
+    args: &[(String, HirValue)],
+    local_types: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+    enum_variants: &HashMap<String, HashMap<String, HashMap<String, TypeId>>>,
+    diag: &mut DiagnosticBag,
+) {
+    match type_ctx.lookup(enum_ty) {
+        Some(TypeKind::BuiltinOption { inner }) => {
+            let expected: HashMap<String, TypeId> = match variant {
+                "None" => HashMap::new(),
+                "Some" => HashMap::from([("v".to_string(), *inner)]),
+                _ => {
+                    emit_error(
+                        diag,
+                        "MPT2023",
+                        None,
+                        format!("variant '{}' is invalid for TOption.", variant),
+                    );
+                    return;
+                }
+            };
+            sema_check_field_arg_list(
+                "variant",
+                "TOption",
+                args,
+                &expected,
+                local_types,
+                type_ctx,
+                diag,
+            );
+        }
+        Some(TypeKind::BuiltinResult { ok, err }) => {
+            let expected: HashMap<String, TypeId> = match variant {
+                "Ok" => HashMap::from([("v".to_string(), *ok)]),
+                "Err" => HashMap::from([("e".to_string(), *err)]),
+                _ => {
+                    emit_error(
+                        diag,
+                        "MPT2024",
+                        None,
+                        format!("variant '{}' is invalid for TResult.", variant),
+                    );
+                    return;
+                }
+            };
+            sema_check_field_arg_list(
+                "variant",
+                "TResult",
+                args,
+                &expected,
+                local_types,
+                type_ctx,
+                diag,
+            );
+        }
+        Some(TypeKind::HeapHandle {
+            base: HeapBase::UserType { type_sid, .. },
+            ..
+        })
+        | Some(TypeKind::ValueStruct { sid: type_sid }) => {
+            let sid = type_sid.0.clone();
+            let Some(variants) = enum_variants.get(&sid) else {
+                emit_error(
+                    diag,
+                    "MPT2025",
+                    None,
+                    format!(
+                        "`enum.new` result type '{}' is not an enum.",
+                        type_id_str(enum_ty, type_ctx)
+                    ),
+                );
+                return;
+            };
+
+            let Some(expected) = variants.get(variant) else {
+                emit_error(
+                    diag,
+                    "MPT2026",
+                    None,
+                    format!("enum '{}' has no variant '{}'.", sid, variant),
+                );
+                return;
+            };
+
+            sema_check_field_arg_list("variant", &sid, args, expected, local_types, type_ctx, diag);
+        }
+        _ => {
+            emit_error(
+                diag,
+                "MPT2027",
+                None,
+                format!(
+                    "`enum.new` result type must be enum, got '{}'.",
+                    type_id_str(enum_ty, type_ctx)
+                ),
+            );
+        }
+    }
+}
+
+fn sema_check_trait_sig(
+    func: &HirFunction,
+    trait_name: &str,
+    target_name: &str,
+    local_type_names: &HashMap<String, Sid>,
+    type_ctx: &TypeCtx,
+    diag: &mut DiagnosticBag,
+) {
+    let (expected_params, expected_ret) = match trait_name {
+        "hash" => (1usize, fixed_type_ids::U64),
+        "eq" => (2usize, fixed_type_ids::BOOL),
+        "ord" => (2usize, fixed_type_ids::I32),
+        _ => return,
+    };
+
+    if func.params.len() != expected_params {
+        emit_error(
+            diag,
+            "MPT2028",
+            None,
+            format!(
+                "trait impl '{}' must have {} parameter(s), got {}.",
+                func.name,
+                expected_params,
+                func.params.len()
+            ),
+        );
+    }
+
+    if func.ret_ty != expected_ret {
+        emit_error(
+            diag,
+            "MPT2029",
+            None,
+            format!(
+                "trait impl '{}' return type mismatch: expected {}, got {}.",
+                func.name,
+                type_id_str(expected_ret, type_ctx),
+                type_id_str(func.ret_ty, type_ctx)
+            ),
+        );
+    }
+
+    let Some((_, first_ty)) = func.params.first() else {
+        return;
+    };
+
+    if !sema_is_borrow_for_trait_target(*first_ty, target_name, local_type_names, type_ctx) {
+        emit_error(
+            diag,
+            "MPT2030",
+            None,
+            format!(
+                "trait impl '{}' first parameter must be `borrow {}`.",
+                func.name, target_name
+            ),
+        );
+    }
+
+    if let Some((_, second_ty)) = func.params.get(1) {
+        if *first_ty != *second_ty {
+            emit_error(
+                diag,
+                "MPT2031",
+                None,
+                format!(
+                    "trait impl '{}' parameters must both be `borrow {}`.",
+                    func.name, target_name
+                ),
+            );
+        }
+    }
+}
+
+fn sema_is_borrow_for_trait_target(
+    ty: TypeId,
+    target_name: &str,
+    local_type_names: &HashMap<String, Sid>,
+    type_ctx: &TypeCtx,
+) -> bool {
+    match type_ctx.lookup(ty) {
+        Some(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::UserType { type_sid, .. },
+        }) => local_type_names
+            .get(target_name)
+            .map(|sid| sid == type_sid)
+            .unwrap_or(false),
+        Some(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::BuiltinStr,
+        }) => target_name == "Str",
+        Some(TypeKind::Prim(p)) => target_name == prim_type_str(*p),
+        _ => false,
+    }
+}
+
+fn sema_seed_builtin_trait_impls(impls: &mut HashSet<(String, String)>) {
+    let prims = [
+        "bool", "i8", "i16", "i32", "i64", "i128", "u1", "u8", "u16", "u32", "u64", "u128",
+        "f16", "f32", "f64",
+    ];
+    for p in prims {
+        let key = format!("prim:{}", p);
+        impls.insert(("hash".to_string(), key.clone()));
+        impls.insert(("eq".to_string(), key.clone()));
+        impls.insert(("ord".to_string(), key));
+    }
+    impls.insert(("hash".to_string(), "str".to_string()));
+    impls.insert(("eq".to_string(), "str".to_string()));
+    impls.insert(("ord".to_string(), "str".to_string()));
+}
+
+fn sema_trait_key_from_type_name(
+    type_name: &str,
+    local_type_names: &HashMap<String, Sid>,
+    _type_ctx: &TypeCtx,
+) -> Option<String> {
+    if let Some(sid) = local_type_names.get(type_name) {
+        return Some(format!("user:{}", sid.0));
+    }
+    if type_name == "Str" {
+        return Some("str".to_string());
+    }
+    if prim_type_from_name(type_name).is_some() {
+        return Some(format!("prim:{}", type_name));
+    }
+    None
+}
+
+fn sema_trait_key_from_type_id(ty: TypeId, type_ctx: &TypeCtx) -> Option<String> {
+    match type_ctx.lookup(ty) {
+        Some(TypeKind::Prim(p)) => Some(format!("prim:{}", prim_type_str(*p))),
+        Some(TypeKind::HeapHandle {
+            base: HeapBase::BuiltinStr,
+            ..
+        }) => Some("str".to_string()),
+        Some(TypeKind::HeapHandle {
+            base: HeapBase::UserType { type_sid, targs },
+            ..
+        }) => {
+            if targs.is_empty() {
+                Some(format!("user:{}", type_sid.0))
+            } else {
+                let mut arg_keys = Vec::new();
+                for targ in targs {
+                    arg_keys.push(
+                        sema_trait_key_from_type_id(*targ, type_ctx)
+                            .unwrap_or_else(|| format!("type#{}", targ.0)),
+                    );
+                }
+                Some(format!("user:{}<{}>", type_sid.0, arg_keys.join(",")))
+            }
+        }
+        Some(TypeKind::ValueStruct { sid }) => Some(format!("user:{}", sid.0)),
+        _ => None,
+    }
+}
+
+fn sema_require_trait_impl(
+    trait_name: &str,
+    ty: TypeId,
+    type_ctx: &TypeCtx,
+    impls: &HashSet<(String, String)>,
+    diag: &mut DiagnosticBag,
+) {
+    let key = sema_trait_key_from_type_id(ty, type_ctx)
+        .unwrap_or_else(|| format!("type#{}", ty.0));
+    if !impls.contains(&(trait_name.to_string(), key.clone())) {
+        emit_error(
+            diag,
+            "MPT1023",
+            None,
+            format!(
+                "missing required trait impl: `impl {} for {}`.",
+                trait_name,
+                type_id_str(ty, type_ctx)
+            ),
+        );
+    }
+}
+
+fn sema_array_elem_type(
+    arr_value: &HirValue,
+    locals: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+) -> Option<TypeId> {
+    let arr_ty = sema_value_type(arr_value, locals)?;
+    match type_ctx.lookup(arr_ty) {
+        Some(TypeKind::HeapHandle {
+            base: HeapBase::BuiltinArray { elem },
+            ..
+        }) => Some(*elem),
+        _ => None,
+    }
+}
+
+fn sema_is_lang_owned_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Str"
+            | "bool"
+            | "unit"
+            | "i1"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "u1"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "f16"
+            | "f32"
+            | "f64"
+    )
+}
+
+fn sema_contains_heap_handle(
+    ty: TypeId,
+    type_ctx: &TypeCtx,
+    visiting: &mut HashSet<TypeId>,
+) -> bool {
+    if !visiting.insert(ty) {
+        return false;
+    }
+    let out = match type_ctx.lookup(ty) {
+        Some(TypeKind::HeapHandle { .. }) => true,
+        Some(TypeKind::BuiltinOption { inner }) => sema_contains_heap_handle(*inner, type_ctx, visiting),
+        Some(TypeKind::BuiltinResult { ok, err }) => {
+            sema_contains_heap_handle(*ok, type_ctx, visiting)
+                || sema_contains_heap_handle(*err, type_ctx, visiting)
+        }
+        Some(TypeKind::Arr { elem, .. }) | Some(TypeKind::Vec { elem, .. }) => {
+            sema_contains_heap_handle(*elem, type_ctx, visiting)
+        }
+        Some(TypeKind::Tuple { elems }) => elems
+            .iter()
+            .any(|elem| sema_contains_heap_handle(*elem, type_ctx, visiting)),
+        _ => false,
+    };
+    visiting.remove(&ty);
+    out
 }

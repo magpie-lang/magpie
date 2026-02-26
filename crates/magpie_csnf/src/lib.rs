@@ -1,112 +1,114 @@
-//! Canonical Source Normal Form (CSNF) formatter for Magpie.
+//! Canonical Source Normal Form (CSNF) formatting and digest helpers.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use magpie_ast::*;
+use magpie_ast::{
+    AstArgListElem, AstArgValue, AstBaseType, AstBlock, AstBuiltinType, AstConstExpr, AstConstLit,
+    AstDecl, AstEnumDecl, AstExternModule, AstFieldDecl, AstFile, AstFnDecl, AstFnMeta,
+    AstGlobalDecl, AstGpuFnDecl, AstImplDecl, AstInstr, AstOp, AstOpVoid, AstParam, AstSigDecl,
+    AstStructDecl, AstTerminator, AstType, AstTypeParam, AstValueRef, BinOpKind, CmpKind,
+    ExportItem, ImportGroup, ImportItem, OwnershipMod, Spanned,
+};
 
-pub fn format_csnf(ast: &AstFile, _source_map: &SourceMap) -> String {
+const BLOCK_INDENT: &str = "  ";
+const INSTR_INDENT: &str = "    ";
+
+/// Prints AST back as canonical `.mp` source.
+pub fn format_csnf(ast: &AstFile) -> String {
     let mut out = String::new();
+    let header = &ast.header.node;
+
     out.push_str("module ");
-    out.push_str(&ast.header.node.module_path.node.to_string());
+    out.push_str(&header.module_path.node.to_string());
     out.push('\n');
 
     out.push_str("exports ");
-    out.push_str(&format_braced_list(sorted_export_items(&ast.header.node.exports)));
+    out.push_str(&format_exports(&header.exports));
     out.push('\n');
 
     out.push_str("imports ");
-    out.push_str(&format_braced_list(sorted_import_groups(&ast.header.node.imports)));
+    out.push_str(&format_imports(&header.imports));
     out.push('\n');
 
-    // Placeholder; update_digest will replace with the canonical value.
-    out.push_str("digest \"\"\n");
+    out.push_str("digest ");
+    out.push_str(&quote_string(&header.digest.node));
+    out.push('\n');
 
     if !ast.decls.is_empty() {
         out.push('\n');
-        for (idx, decl) in ast.decls.iter().enumerate() {
-            out.push_str(&print_decl(&decl.node));
-            if idx + 1 < ast.decls.len() {
-                out.push_str("\n\n");
-            }
+    }
+
+    for (idx, decl) in ast.decls.iter().enumerate() {
+        out.push_str(&print_decl(&decl.node));
+        if idx + 1 != ast.decls.len() {
+            out.push_str("\n\n");
         }
     }
 
-    update_digest(&ensure_single_trailing_newline(out))
+    ensure_single_trailing_newline(&out)
 }
 
+/// BLAKE3 hash (hex) of source minus digest line.
 pub fn compute_digest(canonical_source: &str) -> String {
-    let stripped = strip_digest_line(canonical_source);
+    let stripped = strip_digest_lines(canonical_source);
     blake3::hash(stripped.as_bytes()).to_hex().to_string()
 }
 
+/// Replace digest line with the correct one.
 pub fn update_digest(source: &str) -> String {
-    let digest = compute_digest(source);
+    let normalized = normalize_newlines(source);
+    let mut lines: Vec<String> = normalized.lines().map(ToOwned::to_owned).collect();
 
-    let mut lines: Vec<String> = source.lines().map(str::to_owned).collect();
-    let mut insert_idx = None;
-    lines.retain(|line| {
-        let is_digest = line.trim_start().starts_with("digest ");
-        if is_digest && insert_idx.is_none() {
-            insert_idx = Some(0);
-        }
-        !is_digest
-    });
-
-    if insert_idx.is_none() {
-        insert_idx = lines
-            .iter()
-            .position(|line| line.trim_start().starts_with("imports "))
-            .map(|i| i + 1)
-            .or(Some(lines.len().min(3)));
+    if let Some(idx) = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("digest "))
+    {
+        lines[idx] = "digest \"\"".to_string();
     } else {
-        // Insert where digest line canonically belongs: after imports if present.
-        insert_idx = lines
+        let insert_idx = lines
             .iter()
-            .position(|line| line.trim_start().starts_with("imports "))
-            .map(|i| i + 1)
-            .or(insert_idx);
+            .position(|line| line.starts_with("imports "))
+            .map(|idx| idx + 1)
+            .unwrap_or(3.min(lines.len()));
+        lines.insert(insert_idx, "digest \"\"".to_string());
     }
 
-    lines.insert(
-        insert_idx.unwrap_or(0),
-        format!("digest \"{}\"", digest),
-    );
+    let interim = ensure_single_trailing_newline(&lines.join("\n"));
+    let digest = compute_digest(&interim);
+    let digest_line = format!("digest \"{}\"", digest);
 
-    ensure_single_trailing_newline(lines.join("\n"))
+    let final_lines = interim
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("digest ") {
+                digest_line.clone()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    ensure_single_trailing_newline(&final_lines.join("\n"))
 }
 
+/// Canonical type printing helper.
 pub fn print_type(ty: &AstType) -> String {
     let mut out = String::new();
+
     if let Some(ownership) = &ty.ownership {
         out.push_str(match ownership {
-            OwnershipMod::Shared => "shared",
-            OwnershipMod::Borrow => "borrow",
-            OwnershipMod::MutBorrow => "mutborrow",
-            OwnershipMod::Weak => "weak",
+            OwnershipMod::Shared => "shared ",
+            OwnershipMod::Borrow => "borrow ",
+            OwnershipMod::MutBorrow => "mutborrow ",
+            OwnershipMod::Weak => "weak ",
         });
-        out.push(' ');
     }
 
-    out.push_str(&match &ty.base {
-        AstBaseType::Prim(p) => p.clone(),
-        AstBaseType::Named { path, name, targs } => {
-            let mut s = String::new();
-            if let Some(path) = path {
-                s.push_str(&path.to_string());
-                s.push('.');
-            }
-            s.push_str(name);
-            s.push_str(&print_type_args(targs));
-            s
-        }
-        AstBaseType::Builtin(b) => print_builtin_type(b),
-        AstBaseType::Callable { sig_ref } => format!("TCallable<{}>", sig_ref),
-        AstBaseType::RawPtr(inner) => format!("rawptr<{}>", print_type(inner)),
-    });
-
+    out.push_str(&print_base_type(&ty.base));
     out
 }
 
+/// Canonical value-ref printing helper.
 pub fn print_value_ref(v: &AstValueRef) -> String {
     match v {
         AstValueRef::Local(name) => format!("%{}", name),
@@ -114,69 +116,93 @@ pub fn print_value_ref(v: &AstValueRef) -> String {
     }
 }
 
+/// Canonical value-producing op printing helper.
 pub fn print_op(op: &AstOp) -> String {
-    print_op_with_bb_map(op, &HashMap::new())
+    print_op_with_label_map(op, &HashMap::new())
 }
 
+/// Canonical void op printing helper.
 pub fn print_op_void(op: &AstOpVoid) -> String {
-    print_op_void_with_bb_map(op, &HashMap::new())
+    print_op_void_with_label_map(op, &HashMap::new())
 }
 
-pub fn print_terminator(t: &AstTerminator) -> String {
-    print_terminator_with_bb_map(t, &HashMap::new())
+/// Canonical terminator printing helper.
+pub fn print_terminator(term: &AstTerminator) -> String {
+    print_terminator_with_label_map(term, &HashMap::new())
 }
 
-fn print_decl(decl: &AstDecl) -> String {
+/// Canonical declaration printing helper.
+pub fn print_decl(decl: &AstDecl) -> String {
     match decl {
-        AstDecl::Fn(f) => print_fn_decl(f, "fn", None),
-        AstDecl::AsyncFn(f) => print_fn_decl(f, "async fn", None),
-        AstDecl::UnsafeFn(f) => print_fn_decl(f, "unsafe fn", None),
-        AstDecl::GpuFn(g) => print_fn_decl(&g.inner, "gpu fn", Some(&g.target)),
-        AstDecl::HeapStruct(s) => print_struct_decl(s, "heap struct"),
-        AstDecl::ValueStruct(s) => print_struct_decl(s, "value struct"),
-        AstDecl::HeapEnum(e) => print_enum_decl(e, "heap enum"),
-        AstDecl::ValueEnum(e) => print_enum_decl(e, "value enum"),
-        AstDecl::Extern(e) => print_extern_decl(e),
+        AstDecl::Fn(f) => print_fn_decl("fn", f, None),
+        AstDecl::AsyncFn(f) => print_fn_decl("async fn", f, None),
+        AstDecl::UnsafeFn(f) => print_fn_decl("unsafe fn", f, None),
+        AstDecl::GpuFn(g) => print_gpu_fn_decl(g),
+        AstDecl::HeapStruct(s) => print_struct_decl("heap", s),
+        AstDecl::ValueStruct(s) => print_struct_decl("value", s),
+        AstDecl::HeapEnum(e) => print_enum_decl("heap", e),
+        AstDecl::ValueEnum(e) => print_enum_decl("value", e),
+        AstDecl::Extern(extern_mod) => print_extern_decl(extern_mod),
         AstDecl::Global(g) => print_global_decl(g),
         AstDecl::Impl(i) => print_impl_decl(i),
         AstDecl::Sig(s) => print_sig_decl(s),
     }
 }
 
-fn print_doc_lines(doc: &Option<String>) -> String {
-    match doc {
-        None => String::new(),
-        Some(text) => {
-            let mut out = String::new();
-            for line in text.lines() {
-                out.push_str(";;; ");
-                out.push_str(line);
-                out.push('\n');
+fn format_exports(exports: &[Spanned<ExportItem>]) -> String {
+    let mut items = BTreeSet::new();
+    for item in exports {
+        match &item.node {
+            ExportItem::Fn(name) | ExportItem::Type(name) => {
+                items.insert(name.clone());
             }
-            out
         }
     }
+
+    if items.is_empty() {
+        return "{ }".to_string();
+    }
+
+    format!("{{ {} }}", join_comma(items))
 }
 
-fn print_fn_decl(decl: &AstFnDecl, prefix: &str, gpu_target: Option<&str>) -> String {
+fn format_imports(imports: &[Spanned<ImportGroup>]) -> String {
+    let mut grouped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    for group in imports {
+        let module = group.node.module_path.to_string();
+        let items = grouped.entry(module).or_default();
+        for item in &group.node.items {
+            match item {
+                ImportItem::Fn(name) | ImportItem::Type(name) => {
+                    items.insert(name.clone());
+                }
+            }
+        }
+    }
+
+    if grouped.is_empty() {
+        return "{ }".to_string();
+    }
+
+    let groups = grouped.into_iter().map(|(module, items)| {
+        format!("{}::{{{}}}", module, join_comma(items))
+    });
+
+    format!("{{ {} }}", join_comma(groups))
+}
+
+fn print_fn_decl(prefix: &str, f: &AstFnDecl, gpu_target: Option<&str>) -> String {
     let mut out = String::new();
-    out.push_str(&print_doc_lines(&decl.doc));
+    push_doc(&mut out, f.doc.as_deref());
 
     out.push_str(prefix);
     out.push(' ');
-    out.push_str(&decl.name);
+    out.push_str(&f.name);
     out.push('(');
-    out.push_str(
-        &decl
-            .params
-            .iter()
-            .map(|p| format!("%{}: {}", p.name, print_type(&p.ty.node)))
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
-    out.push(')');
-    out.push_str(" -> ");
-    out.push_str(&print_type(&decl.ret_ty.node));
+    out.push_str(&join_comma(f.params.iter().map(print_param)));
+    out.push_str(") -> ");
+    out.push_str(&print_type(&f.ret_ty.node));
 
     if let Some(target) = gpu_target {
         out.push_str(" target(");
@@ -184,225 +210,132 @@ fn print_fn_decl(decl: &AstFnDecl, prefix: &str, gpu_target: Option<&str>) -> St
         out.push(')');
     }
 
-    if let Some(meta) = &decl.meta {
+    if let Some(meta) = &f.meta {
         out.push(' ');
-        out.push_str(&print_fn_meta(meta));
+        out.push_str(&print_meta(meta));
     }
 
     out.push_str(" {\n");
 
-    let bb_map = canonical_block_map(&decl.blocks);
-    for (idx, block) in decl.blocks.iter().enumerate() {
-        let new_label = remap_bb_label(block.node.label, &bb_map);
-        out.push_str("  bb");
-        out.push_str(&new_label.to_string());
-        out.push_str(":\n");
+    let blocks = f.blocks.iter().map(|b| &b.node).collect::<Vec<_>>();
+    out.push_str(&print_blocks(&blocks));
 
-        for instr in &block.node.instrs {
-            out.push_str(&print_instr_with_bb_map(&instr.node, &bb_map, 4));
+    out.push_str("\n}");
+    out
+}
+
+fn print_gpu_fn_decl(gpu: &AstGpuFnDecl) -> String {
+    print_fn_decl("gpu fn", &gpu.inner, Some(&gpu.target))
+}
+
+fn print_blocks(blocks: &[&AstBlock]) -> String {
+    let label_map = build_block_label_map(blocks);
+    let mut out = String::new();
+
+    for (idx, block) in blocks.iter().enumerate() {
+        out.push_str(BLOCK_INDENT);
+        out.push_str(&format!("bb{}:\n", remap_bb(block.label, &label_map)));
+
+        for instr in &block.instrs {
+            out.push_str(&print_instr(&instr.node, &label_map, INSTR_INDENT));
             out.push('\n');
         }
 
-        out.push_str("    ");
-        out.push_str(&print_terminator_with_bb_map(
-            &block.node.terminator.node,
-            &bb_map,
-        ));
-        out.push('\n');
+        out.push_str(INSTR_INDENT);
+        out.push_str(&print_terminator_with_label_map(&block.terminator.node, &label_map));
 
-        if idx + 1 < decl.blocks.len() {
-            out.push('\n');
+        if idx + 1 != blocks.len() {
+            out.push_str("\n\n");
         }
     }
 
-    out.push('}');
     out
 }
 
-fn print_fn_meta(meta: &AstFnMeta) -> String {
-    let mut uses = meta.uses.clone();
-    uses.sort();
-
-    let mut effects = meta.effects.clone();
-    effects.sort();
-
-    let mut cost = meta.cost.clone();
-    cost.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let cost_items = cost
-        .into_iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>();
-
-    format!(
-        "meta {{ uses {} effects {} cost {} }}",
-        format_braced_list(uses),
-        format_braced_list(effects),
-        format_braced_list(cost_items),
-    )
-}
-
-fn print_struct_decl(decl: &AstStructDecl, prefix: &str) -> String {
-    let mut out = String::new();
-    out.push_str(&print_doc_lines(&decl.doc));
-    out.push_str(prefix);
-    out.push(' ');
-    out.push_str(&decl.name);
-    out.push_str(&print_type_params(&decl.type_params));
-    out.push_str(" {\n");
-
-    for field in &decl.fields {
-        out.push_str("  field ");
-        out.push_str(&field.name);
-        out.push_str(": ");
-        out.push_str(&print_type(&field.ty.node));
-        out.push('\n');
+fn build_block_label_map(blocks: &[&AstBlock]) -> HashMap<u32, u32> {
+    let mut map = HashMap::new();
+    for (idx, block) in blocks.iter().enumerate() {
+        map.insert(block.label, idx as u32);
     }
-
-    out.push('}');
-    out
+    map
 }
 
-fn print_enum_decl(decl: &AstEnumDecl, prefix: &str) -> String {
-    let mut out = String::new();
-    out.push_str(&print_doc_lines(&decl.doc));
-    out.push_str(prefix);
-    out.push(' ');
-    out.push_str(&decl.name);
-    out.push_str(&print_type_params(&decl.type_params));
-    out.push_str(" {\n");
-
-    for variant in &decl.variants {
-        out.push_str("  variant ");
-        out.push_str(&variant.name);
-        out.push_str(" { ");
-        out.push_str(
-            &variant
-                .fields
-                .iter()
-                .map(|f| format!("field {}: {}", f.name, print_type(&f.ty.node)))
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        out.push_str(" }\n");
-    }
-
-    out.push('}');
-    out
-}
-
-fn print_extern_decl(decl: &AstExternModule) -> String {
-    let mut out = String::new();
-    out.push_str(&print_doc_lines(&decl.doc));
-    out.push_str("extern ");
-    out.push_str(&print_string_literal(&decl.abi));
-    out.push_str(" module ");
-    out.push_str(&decl.name);
-    out.push_str(" {\n");
-
-    for item in &decl.items {
-        out.push_str("  fn ");
-        out.push_str(&item.name);
-        out.push('(');
-        out.push_str(
-            &item
-                .params
-                .iter()
-                .map(|p| format!("%{}: {}", p.name, print_type(&p.ty.node)))
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        out.push(')');
-        out.push_str(" -> ");
-        out.push_str(&print_type(&item.ret_ty.node));
-
-        if !item.attrs.is_empty() {
-            let mut attrs = item.attrs.clone();
-            attrs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            out.push_str(" attrs ");
-            out.push_str(&format_braced_list(
-                attrs
-                    .into_iter()
-                    .map(|(k, v)| format!("{k}={}", print_string_literal(&v)))
-                    .collect::<Vec<_>>(),
-            ));
-        }
-
-        out.push('\n');
-    }
-
-    out.push('}');
-    out
-}
-
-fn print_global_decl(decl: &AstGlobalDecl) -> String {
-    let mut out = String::new();
-    out.push_str(&print_doc_lines(&decl.doc));
-    out.push_str("global ");
-    out.push_str(&decl.name);
-    out.push_str(": ");
-    out.push_str(&print_type(&decl.ty.node));
-    out.push_str(" = ");
-    out.push_str(&print_const_expr(&decl.init));
-    out
-}
-
-fn print_impl_decl(decl: &AstImplDecl) -> String {
-    format!(
-        "impl {} for {} = {}",
-        decl.trait_name,
-        print_type(&decl.for_type),
-        decl.fn_ref
-    )
-}
-
-fn print_sig_decl(decl: &AstSigDecl) -> String {
-    format!(
-        "sig {}({}) -> {}",
-        decl.name,
-        decl.param_types
-            .iter()
-            .map(print_type)
-            .collect::<Vec<_>>()
-            .join(", "),
-        print_type(&decl.ret_ty)
-    )
-}
-
-fn print_instr_with_bb_map(instr: &AstInstr, bb_map: &HashMap<u32, u32>, indent: usize) -> String {
-    let pad = " ".repeat(indent);
+fn print_instr(instr: &AstInstr, label_map: &HashMap<u32, u32>, indent: &str) -> String {
     match instr {
         AstInstr::Assign { name, ty, op } => format!(
-            "{pad}%{}: {} = {}",
+            "{}%{}: {} = {}",
+            indent,
             name,
             print_type(&ty.node),
-            print_op_with_bb_map(op, bb_map)
+            print_op_with_label_map(op, label_map)
         ),
-        AstInstr::Void(op) => format!("{pad}{}", print_op_void_with_bb_map(op, bb_map)),
-        AstInstr::UnsafeBlock(inner) => {
+        AstInstr::Void(op) => format!("{}{}", indent, print_op_void_with_label_map(op, label_map)),
+        AstInstr::UnsafeBlock(instrs) => {
             let mut out = String::new();
-            out.push_str(&pad);
+            out.push_str(indent);
             out.push_str("unsafe {\n");
-            for i in inner {
-                out.push_str(&print_instr_with_bb_map(&i.node, bb_map, indent + 2));
+
+            for inner in instrs {
+                out.push_str(&print_instr(&inner.node, label_map, "      "));
                 out.push('\n');
             }
-            out.push_str(&pad);
+
+            out.push_str(indent);
             out.push('}');
             out
         }
     }
 }
 
-fn print_op_with_bb_map(op: &AstOp, bb_map: &HashMap<u32, u32>) -> String {
+fn print_terminator_with_label_map(term: &AstTerminator, label_map: &HashMap<u32, u32>) -> String {
+    match term {
+        AstTerminator::Ret(Some(v)) => format!("ret {}", print_value_ref(v)),
+        AstTerminator::Ret(None) => "ret".to_string(),
+        AstTerminator::Br(bb) => format!("br bb{}", remap_bb(*bb, label_map)),
+        AstTerminator::Cbr {
+            cond,
+            then_bb,
+            else_bb,
+        } => format!(
+            "cbr {} bb{} bb{}",
+            print_value_ref(cond),
+            remap_bb(*then_bb, label_map),
+            remap_bb(*else_bb, label_map)
+        ),
+        AstTerminator::Switch { val, arms, default } => {
+            let arm_text = if arms.is_empty() {
+                "".to_string()
+            } else {
+                format!(
+                    " {}",
+                    arms.iter()
+                        .map(|(lit, bb)| format!(
+                            "case {} -> bb{}",
+                            print_const_lit(lit),
+                            remap_bb(*bb, label_map)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            };
+
+            format!(
+                "switch {} {{{} }} else bb{}",
+                print_value_ref(val),
+                arm_text,
+                remap_bb(*default, label_map)
+            )
+        }
+        AstTerminator::Unreachable => "unreachable".to_string(),
+    }
+}
+
+fn print_op_with_label_map(op: &AstOp, label_map: &HashMap<u32, u32>) -> String {
     match op {
         AstOp::Const(c) => print_const_expr(c),
-        AstOp::BinOp { kind, lhs, rhs } => format!(
-            "{} {}",
-            print_bin_op(kind),
-            print_kv_args(vec![
-                ("lhs".to_string(), print_value_ref(lhs)),
-                ("rhs".to_string(), print_value_ref(rhs)),
-            ])
+        AstOp::BinOp { kind, lhs, rhs } => print_op_with_pairs(
+            bin_op_name(kind),
+            vec![("lhs", print_value_ref(lhs)), ("rhs", print_value_ref(rhs))],
         ),
         AstOp::Cmp {
             kind,
@@ -411,370 +344,242 @@ fn print_op_with_bb_map(op: &AstOp, bb_map: &HashMap<u32, u32>) -> String {
             rhs,
         } => {
             let op_name = match kind {
-                CmpKind::ICmp => format!("icmp.{pred}"),
-                CmpKind::FCmp => format!("fcmp.{pred}"),
+                CmpKind::ICmp => format!("icmp.{}", pred),
+                CmpKind::FCmp => format!("fcmp.{}", pred),
             };
-            format!(
-                "{} {}",
-                op_name,
-                print_kv_args(vec![
-                    ("lhs".to_string(), print_value_ref(lhs)),
-                    ("rhs".to_string(), print_value_ref(rhs)),
-                ])
+            print_op_with_pairs(
+                &op_name,
+                vec![("lhs", print_value_ref(lhs)), ("rhs", print_value_ref(rhs))],
             )
         }
-        AstOp::Call { callee, targs, args } => format!(
-            "call {}{} {}",
-            callee,
-            print_type_args(targs),
-            print_arg_kv_args(args)
-        ),
-        AstOp::CallIndirect { callee, args } => format!(
-            "call.indirect {} {}",
-            print_value_ref(callee),
-            print_arg_kv_args(args)
-        ),
-        AstOp::Try { callee, targs, args } => format!(
-            "try {}{} {}",
-            callee,
-            print_type_args(targs),
-            print_arg_kv_args(args)
-        ),
+        AstOp::Call { callee, targs, args } => {
+            format!("call {}{} {}", callee, print_type_args(targs), print_arg_pairs(args))
+        }
+        AstOp::CallIndirect { callee, args } => {
+            format!("call.indirect {} {}", print_value_ref(callee), print_arg_pairs(args))
+        }
+        AstOp::Try { callee, targs, args } => {
+            format!("try {}{} {}", callee, print_type_args(targs), print_arg_pairs(args))
+        }
         AstOp::SuspendCall { callee, targs, args } => format!(
             "suspend.call {}{} {}",
             callee,
             print_type_args(targs),
-            print_arg_kv_args(args)
+            print_arg_pairs(args)
         ),
-        AstOp::SuspendAwait { fut } => format!(
-            "suspend.await {}",
-            print_kv_args(vec![("fut".to_string(), print_value_ref(fut)),])
-        ),
-        AstOp::New { ty, fields } => format!(
-            "new {} {}",
-            print_type(ty),
-            print_kv_args(
-                fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), print_value_ref(v)))
-                    .collect(),
-            )
-        ),
-        AstOp::GetField { obj, field } => format!(
-            "getfield {}",
-            print_kv_args(vec![
-                ("obj".to_string(), print_value_ref(obj)),
-                ("field".to_string(), field.clone()),
-            ])
+        AstOp::SuspendAwait { fut } => {
+            print_op_with_pairs("suspend.await", vec![("fut", print_value_ref(fut))])
+        }
+        AstOp::New { ty, fields } => format!("new {} {}", print_type(ty), print_value_pairs(fields)),
+        AstOp::GetField { obj, field } => print_op_with_pairs(
+            "getfield",
+            vec![("obj", print_value_ref(obj)), ("field", field.clone())],
         ),
         AstOp::Phi { ty, incomings } => {
             let mut incoming = incomings
                 .iter()
-                .map(|(bb, v)| (remap_bb_label(*bb, bb_map), print_value_ref(v)))
+                .map(|(bb, v)| (remap_bb(*bb, label_map), print_value_ref(v)))
                 .collect::<Vec<_>>();
-            incoming.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            format!(
-                "phi {} {}",
-                print_type(ty),
-                if incoming.is_empty() {
-                    "{ }".to_string()
-                } else {
-                    format!(
-                        "{{ {} }}",
-                        incoming
-                            .into_iter()
-                            .map(|(bb, v)| format!("[bb{}:{}]", bb, v))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                }
-            )
+            incoming.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let body = if incoming.is_empty() {
+                "{ }".to_string()
+            } else {
+                format!(
+                    "{{ {} }}",
+                    incoming
+                        .into_iter()
+                        .map(|(bb, v)| format!("[bb{}:{}]", bb, v))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            format!("phi {} {}", print_type(ty), body)
         }
         AstOp::EnumNew { variant, args } => {
-            let mut sorted = args.clone();
-            sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| print_value_ref(&a.1).cmp(&print_value_ref(&b.1))));
-            format!(
-                "enum.new<{}> {}",
-                variant,
-                print_kv_args(
-                    sorted
-                        .into_iter()
-                        .map(|(k, v)| (k, print_value_ref(&v)))
-                        .collect(),
-                )
-            )
+            format!("enum.new<{}> {}", variant, print_value_pairs(args))
         }
-        AstOp::EnumTag { v } => format!(
-            "enum.tag {}",
-            print_kv_args(vec![("v".to_string(), print_value_ref(v)),])
-        ),
+        AstOp::EnumTag { v } => print_op_with_pairs("enum.tag", vec![("v", print_value_ref(v))]),
         AstOp::EnumPayload { variant, v } => format!(
             "enum.payload<{}> {}",
             variant,
-            print_kv_args(vec![("v".to_string(), print_value_ref(v)),])
+            format_pairs(vec![("v", print_value_ref(v))])
         ),
-        AstOp::EnumIs { variant, v } => format!(
-            "enum.is<{}> {}",
-            variant,
-            print_kv_args(vec![("v".to_string(), print_value_ref(v)),])
-        ),
-        AstOp::Share { v } => format!(
-            "share {}",
-            print_kv_args(vec![("v".to_string(), print_value_ref(v)),])
-        ),
-        AstOp::CloneShared { v } => format!(
-            "clone.shared {}",
-            print_kv_args(vec![("v".to_string(), print_value_ref(v)),])
-        ),
-        AstOp::CloneWeak { v } => format!(
-            "clone.weak {}",
-            print_kv_args(vec![("v".to_string(), print_value_ref(v)),])
-        ),
-        AstOp::WeakDowngrade { v } => format!(
-            "weak.downgrade {}",
-            print_kv_args(vec![("v".to_string(), print_value_ref(v)),])
-        ),
-        AstOp::WeakUpgrade { v } => format!(
-            "weak.upgrade {}",
-            print_kv_args(vec![("v".to_string(), print_value_ref(v)),])
-        ),
+        AstOp::EnumIs { variant, v } => {
+            format!("enum.is<{}> {}", variant, format_pairs(vec![("v", print_value_ref(v))]))
+        }
+        AstOp::Share { v } => print_op_with_pairs("share", vec![("v", print_value_ref(v))]),
+        AstOp::CloneShared { v } => {
+            print_op_with_pairs("clone.shared", vec![("v", print_value_ref(v))])
+        }
+        AstOp::CloneWeak { v } => print_op_with_pairs("clone.weak", vec![("v", print_value_ref(v))]),
+        AstOp::WeakDowngrade { v } => {
+            print_op_with_pairs("weak.downgrade", vec![("v", print_value_ref(v))])
+        }
+        AstOp::WeakUpgrade { v } => {
+            print_op_with_pairs("weak.upgrade", vec![("v", print_value_ref(v))])
+        }
         AstOp::Cast { from, to, v } => format!(
             "cast<{}, {}> {}",
             print_type(from),
             print_type(to),
-            print_kv_args(vec![("v".to_string(), print_value_ref(v)),])
+            format_pairs(vec![("v", print_value_ref(v))])
         ),
-        AstOp::BorrowShared { v } => format!(
-            "borrow.shared {}",
-            print_kv_args(vec![("v".to_string(), print_value_ref(v)),])
-        ),
-        AstOp::BorrowMut { v } => format!(
-            "borrow.mut {}",
-            print_kv_args(vec![("v".to_string(), print_value_ref(v)),])
-        ),
+        AstOp::BorrowShared { v } => {
+            print_op_with_pairs("borrow.shared", vec![("v", print_value_ref(v))])
+        }
+        AstOp::BorrowMut { v } => print_op_with_pairs("borrow.mut", vec![("v", print_value_ref(v))]),
         AstOp::PtrNull { ty } => format!("ptr.null<{}>", print_type(ty)),
         AstOp::PtrAddr { ty, p } => format!(
             "ptr.addr<{}> {}",
             print_type(ty),
-            print_kv_args(vec![("p".to_string(), print_value_ref(p)),])
+            format_pairs(vec![("p", print_value_ref(p))])
         ),
         AstOp::PtrFromAddr { ty, addr } => format!(
             "ptr.from_addr<{}> {}",
             print_type(ty),
-            print_kv_args(vec![("addr".to_string(), print_value_ref(addr)),])
+            format_pairs(vec![("addr", print_value_ref(addr))])
         ),
         AstOp::PtrAdd { ty, p, count } => format!(
             "ptr.add<{}> {}",
             print_type(ty),
-            print_kv_args(vec![
-                ("p".to_string(), print_value_ref(p)),
-                ("count".to_string(), print_value_ref(count)),
-            ])
+            format_pairs(vec![("p", print_value_ref(p)), ("count", print_value_ref(count))])
         ),
         AstOp::PtrLoad { ty, p } => format!(
             "ptr.load<{}> {}",
             print_type(ty),
-            print_kv_args(vec![("p".to_string(), print_value_ref(p)),])
+            format_pairs(vec![("p", print_value_ref(p))])
         ),
-        AstOp::CallableCapture { fn_ref, captures } => format!(
-            "callable.capture {} {}",
-            fn_ref,
-            print_kv_args(
-                captures
-                    .iter()
-                    .map(|(k, v)| (k.clone(), print_value_ref(v)))
-                    .collect(),
-            )
-        ),
+        AstOp::CallableCapture { fn_ref, captures } => {
+            format!("callable.capture {} {}", fn_ref, print_value_pairs(captures))
+        }
         AstOp::ArrNew { elem_ty, cap } => format!(
             "arr.new<{}> {}",
             print_type(elem_ty),
-            print_kv_args(vec![("cap".to_string(), print_value_ref(cap)),])
+            format_pairs(vec![("cap", print_value_ref(cap))])
         ),
-        AstOp::ArrLen { arr } => format!(
-            "arr.len {}",
-            print_kv_args(vec![("arr".to_string(), print_value_ref(arr)),])
+        AstOp::ArrLen { arr } => print_op_with_pairs("arr.len", vec![("arr", print_value_ref(arr))]),
+        AstOp::ArrGet { arr, idx } => print_op_with_pairs(
+            "arr.get",
+            vec![("arr", print_value_ref(arr)), ("idx", print_value_ref(idx))],
         ),
-        AstOp::ArrGet { arr, idx } => format!(
-            "arr.get {}",
-            print_kv_args(vec![
-                ("arr".to_string(), print_value_ref(arr)),
-                ("idx".to_string(), print_value_ref(idx)),
-            ])
+        AstOp::ArrPop { arr } => print_op_with_pairs("arr.pop", vec![("arr", print_value_ref(arr))]),
+        AstOp::ArrSlice { arr, start, end } => print_op_with_pairs(
+            "arr.slice",
+            vec![
+                ("arr", print_value_ref(arr)),
+                ("start", print_value_ref(start)),
+                ("end", print_value_ref(end)),
+            ],
         ),
-        AstOp::ArrPop { arr } => format!(
-            "arr.pop {}",
-            print_kv_args(vec![("arr".to_string(), print_value_ref(arr)),])
+        AstOp::ArrContains { arr, val } => print_op_with_pairs(
+            "arr.contains",
+            vec![("arr", print_value_ref(arr)), ("val", print_value_ref(val))],
         ),
-        AstOp::ArrSlice { arr, start, end } => format!(
-            "arr.slice {}",
-            print_kv_args(vec![
-                ("arr".to_string(), print_value_ref(arr)),
-                ("start".to_string(), print_value_ref(start)),
-                ("end".to_string(), print_value_ref(end)),
-            ])
+        AstOp::ArrMap { arr, func } => print_op_with_pairs(
+            "arr.map",
+            vec![("arr", print_value_ref(arr)), ("fn", print_value_ref(func))],
         ),
-        AstOp::ArrContains { arr, val } => format!(
-            "arr.contains {}",
-            print_kv_args(vec![
-                ("arr".to_string(), print_value_ref(arr)),
-                ("val".to_string(), print_value_ref(val)),
-            ])
+        AstOp::ArrFilter { arr, func } => print_op_with_pairs(
+            "arr.filter",
+            vec![("arr", print_value_ref(arr)), ("fn", print_value_ref(func))],
         ),
-        AstOp::ArrMap { arr, func } => format!(
-            "arr.map {}",
-            print_kv_args(vec![
-                ("arr".to_string(), print_value_ref(arr)),
-                ("fn".to_string(), print_value_ref(func)),
-            ])
-        ),
-        AstOp::ArrFilter { arr, func } => format!(
-            "arr.filter {}",
-            print_kv_args(vec![
-                ("arr".to_string(), print_value_ref(arr)),
-                ("fn".to_string(), print_value_ref(func)),
-            ])
-        ),
-        AstOp::ArrReduce { arr, init, func } => format!(
-            "arr.reduce {}",
-            print_kv_args(vec![
-                ("arr".to_string(), print_value_ref(arr)),
-                ("init".to_string(), print_value_ref(init)),
-                ("fn".to_string(), print_value_ref(func)),
-            ])
+        AstOp::ArrReduce { arr, init, func } => print_op_with_pairs(
+            "arr.reduce",
+            vec![
+                ("arr", print_value_ref(arr)),
+                ("init", print_value_ref(init)),
+                ("fn", print_value_ref(func)),
+            ],
         ),
         AstOp::MapNew { key_ty, val_ty } => {
             format!("map.new<{}, {}> {{ }}", print_type(key_ty), print_type(val_ty))
         }
-        AstOp::MapLen { map } => format!(
-            "map.len {}",
-            print_kv_args(vec![("map".to_string(), print_value_ref(map)),])
+        AstOp::MapLen { map } => print_op_with_pairs("map.len", vec![("map", print_value_ref(map))]),
+        AstOp::MapGet { map, key } => print_op_with_pairs(
+            "map.get",
+            vec![("map", print_value_ref(map)), ("key", print_value_ref(key))],
         ),
-        AstOp::MapGet { map, key } => format!(
-            "map.get {}",
-            print_kv_args(vec![
-                ("map".to_string(), print_value_ref(map)),
-                ("key".to_string(), print_value_ref(key)),
-            ])
+        AstOp::MapGetRef { map, key } => print_op_with_pairs(
+            "map.get_ref",
+            vec![("map", print_value_ref(map)), ("key", print_value_ref(key))],
         ),
-        AstOp::MapGetRef { map, key } => format!(
-            "map.get_ref {}",
-            print_kv_args(vec![
-                ("map".to_string(), print_value_ref(map)),
-                ("key".to_string(), print_value_ref(key)),
-            ])
+        AstOp::MapDelete { map, key } => print_op_with_pairs(
+            "map.delete",
+            vec![("map", print_value_ref(map)), ("key", print_value_ref(key))],
         ),
-        AstOp::MapDelete { map, key } => format!(
-            "map.delete {}",
-            print_kv_args(vec![
-                ("map".to_string(), print_value_ref(map)),
-                ("key".to_string(), print_value_ref(key)),
-            ])
+        AstOp::MapContainsKey { map, key } => print_op_with_pairs(
+            "map.contains_key",
+            vec![("map", print_value_ref(map)), ("key", print_value_ref(key))],
         ),
-        AstOp::MapContainsKey { map, key } => format!(
-            "map.contains_key {}",
-            print_kv_args(vec![
-                ("map".to_string(), print_value_ref(map)),
-                ("key".to_string(), print_value_ref(key)),
-            ])
+        AstOp::MapKeys { map } => print_op_with_pairs("map.keys", vec![("map", print_value_ref(map))]),
+        AstOp::MapValues { map } => {
+            print_op_with_pairs("map.values", vec![("map", print_value_ref(map))])
+        }
+        AstOp::StrConcat { a, b } => print_op_with_pairs(
+            "str.concat",
+            vec![("a", print_value_ref(a)), ("b", print_value_ref(b))],
         ),
-        AstOp::MapKeys { map } => format!(
-            "map.keys {}",
-            print_kv_args(vec![("map".to_string(), print_value_ref(map)),])
+        AstOp::StrLen { s } => print_op_with_pairs("str.len", vec![("s", print_value_ref(s))]),
+        AstOp::StrEq { a, b } => {
+            print_op_with_pairs("str.eq", vec![("a", print_value_ref(a)), ("b", print_value_ref(b))])
+        }
+        AstOp::StrSlice { s, start, end } => print_op_with_pairs(
+            "str.slice",
+            vec![
+                ("s", print_value_ref(s)),
+                ("start", print_value_ref(start)),
+                ("end", print_value_ref(end)),
+            ],
         ),
-        AstOp::MapValues { map } => format!(
-            "map.values {}",
-            print_kv_args(vec![("map".to_string(), print_value_ref(map)),])
-        ),
-        AstOp::StrConcat { a, b } => format!(
-            "str.concat {}",
-            print_kv_args(vec![
-                ("a".to_string(), print_value_ref(a)),
-                ("b".to_string(), print_value_ref(b)),
-            ])
-        ),
-        AstOp::StrLen { s } => format!(
-            "str.len {}",
-            print_kv_args(vec![("s".to_string(), print_value_ref(s)),])
-        ),
-        AstOp::StrEq { a, b } => format!(
-            "str.eq {}",
-            print_kv_args(vec![
-                ("a".to_string(), print_value_ref(a)),
-                ("b".to_string(), print_value_ref(b)),
-            ])
-        ),
-        AstOp::StrSlice { s, start, end } => format!(
-            "str.slice {}",
-            print_kv_args(vec![
-                ("s".to_string(), print_value_ref(s)),
-                ("start".to_string(), print_value_ref(start)),
-                ("end".to_string(), print_value_ref(end)),
-            ])
-        ),
-        AstOp::StrBytes { s } => format!(
-            "str.bytes {}",
-            print_kv_args(vec![("s".to_string(), print_value_ref(s)),])
-        ),
+        AstOp::StrBytes { s } => print_op_with_pairs("str.bytes", vec![("s", print_value_ref(s))]),
         AstOp::StrBuilderNew => "str.builder.new { }".to_string(),
-        AstOp::StrBuilderBuild { b } => format!(
-            "str.builder.build {}",
-            print_kv_args(vec![("b".to_string(), print_value_ref(b)),])
-        ),
-        AstOp::StrParseI64 { s } => format!(
-            "str.parse_i64 {}",
-            print_kv_args(vec![("s".to_string(), print_value_ref(s)),])
-        ),
-        AstOp::StrParseU64 { s } => format!(
-            "str.parse_u64 {}",
-            print_kv_args(vec![("s".to_string(), print_value_ref(s)),])
-        ),
-        AstOp::StrParseF64 { s } => format!(
-            "str.parse_f64 {}",
-            print_kv_args(vec![("s".to_string(), print_value_ref(s)),])
-        ),
-        AstOp::StrParseBool { s } => format!(
-            "str.parse_bool {}",
-            print_kv_args(vec![("s".to_string(), print_value_ref(s)),])
-        ),
+        AstOp::StrBuilderBuild { b } => {
+            print_op_with_pairs("str.builder.build", vec![("b", print_value_ref(b))])
+        }
+        AstOp::StrParseI64 { s } => {
+            print_op_with_pairs("str.parse_i64", vec![("s", print_value_ref(s))])
+        }
+        AstOp::StrParseU64 { s } => {
+            print_op_with_pairs("str.parse_u64", vec![("s", print_value_ref(s))])
+        }
+        AstOp::StrParseF64 { s } => {
+            print_op_with_pairs("str.parse_f64", vec![("s", print_value_ref(s))])
+        }
+        AstOp::StrParseBool { s } => {
+            print_op_with_pairs("str.parse_bool", vec![("s", print_value_ref(s))])
+        }
         AstOp::JsonEncode { ty, v } => format!(
             "json.encode<{}> {}",
             print_type(ty),
-            print_kv_args(vec![("v".to_string(), print_value_ref(v)),])
+            format_pairs(vec![("v", print_value_ref(v))])
         ),
         AstOp::JsonDecode { ty, s } => format!(
             "json.decode<{}> {}",
             print_type(ty),
-            print_kv_args(vec![("s".to_string(), print_value_ref(s)),])
+            format_pairs(vec![("s", print_value_ref(s))])
         ),
-        AstOp::GpuThreadId { dim } => format!(
-            "gpu.thread_id {}",
-            print_kv_args(vec![("dim".to_string(), print_value_ref(dim)),])
-        ),
-        AstOp::GpuWorkgroupId { dim } => format!(
-            "gpu.workgroup_id {}",
-            print_kv_args(vec![("dim".to_string(), print_value_ref(dim)),])
-        ),
-        AstOp::GpuWorkgroupSize { dim } => format!(
-            "gpu.workgroup_size {}",
-            print_kv_args(vec![("dim".to_string(), print_value_ref(dim)),])
-        ),
-        AstOp::GpuGlobalId { dim } => format!(
-            "gpu.global_id {}",
-            print_kv_args(vec![("dim".to_string(), print_value_ref(dim)),])
-        ),
+        AstOp::GpuThreadId { dim } => {
+            print_op_with_pairs("gpu.thread_id", vec![("dim", print_value_ref(dim))])
+        }
+        AstOp::GpuWorkgroupId { dim } => {
+            print_op_with_pairs("gpu.workgroup_id", vec![("dim", print_value_ref(dim))])
+        }
+        AstOp::GpuWorkgroupSize { dim } => {
+            print_op_with_pairs("gpu.workgroup_size", vec![("dim", print_value_ref(dim))])
+        }
+        AstOp::GpuGlobalId { dim } => {
+            print_op_with_pairs("gpu.global_id", vec![("dim", print_value_ref(dim))])
+        }
         AstOp::GpuBufferLoad { ty, buf, idx } => format!(
             "gpu.buffer_load<{}> {}",
             print_type(ty),
-            print_kv_args(vec![
-                ("buf".to_string(), print_value_ref(buf)),
-                ("idx".to_string(), print_value_ref(idx)),
-            ])
+            format_pairs(vec![("buf", print_value_ref(buf)), ("idx", print_value_ref(idx))])
         ),
         AstOp::GpuBufferLen { ty, buf } => format!(
             "gpu.buffer_len<{}> {}",
             print_type(ty),
-            print_kv_args(vec![("buf".to_string(), print_value_ref(buf)),])
+            format_pairs(vec![("buf", print_value_ref(buf))])
         ),
         AstOp::GpuShared { count, ty } => format!("gpu.shared<{}, {}>", count, print_type(ty)),
         AstOp::GpuLaunch {
@@ -783,15 +588,15 @@ fn print_op_with_bb_map(op: &AstOp, bb_map: &HashMap<u32, u32>) -> String {
             grid,
             block,
             args,
-        } => format!(
-            "gpu.launch {}",
-            print_arg_kv_args(&[
-                ("device".to_string(), AstArgValue::Value(device.clone())),
-                ("kernel".to_string(), AstArgValue::FnRef(kernel.clone())),
-                ("grid".to_string(), grid.clone()),
-                ("block".to_string(), block.clone()),
-                ("args".to_string(), args.clone()),
-            ])
+        } => print_op_with_pairs(
+            "gpu.launch",
+            vec![
+                ("device", print_value_ref(device)),
+                ("kernel", kernel.clone()),
+                ("grid", print_arg_value(grid)),
+                ("block", print_arg_value(block)),
+                ("args", print_arg_value(args)),
+            ],
         ),
         AstOp::GpuLaunchAsync {
             device,
@@ -799,273 +604,136 @@ fn print_op_with_bb_map(op: &AstOp, bb_map: &HashMap<u32, u32>) -> String {
             grid,
             block,
             args,
-        } => format!(
-            "gpu.launch_async {}",
-            print_arg_kv_args(&[
-                ("device".to_string(), AstArgValue::Value(device.clone())),
-                ("kernel".to_string(), AstArgValue::FnRef(kernel.clone())),
-                ("grid".to_string(), grid.clone()),
-                ("block".to_string(), block.clone()),
-                ("args".to_string(), args.clone()),
-            ])
+        } => print_op_with_pairs(
+            "gpu.launch_async",
+            vec![
+                ("device", print_value_ref(device)),
+                ("kernel", kernel.clone()),
+                ("grid", print_arg_value(grid)),
+                ("block", print_arg_value(block)),
+                ("args", print_arg_value(args)),
+            ],
         ),
     }
 }
 
-fn print_op_void_with_bb_map(op: &AstOpVoid, _bb_map: &HashMap<u32, u32>) -> String {
+fn print_op_void_with_label_map(op: &AstOpVoid, _label_map: &HashMap<u32, u32>) -> String {
     match op {
         AstOpVoid::CallVoid { callee, targs, args } => format!(
             "call_void {}{} {}",
             callee,
             print_type_args(targs),
-            print_arg_kv_args(args)
+            print_arg_pairs(args)
         ),
         AstOpVoid::CallVoidIndirect { callee, args } => format!(
             "call_void.indirect {} {}",
             print_value_ref(callee),
-            print_arg_kv_args(args)
+            print_arg_pairs(args)
         ),
-        AstOpVoid::SetField { obj, field, val } => format!(
-            "setfield {}",
-            print_kv_args(vec![
-                ("obj".to_string(), print_value_ref(obj)),
-                ("field".to_string(), field.clone()),
-                ("val".to_string(), print_value_ref(val)),
-            ])
+        AstOpVoid::SetField { obj, field, val } => print_op_with_pairs(
+            "setfield",
+            vec![
+                ("obj", print_value_ref(obj)),
+                ("field", field.clone()),
+                ("val", print_value_ref(val)),
+            ],
         ),
-        AstOpVoid::Panic { msg } => format!(
-            "panic {}",
-            print_kv_args(vec![("msg".to_string(), print_value_ref(msg)),])
-        ),
+        AstOpVoid::Panic { msg } => print_op_with_pairs("panic", vec![("msg", print_value_ref(msg))]),
         AstOpVoid::PtrStore { ty, p, v } => format!(
             "ptr.store<{}> {}",
             print_type(ty),
-            print_kv_args(vec![
-                ("p".to_string(), print_value_ref(p)),
-                ("v".to_string(), print_value_ref(v)),
-            ])
+            format_pairs(vec![("p", print_value_ref(p)), ("v", print_value_ref(v))])
         ),
-        AstOpVoid::ArrSet { arr, idx, val } => format!(
-            "arr.set {}",
-            print_kv_args(vec![
-                ("arr".to_string(), print_value_ref(arr)),
-                ("idx".to_string(), print_value_ref(idx)),
-                ("val".to_string(), print_value_ref(val)),
-            ])
+        AstOpVoid::ArrSet { arr, idx, val } => print_op_with_pairs(
+            "arr.set",
+            vec![
+                ("arr", print_value_ref(arr)),
+                ("idx", print_value_ref(idx)),
+                ("val", print_value_ref(val)),
+            ],
         ),
-        AstOpVoid::ArrPush { arr, val } => format!(
-            "arr.push {}",
-            print_kv_args(vec![
-                ("arr".to_string(), print_value_ref(arr)),
-                ("val".to_string(), print_value_ref(val)),
-            ])
+        AstOpVoid::ArrPush { arr, val } => print_op_with_pairs(
+            "arr.push",
+            vec![("arr", print_value_ref(arr)), ("val", print_value_ref(val))],
         ),
-        AstOpVoid::ArrSort { arr } => format!(
-            "arr.sort {}",
-            print_kv_args(vec![("arr".to_string(), print_value_ref(arr)),])
+        AstOpVoid::ArrSort { arr } => {
+            print_op_with_pairs("arr.sort", vec![("arr", print_value_ref(arr))])
+        }
+        AstOpVoid::ArrForeach { arr, func } => print_op_with_pairs(
+            "arr.foreach",
+            vec![("arr", print_value_ref(arr)), ("fn", print_value_ref(func))],
         ),
-        AstOpVoid::ArrForeach { arr, func } => format!(
-            "arr.foreach {}",
-            print_kv_args(vec![
-                ("arr".to_string(), print_value_ref(arr)),
-                ("fn".to_string(), print_value_ref(func)),
-            ])
+        AstOpVoid::MapSet { map, key, val } => print_op_with_pairs(
+            "map.set",
+            vec![
+                ("map", print_value_ref(map)),
+                ("key", print_value_ref(key)),
+                ("val", print_value_ref(val)),
+            ],
         ),
-        AstOpVoid::MapSet { map, key, val } => format!(
-            "map.set {}",
-            print_kv_args(vec![
-                ("map".to_string(), print_value_ref(map)),
-                ("key".to_string(), print_value_ref(key)),
-                ("val".to_string(), print_value_ref(val)),
-            ])
+        AstOpVoid::MapDeleteVoid { map, key } => print_op_with_pairs(
+            "map.delete_void",
+            vec![("map", print_value_ref(map)), ("key", print_value_ref(key))],
         ),
-        AstOpVoid::MapDeleteVoid { map, key } => format!(
-            "map.delete_void {}",
-            print_kv_args(vec![
-                ("map".to_string(), print_value_ref(map)),
-                ("key".to_string(), print_value_ref(key)),
-            ])
+        AstOpVoid::StrBuilderAppendStr { b, s } => print_op_with_pairs(
+            "str.builder.append_str",
+            vec![("b", print_value_ref(b)), ("s", print_value_ref(s))],
         ),
-        AstOpVoid::StrBuilderAppendStr { b, s } => format!(
-            "str.builder.append_str {}",
-            print_kv_args(vec![
-                ("b".to_string(), print_value_ref(b)),
-                ("s".to_string(), print_value_ref(s)),
-            ])
+        AstOpVoid::StrBuilderAppendI64 { b, v } => print_op_with_pairs(
+            "str.builder.append_i64",
+            vec![("b", print_value_ref(b)), ("v", print_value_ref(v))],
         ),
-        AstOpVoid::StrBuilderAppendI64 { b, v } => format!(
-            "str.builder.append_i64 {}",
-            print_kv_args(vec![
-                ("b".to_string(), print_value_ref(b)),
-                ("v".to_string(), print_value_ref(v)),
-            ])
+        AstOpVoid::StrBuilderAppendI32 { b, v } => print_op_with_pairs(
+            "str.builder.append_i32",
+            vec![("b", print_value_ref(b)), ("v", print_value_ref(v))],
         ),
-        AstOpVoid::StrBuilderAppendI32 { b, v } => format!(
-            "str.builder.append_i32 {}",
-            print_kv_args(vec![
-                ("b".to_string(), print_value_ref(b)),
-                ("v".to_string(), print_value_ref(v)),
-            ])
+        AstOpVoid::StrBuilderAppendF64 { b, v } => print_op_with_pairs(
+            "str.builder.append_f64",
+            vec![("b", print_value_ref(b)), ("v", print_value_ref(v))],
         ),
-        AstOpVoid::StrBuilderAppendF64 { b, v } => format!(
-            "str.builder.append_f64 {}",
-            print_kv_args(vec![
-                ("b".to_string(), print_value_ref(b)),
-                ("v".to_string(), print_value_ref(v)),
-            ])
-        ),
-        AstOpVoid::StrBuilderAppendBool { b, v } => format!(
-            "str.builder.append_bool {}",
-            print_kv_args(vec![
-                ("b".to_string(), print_value_ref(b)),
-                ("v".to_string(), print_value_ref(v)),
-            ])
+        AstOpVoid::StrBuilderAppendBool { b, v } => print_op_with_pairs(
+            "str.builder.append_bool",
+            vec![("b", print_value_ref(b)), ("v", print_value_ref(v))],
         ),
         AstOpVoid::GpuBarrier => "gpu.barrier".to_string(),
         AstOpVoid::GpuBufferStore { ty, buf, idx, v } => format!(
             "gpu.buffer_store<{}> {}",
             print_type(ty),
-            print_kv_args(vec![
-                ("buf".to_string(), print_value_ref(buf)),
-                ("idx".to_string(), print_value_ref(idx)),
-                ("v".to_string(), print_value_ref(v)),
+            format_pairs(vec![
+                ("buf", print_value_ref(buf)),
+                ("idx", print_value_ref(idx)),
+                ("v", print_value_ref(v)),
             ])
         ),
     }
 }
 
-fn print_terminator_with_bb_map(t: &AstTerminator, bb_map: &HashMap<u32, u32>) -> String {
-    match t {
-        AstTerminator::Ret(None) => "ret".to_string(),
-        AstTerminator::Ret(Some(v)) => format!("ret {}", print_value_ref(v)),
-        AstTerminator::Br(bb) => format!("br bb{}", remap_bb_label(*bb, bb_map)),
-        AstTerminator::Cbr {
-            cond,
-            then_bb,
-            else_bb,
-        } => format!(
-            "cbr {} bb{} bb{}",
-            print_value_ref(cond),
-            remap_bb_label(*then_bb, bb_map),
-            remap_bb_label(*else_bb, bb_map)
-        ),
-        AstTerminator::Switch { val, arms, default } => {
-            let mut sorted_arms = arms
-                .iter()
-                .map(|(lit, bb)| (print_const_lit(lit), remap_bb_label(*bb, bb_map)))
-                .collect::<Vec<_>>();
-            sorted_arms.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-            let arms_str = if sorted_arms.is_empty() {
-                "{ }".to_string()
-            } else {
-                format!(
-                    "{{ {} }}",
-                    sorted_arms
-                        .into_iter()
-                        .map(|(lit, bb)| format!("case {} -> bb{}", lit, bb))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                )
-            };
-
-            format!(
-                "switch {} {} else bb{}",
-                print_value_ref(val),
-                arms_str,
-                remap_bb_label(*default, bb_map)
-            )
-        }
-        AstTerminator::Unreachable => "unreachable".to_string(),
-    }
-}
-
-fn print_const_expr(c: &AstConstExpr) -> String {
-    format!("const.{} {}", print_type(&c.ty), print_typed_const_lit(&c.lit))
-}
-
-fn print_typed_const_lit(lit: &AstConstLit) -> String {
-    match lit {
-        AstConstLit::Int(v) => v.to_string(),
-        AstConstLit::Float(v) => canonical_float(*v),
-        AstConstLit::Str(s) => print_string_literal(s),
-        AstConstLit::Bool(v) => v.to_string(),
-        AstConstLit::Unit => "unit".to_string(),
-    }
-}
-
-fn print_const_lit(lit: &AstConstLit) -> String {
-    match lit {
-        AstConstLit::Int(v) => v.to_string(),
-        AstConstLit::Float(v) => canonical_float(*v),
-        AstConstLit::Str(s) => print_string_literal(s),
-        AstConstLit::Bool(v) => v.to_string(),
-        AstConstLit::Unit => "unit".to_string(),
-    }
-}
-
-fn print_string_literal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                out.push_str("\\u{");
-                out.push_str(&format!("{:x}", c as u32));
-                out.push('}');
+fn print_base_type(base: &AstBaseType) -> String {
+    match base {
+        AstBaseType::Prim(name) => name.clone(),
+        AstBaseType::Named { path, name, targs } => {
+            let mut out = String::new();
+            if let Some(path) = path {
+                out.push_str(&path.to_string());
+                out.push('.');
             }
-            c => out.push(c),
+            out.push_str(name);
+            out.push_str(&print_type_args(targs));
+            out
         }
-    }
-    out.push('"');
-    out
-}
-
-fn canonical_float(v: f64) -> String {
-    let mut s = v.to_string();
-    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
-        s.push_str(".0");
-    }
-    s
-}
-
-fn print_type_args(targs: &[AstType]) -> String {
-    if targs.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "<{}>",
-            targs.iter().map(print_type).collect::<Vec<_>>().join(", ")
-        )
+        AstBaseType::Builtin(builtin) => print_builtin_type(builtin),
+        AstBaseType::Callable { sig_ref } => format!("TCallable<{}>", sig_ref),
+        AstBaseType::RawPtr(inner) => format!("rawptr<{}>", print_type(inner)),
     }
 }
 
-fn print_type_params(params: &[AstTypeParam]) -> String {
-    if params.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "<{}>",
-            params
-                .iter()
-                .map(|p| format!("{}: {}", p.name, p.constraint))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
-fn print_builtin_type(b: &AstBuiltinType) -> String {
-    match b {
+fn print_builtin_type(builtin: &AstBuiltinType) -> String {
+    match builtin {
         AstBuiltinType::Str => "Str".to_string(),
-        AstBuiltinType::Array(t) => format!("Array<{}>", print_type(t)),
+        AstBuiltinType::Array(elem) => format!("Array<{}>", print_type(elem)),
         AstBuiltinType::Map(k, v) => format!("Map<{}, {}>", print_type(k), print_type(v)),
         AstBuiltinType::TOption(t) => format!("TOption<{}>", print_type(t)),
-        AstBuiltinType::TResult(a, b) => format!("TResult<{}, {}>", print_type(a), print_type(b)),
+        AstBuiltinType::TResult(ok, err) => format!("TResult<{}, {}>", print_type(ok), print_type(err)),
         AstBuiltinType::TStrBuilder => "TStrBuilder".to_string(),
         AstBuiltinType::TMutex(t) => format!("TMutex<{}>", print_type(t)),
         AstBuiltinType::TRwLock(t) => format!("TRwLock<{}>", print_type(t)),
@@ -1076,7 +744,264 @@ fn print_builtin_type(b: &AstBuiltinType) -> String {
     }
 }
 
-fn print_bin_op(kind: &BinOpKind) -> &'static str {
+fn print_const_expr(c: &AstConstExpr) -> String {
+    format!("const.{} {}", print_type(&c.ty), print_const_lit(&c.lit))
+}
+
+fn print_const_lit(lit: &AstConstLit) -> String {
+    match lit {
+        AstConstLit::Int(v) => v.to_string(),
+        AstConstLit::Float(v) => canonical_float(*v),
+        AstConstLit::Str(s) => quote_string(s),
+        AstConstLit::Bool(v) => v.to_string(),
+        AstConstLit::Unit => "unit".to_string(),
+    }
+}
+
+fn print_struct_decl(kind: &str, s: &AstStructDecl) -> String {
+    let mut out = String::new();
+    push_doc(&mut out, s.doc.as_deref());
+
+    out.push_str(kind);
+    out.push_str(" struct ");
+    out.push_str(&s.name);
+    out.push_str(&print_type_params(&s.type_params));
+    out.push_str(" {\n");
+
+    for field in &s.fields {
+        out.push_str(BLOCK_INDENT);
+        out.push_str(&print_field_decl(field));
+        out.push('\n');
+    }
+
+    out.push('}');
+    out
+}
+
+fn print_enum_decl(kind: &str, e: &AstEnumDecl) -> String {
+    let mut out = String::new();
+    push_doc(&mut out, e.doc.as_deref());
+
+    out.push_str(kind);
+    out.push_str(" enum ");
+    out.push_str(&e.name);
+    out.push_str(&print_type_params(&e.type_params));
+    out.push_str(" {\n");
+
+    for variant in &e.variants {
+        out.push_str(BLOCK_INDENT);
+        out.push_str("variant ");
+        out.push_str(&variant.name);
+        if variant.fields.is_empty() {
+            out.push_str(" { }");
+        } else {
+            out.push_str(" { ");
+            out.push_str(&join_comma(variant.fields.iter().map(print_field_decl)));
+            out.push_str(" }");
+        }
+        out.push('\n');
+    }
+
+    out.push('}');
+    out
+}
+
+fn print_extern_decl(extern_mod: &AstExternModule) -> String {
+    let mut out = String::new();
+    push_doc(&mut out, extern_mod.doc.as_deref());
+
+    out.push_str("extern ");
+    out.push_str(&quote_string(&extern_mod.abi));
+    out.push_str(" module ");
+    out.push_str(&extern_mod.name);
+    out.push_str(" {\n");
+
+    for item in &extern_mod.items {
+        out.push_str(BLOCK_INDENT);
+        out.push_str("fn ");
+        out.push_str(&item.name);
+        out.push('(');
+        out.push_str(&join_comma(item.params.iter().map(print_param)));
+        out.push_str(") -> ");
+        out.push_str(&print_type(&item.ret_ty.node));
+
+        if !item.attrs.is_empty() {
+            let attrs = item
+                .attrs
+                .iter()
+                .map(|(k, v)| (k.as_str(), quote_string(v)))
+                .collect::<Vec<_>>();
+            out.push(' ');
+            out.push_str("attrs ");
+            out.push_str(&format_pairs(attrs));
+        }
+
+        out.push('\n');
+    }
+
+    out.push('}');
+    out
+}
+
+fn print_global_decl(g: &AstGlobalDecl) -> String {
+    let mut out = String::new();
+    push_doc(&mut out, g.doc.as_deref());
+
+    out.push_str("global ");
+    out.push_str(&g.name);
+    out.push_str(": ");
+    out.push_str(&print_type(&g.ty.node));
+    out.push_str(" = ");
+    out.push_str(&print_const_expr(&g.init));
+    out
+}
+
+fn print_impl_decl(i: &AstImplDecl) -> String {
+    format!(
+        "impl {} for {} = {}",
+        i.trait_name,
+        print_type(&i.for_type),
+        i.fn_ref
+    )
+}
+
+fn print_sig_decl(s: &AstSigDecl) -> String {
+    format!(
+        "sig {}({}) -> {}",
+        s.name,
+        join_comma(s.param_types.iter().map(print_type)),
+        print_type(&s.ret_ty)
+    )
+}
+
+fn print_meta(meta: &AstFnMeta) -> String {
+    let mut parts = Vec::new();
+
+    if !meta.uses.is_empty() {
+        let mut uses = meta.uses.clone();
+        uses.sort();
+        uses.dedup();
+        parts.push(format!("uses {{ {} }}", join_comma(uses)));
+    }
+
+    if !meta.effects.is_empty() {
+        let mut effects = meta.effects.clone();
+        effects.sort();
+        effects.dedup();
+        parts.push(format!("effects {{ {} }}", join_comma(effects)));
+    }
+
+    if !meta.cost.is_empty() {
+        let mut cost = meta.cost.clone();
+        cost.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        cost.dedup_by(|a, b| a.0 == b.0);
+        let cost_text = cost
+            .into_iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("cost {{ {} }}", cost_text));
+    }
+
+    if parts.is_empty() {
+        "meta { }".to_string()
+    } else {
+        format!("meta {{ {} }}", parts.join(" "))
+    }
+}
+
+fn print_param(param: &AstParam) -> String {
+    format!("%{}: {}", param.name, print_type(&param.ty.node))
+}
+
+fn print_field_decl(field: &AstFieldDecl) -> String {
+    format!("field {}: {}", field.name, print_type(&field.ty.node))
+}
+
+fn print_type_params(params: &[AstTypeParam]) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+
+    let body = params
+        .iter()
+        .map(|p| format!("{}: {}", p.name, p.constraint))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("<{}>", body)
+}
+
+fn print_type_args(types: &[AstType]) -> String {
+    if types.is_empty() {
+        return String::new();
+    }
+
+    format!("<{}>", join_comma(types.iter().map(print_type)))
+}
+
+fn print_arg_pairs(args: &[(String, AstArgValue)]) -> String {
+    let pairs = args
+        .iter()
+        .map(|(k, v)| (k.as_str(), print_arg_value(v)))
+        .collect::<Vec<_>>();
+    format_pairs(pairs)
+}
+
+fn print_value_pairs(args: &[(String, AstValueRef)]) -> String {
+    let pairs = args
+        .iter()
+        .map(|(k, v)| (k.as_str(), print_value_ref(v)))
+        .collect::<Vec<_>>();
+    format_pairs(pairs)
+}
+
+fn print_arg_value(v: &AstArgValue) -> String {
+    match v {
+        AstArgValue::Value(v) => print_value_ref(v),
+        AstArgValue::List(items) => {
+            if items.is_empty() {
+                "[]".to_string()
+            } else {
+                format!(
+                    "[{}]",
+                    items
+                        .iter()
+                        .map(print_arg_list_elem)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
+        AstArgValue::FnRef(name) => name.clone(),
+    }
+}
+
+fn print_arg_list_elem(elem: &AstArgListElem) -> String {
+    match elem {
+        AstArgListElem::Value(v) => print_value_ref(v),
+        AstArgListElem::FnRef(name) => name.clone(),
+    }
+}
+
+fn print_op_with_pairs(op_name: &str, pairs: Vec<(&str, String)>) -> String {
+    format!("{} {}", op_name, format_pairs(pairs))
+}
+
+fn format_pairs(mut pairs: Vec<(&str, String)>) -> String {
+    pairs.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(&b.1)));
+    if pairs.is_empty() {
+        return "{ }".to_string();
+    }
+
+    let body = pairs
+        .into_iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{ {} }}", body)
+}
+
+fn bin_op_name(kind: &BinOpKind) -> &'static str {
     match kind {
         BinOpKind::IAdd => "i.add",
         BinOpKind::ISub => "i.sub",
@@ -1109,214 +1034,88 @@ fn print_bin_op(kind: &BinOpKind) -> &'static str {
     }
 }
 
-fn print_kv_args(mut args: Vec<(String, String)>) -> String {
-    args.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    if args.is_empty() {
-        "{ }".to_string()
-    } else {
-        format!(
-            "{{ {} }}",
-            args.into_iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
+fn remap_bb(old: u32, map: &HashMap<u32, u32>) -> u32 {
+    map.get(&old).copied().unwrap_or(old)
 }
 
-fn print_arg_kv_args(args: &[(String, AstArgValue)]) -> String {
-    let mapped = args
-        .iter()
-        .map(|(k, v)| (k.clone(), print_arg_value(v)))
-        .collect::<Vec<_>>();
-    print_kv_args(mapped)
-}
-
-fn print_arg_value(v: &AstArgValue) -> String {
-    match v {
-        AstArgValue::Value(v) => print_value_ref(v),
-        AstArgValue::List(items) => format!(
-            "[{}]",
-            items
-                .iter()
-                .map(print_arg_list_elem)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        AstArgValue::FnRef(f) => f.clone(),
-    }
-}
-
-fn print_arg_list_elem(v: &AstArgListElem) -> String {
-    match v {
-        AstArgListElem::Value(v) => print_value_ref(v),
-        AstArgListElem::FnRef(f) => f.clone(),
-    }
-}
-
-fn sorted_export_items(items: &[Spanned<ExportItem>]) -> Vec<String> {
-    let mut out = items
-        .iter()
-        .map(|item| match &item.node {
-            ExportItem::Fn(f) => f.clone(),
-            ExportItem::Type(t) => t.clone(),
-        })
-        .collect::<Vec<_>>();
-    out.sort();
-    out
-}
-
-fn sorted_import_groups(groups: &[Spanned<ImportGroup>]) -> Vec<String> {
-    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-
-    for g in groups {
-        let path = g.node.module_path.to_string();
-        let entry = grouped.entry(path).or_default();
-        for item in &g.node.items {
-            match item {
-                ImportItem::Fn(f) => entry.push(f.clone()),
-                ImportItem::Type(t) => entry.push(t.clone()),
-            }
-        }
+fn canonical_float(v: f64) -> String {
+    if v.is_nan() {
+        return "0.0".to_string();
     }
 
-    grouped
-        .into_iter()
-        .map(|(path, mut items)| {
-            items.sort();
-            items.dedup();
-            format!("{}::{}", path, format_braced_list(items))
-        })
-        .collect()
-}
-
-fn format_braced_list(items: Vec<String>) -> String {
-    if items.is_empty() {
-        "{ }".to_string()
-    } else {
-        format!("{{ {} }}", items.join(", "))
+    let mut s = v.to_string();
+    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+        s.push_str(".0");
     }
-}
-
-fn canonical_block_map(blocks: &[Spanned<AstBlock>]) -> HashMap<u32, u32> {
-    let mut map = HashMap::new();
-    for (idx, block) in blocks.iter().enumerate() {
-        map.insert(block.node.label, idx as u32);
-    }
-    map
-}
-
-fn remap_bb_label(label: u32, bb_map: &HashMap<u32, u32>) -> u32 {
-    bb_map.get(&label).copied().unwrap_or(label)
-}
-
-fn strip_digest_line(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut i = 0usize;
-
-    while i < source.len() {
-        let rest = &source[i..];
-        let (line, next_i, had_newline) = if let Some(rel) = rest.find('\n') {
-            (&rest[..rel], i + rel + 1, true)
-        } else {
-            (rest, source.len(), false)
-        };
-
-        if !line.trim_start().starts_with("digest ") {
-            out.push_str(line);
-            if had_newline {
-                out.push('\n');
-            }
-        }
-
-        i = next_i;
-    }
-
-    out
-}
-
-fn ensure_single_trailing_newline(mut s: String) -> String {
-    while s.ends_with('\n') {
-        s.pop();
-    }
-    s.push('\n');
     s
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn quote_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
 
-    fn dummy_span<T>(node: T) -> Spanned<T> {
-        Spanned::new(node, Span::dummy())
+fn join_comma<I>(iter: I) -> String
+where
+    I: IntoIterator,
+    I::Item: ToString,
+{
+    iter.into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn push_doc(out: &mut String, doc: Option<&str>) {
+    let Some(doc) = doc else {
+        return;
+    };
+
+    for line in doc.lines() {
+        if line.is_empty() {
+            out.push_str(";;;\n");
+        } else {
+            out.push_str(";;; ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+}
+
+fn normalize_newlines(source: &str) -> String {
+    source.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn strip_digest_lines(source: &str) -> String {
+    let normalized = normalize_newlines(source);
+    let mut out = String::new();
+
+    for chunk in normalized.split_inclusive('\n') {
+        let line = chunk.strip_suffix('\n').unwrap_or(chunk);
+        if line.trim_start().starts_with("digest ") {
+            continue;
+        }
+        out.push_str(chunk);
     }
 
-    #[test]
-    fn digest_updates_and_stabilizes() {
-        let src = "module a.b\nexports { @x }\nimports { }\ndigest \"old\"\n\nfn @x() -> i32 {\n  bb0:\n    ret const.i32 0\n}\n";
-        let once = update_digest(src);
-        let twice = update_digest(&once);
-        assert_eq!(once, twice);
-        assert!(once.contains("digest \""));
-    }
+    out
+}
 
-    #[test]
-    fn format_is_idempotent_and_renumbers_blocks() {
-        let ast = AstFile {
-            header: dummy_span(AstHeader {
-                module_path: dummy_span(ModulePath {
-                    segments: vec!["demo".to_string(), "main".to_string()],
-                }),
-                exports: vec![
-                    dummy_span(ExportItem::Fn("@z".to_string())),
-                    dummy_span(ExportItem::Fn("@a".to_string())),
-                ],
-                imports: vec![dummy_span(ImportGroup {
-                    module_path: ModulePath {
-                        segments: vec!["std".to_string(), "io".to_string()],
-                    },
-                    items: vec![ImportItem::Fn("@println".to_string())],
-                })],
-                digest: dummy_span(String::new()),
-            }),
-            decls: vec![dummy_span(AstDecl::Fn(AstFnDecl {
-                name: "@main".to_string(),
-                params: Vec::new(),
-                ret_ty: dummy_span(AstType {
-                    ownership: None,
-                    base: AstBaseType::Prim("i32".to_string()),
-                }),
-                meta: None,
-                blocks: vec![
-                    dummy_span(AstBlock {
-                        label: 10,
-                        instrs: Vec::new(),
-                        terminator: dummy_span(AstTerminator::Br(20)),
-                    }),
-                    dummy_span(AstBlock {
-                        label: 20,
-                        instrs: Vec::new(),
-                        terminator: dummy_span(AstTerminator::Ret(Some(AstValueRef::Const(
-                            AstConstExpr {
-                                ty: AstType {
-                                    ownership: None,
-                                    base: AstBaseType::Prim("i32".to_string()),
-                                },
-                                lit: AstConstLit::Int(0),
-                            },
-                        )))),
-                    }),
-                ],
-                doc: None,
-            }))],
-        };
-
-        let sm = SourceMap::new();
-        let once = format_csnf(&ast, &sm);
-        let twice = update_digest(&once);
-        assert_eq!(once, twice);
-        assert!(once.contains("  bb0:"));
-        assert!(once.contains("  bb1:"));
-        assert!(once.contains("    br bb1"));
-    }
+fn ensure_single_trailing_newline(source: &str) -> String {
+    let trimmed = source.trim_end_matches('\n');
+    let mut out = trimmed.to_string();
+    out.push('\n');
+    out
 }
