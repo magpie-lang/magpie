@@ -1,6 +1,8 @@
 //! Magpie CLI entry point (§5).
 
 use clap::{Parser, Subcommand};
+use magpie_diag::{Diagnostic, Severity};
+use magpie_driver::{BuildProfile, BuildResult, DriverConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "magpie", version = "0.1.0", about = "Magpie language toolchain")]
@@ -235,85 +237,246 @@ enum GraphSubcommand {
 
 fn main() {
     let cli = Cli::parse();
+    let output_mode = effective_output_mode(&cli);
 
-    match &cli.command {
+    let exit_code = match &cli.command {
         Commands::New { name } => {
-            println!("Creating new Magpie project: {}", name);
-            create_project(name);
+            let mut result = BuildResult::default();
+            match magpie_driver::create_project(name) {
+                Ok(()) => {
+                    result.success = true;
+                    result.artifacts.push(name.clone());
+                }
+                Err(err) => {
+                    result.success = false;
+                    result.diagnostics.push(error_diag(
+                        "MPC0001",
+                        "project creation failed",
+                        err,
+                    ));
+                }
+            }
+
+            let config = driver_config_from_cli(&cli, false);
+            emit_command_output("new", &config, &result, output_mode);
+            if result.success { 0 } else { 1 }
         }
         Commands::Build => {
-            println!("Building...");
-            // TODO: Wire up magpie_driver
+            let config = driver_config_from_cli(&cli, false);
+            let result = magpie_driver::build(&config);
+            emit_command_output("build", &config, &result, output_mode);
+            if result.success { 0 } else { 1 }
         }
-        Commands::Run { args: _ } => {
-            println!("Building and running...");
+        Commands::Run { args } => {
+            let config = driver_config_from_cli(&cli, false);
+            let mut result = magpie_driver::build(&config);
+            if result.success {
+                let message = if args.is_empty() {
+                    "run placeholder: execution is not implemented yet.".to_string()
+                } else {
+                    format!(
+                        "run placeholder: execution is not implemented yet (args: {}).",
+                        args.join(" ")
+                    )
+                };
+                result
+                    .diagnostics
+                    .push(info_diag("MPR0000", "run placeholder", message));
+            }
+
+            emit_command_output("run", &config, &result, output_mode);
+            if result.success { 0 } else { 1 }
         }
-        Commands::Fmt { fix_meta: _ } => {
-            println!("Formatting (CSNF)...");
+        Commands::Fmt { fix_meta } => {
+            let paths = vec!["src/main.mp".to_string()];
+            let result = magpie_driver::format_files(&paths, *fix_meta);
+            let config = driver_config_from_cli(&cli, false);
+            emit_command_output("fmt", &config, &result, output_mode);
+            if result.success { 0 } else { 1 }
         }
-        Commands::Test { filter: _ } => {
-            println!("Running tests...");
+        Commands::Test { filter } => {
+            let config = driver_config_from_cli(&cli, true);
+            let mut result = magpie_driver::build(&config);
+            if let Some(filter) = filter {
+                result.diagnostics.push(info_diag(
+                    "MPT0000",
+                    "test filter accepted",
+                    format!("Test filter '{filter}' is accepted but not yet applied."),
+                ));
+            }
+
+            emit_command_output("test", &config, &result, output_mode);
+            if result.success { 0 } else { 1 }
+        }
+        Commands::Explain { code } => {
+            let mut result = BuildResult::default();
+            match magpie_diag::explain_code(code) {
+                Some(explanation) => {
+                    result.success = true;
+                    result.diagnostics.push(info_diag(
+                        code.clone(),
+                        "diagnostic explanation",
+                        explanation,
+                    ));
+                }
+                None => {
+                    result.success = false;
+                    result.diagnostics.push(error_diag(
+                        code.clone(),
+                        "unknown diagnostic code",
+                        "No explanation is available for this code.",
+                    ));
+                }
+            }
+
+            let config = driver_config_from_cli(&cli, false);
+            emit_command_output("explain", &config, &result, output_mode);
+            if result.success { 0 } else { 1 }
         }
         _ => {
             println!("Command not yet implemented: {:?}", cli.command);
+            2
+        }
+    };
+
+    std::process::exit(exit_code);
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum OutputMode {
+    Text,
+    Json,
+}
+
+fn effective_output_mode(cli: &Cli) -> OutputMode {
+    if cli.llm || cli.output == "json" || cli.output == "jsonl" {
+        OutputMode::Json
+    } else {
+        OutputMode::Text
+    }
+}
+
+fn driver_config_from_cli(cli: &Cli, test_mode: bool) -> DriverConfig {
+    let mut config = DriverConfig::default();
+
+    config.profile = match cli.profile.as_str() {
+        "release" => BuildProfile::Release,
+        _ => BuildProfile::Dev,
+    };
+    if let Some(target) = &cli.target {
+        config.target_triple = target.clone();
+    }
+    if let Some(emit) = &cli.emit {
+        let emit_items = parse_csv(emit);
+        if !emit_items.is_empty() {
+            config.emit = emit_items;
+        }
+    }
+
+    config.max_errors = cli.max_errors as usize;
+    config.llm_mode = cli.llm;
+    config.token_budget = cli.llm_token_budget;
+    config.shared_generics = cli.shared_generics;
+    config.features = cli.features.as_deref().map(parse_csv).unwrap_or_default();
+
+    if test_mode && !config.features.iter().any(|feature| feature == "test") {
+        config.features.push("test".to_string());
+    }
+
+    config
+}
+
+fn parse_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn emit_command_output(command: &str, config: &DriverConfig, result: &BuildResult, mode: OutputMode) {
+    match mode {
+        OutputMode::Text => print_human_output(command, result),
+        OutputMode::Json => {
+            let envelope = magpie_driver::json_output_envelope(command, config, result);
+            match serde_json::to_string_pretty(&envelope) {
+                Ok(payload) => println!("{payload}"),
+                Err(err) => eprintln!("Failed to serialize output envelope: {err}"),
+            }
         }
     }
 }
 
-fn create_project(name: &str) {
-    use std::fs;
-    use std::path::Path;
+fn print_human_output(command: &str, result: &BuildResult) {
+    let status = if result.success { "ok" } else { "failed" };
+    println!("{command}: {status}");
 
-    let base = Path::new(name);
-    fs::create_dir_all(base.join("src")).expect("Failed to create src/");
-    fs::create_dir_all(base.join("tests")).expect("Failed to create tests/");
-    fs::create_dir_all(base.join(".magpie")).expect("Failed to create .magpie/");
+    if !result.artifacts.is_empty() {
+        println!("Artifacts:");
+        for artifact in &result.artifacts {
+            println!("  - {artifact}");
+        }
+    }
 
-    // Magpie.toml
-    let manifest = format!(
-        r#"[package]
-name = "{name}"
-version = "0.1.0"
-edition = "2026"
+    if !result.diagnostics.is_empty() {
+        println!("Diagnostics:");
+        for diag in &result.diagnostics {
+            println!(
+                "  - [{}] {}: {}",
+                diag.code,
+                severity_label(&diag.severity),
+                diag.message
+            );
+        }
+    }
 
-[build]
-entry = "src/main.mp"
-profile_default = "dev"
-max_mono_instances = 10000
+    if !result.timing_ms.is_empty() {
+        println!("Timing (ms):");
+        let mut items: Vec<(&str, u64)> = result
+            .timing_ms
+            .iter()
+            .map(|(stage, ms)| (stage.as_str(), *ms))
+            .collect();
+        items.sort_by_key(|(stage, _)| *stage);
+        for (stage, ms) in items {
+            println!("  - {stage}: {ms}");
+        }
+    }
+}
 
-[dependencies]
-std = {{ version = "^0.1" }}
+fn severity_label(severity: &Severity) -> &'static str {
+    match severity {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+        Severity::Info => "info",
+        Severity::Hint => "hint",
+    }
+}
 
-[llm]
-mode_default = true
-token_budget = 12000
-tokenizer = "approx:utf8_4chars"
-budget_policy = "balanced"
-max_module_lines = 800
-max_fn_lines = 80
-"#
-    );
-    fs::write(base.join("Magpie.toml"), manifest).expect("Failed to write Magpie.toml");
+fn info_diag(code: impl Into<String>, title: impl Into<String>, message: impl Into<String>) -> Diagnostic {
+    simple_diag(code, Severity::Info, title, message)
+}
 
-    // src/main.mp
-    let main_mp = format!(
-        r#"module {name}.main
-exports {{ @main }}
-imports {{ std.io::{{@println}} }}
-digest "0000000000000000"
+fn error_diag(code: impl Into<String>, title: impl Into<String>, message: impl Into<String>) -> Diagnostic {
+    simple_diag(code, Severity::Error, title, message)
+}
 
-fn @main() -> i32 {{
-bb0:
-  %msg: Str = const.Str "Hello, world!"
-  call_void std.io.@println {{ args=[%msg] }}
-  ret const.i32 0
-}}
-"#
-    );
-    fs::write(base.join("src/main.mp"), main_mp).expect("Failed to write main.mp");
-
-    // Magpie.lock (empty)
-    fs::write(base.join("Magpie.lock"), "{}").expect("Failed to write Magpie.lock");
-
-    println!("Created project '{name}' with Magpie.toml, src/main.mp, and tests/");
+fn simple_diag(
+    code: impl Into<String>,
+    severity: Severity,
+    title: impl Into<String>,
+    message: impl Into<String>,
+) -> Diagnostic {
+    Diagnostic {
+        code: code.into(),
+        severity,
+        title: title.into(),
+        primary_span: None,
+        secondary_spans: Vec::new(),
+        message: message.into(),
+        explanation_md: None,
+        why: None,
+        suggested_fixes: Vec::new(),
+    }
 }

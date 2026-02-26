@@ -23,3 +23,14 @@
 {"timestamp":"2026-02-26T18:53:05.004Z","type":"hook_dispatch","event":"turn-complete","source":"native","enabled":false,"reason":"plugins_disabled"}
 {"timestamp":"2026-02-26T18:53:19.690Z","type":"hook_dispatch","event":"turn-complete","source":"native","enabled":false,"reason":"plugins_disabled"}
 {"timestamp":"2026-02-26T18:53:33.573Z","type":"hook_dispatch","event":"turn-complete","source":"native","enabled":false,"reason":"plugins_disabled"}
+{"timestamp":"2026-02-26T19:14:55.831Z","type":"hook_dispatch","event":"turn-complete","source":"native","enabled":false,"reason":"plugins_disabled"}
+{"timestamp":"2026-02-26T19:23:12.515Z","type":"hook_dispatch","event":"turn-complete","source":"native","enabled":false,"reason":"plugins_disabled"}
+{"timestamp":"2026-02-26T19:23:27.502Z","type":"hook_dispatch","event":"turn-complete","source":"native","enabled":false,"reason":"plugins_disabled"}
+{"timestamp":"2026-02-26T19:25:16.063Z","type":"hook_dispatch","event":"turn-complete","source":"native","enabled":false,"reason":"plugins_disabled"}
+{"timestamp":"2026-02-26T19:25:30.047Z","type":"hook_dispatch","event":"turn-complete","source":"native","enabled":false,"reason":"plugins_disabled"}
+{"timestamp":"2026-02-26T19:30:17.655Z","type":"hook_dispatch","event":"turn-complete","source":"native","enabled":false,"reason":"plugins_disabled"}
+{"timestamp":"2026-02-26T19:36:05.628Z","type":"hook_dispatch","event":"turn-complete","source":"native","enabled":false,"reason":"plugins_disabled"}
+{"timestamp":"2026-02-26T19:38:16.855Z","type":"hook_dispatch","event":"turn-complete","source":"native","enabled":false,"reason":"plugins_disabled"}
+{"timestamp":"2026-02-26T19:38:38.593Z","type":"hook_dispatch","event":"turn-complete","source":"native","enabled":false,"reason":"plugins_disabled"}
+{"timestamp":"2026-02-26T19:44:50.336Z","type":"hook_dispatch","event":"turn-complete","source":"native","enabled":false,"reason":"plugins_disabled"}
+{"timestamp":"2026-02-26T19:47:42.818Z","type":"hook_dispatch","event":"turn-complete","source":"native","enabled":false,"reason":"plugins_disabled"}
