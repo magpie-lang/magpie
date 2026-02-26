@@ -6,3 +6,6 @@ Cargo.lock
 .DS_Store
 .magpie/
 .omc/
+.omx/
+.cargo-home/
+.cargo-local/
