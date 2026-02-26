@@ -7,4 +7,5 @@ edition.workspace = true
 magpie_mpir = { path = "../magpie_mpir" }
 magpie_types = { path = "../magpie_types" }
 magpie_diag = { path = "../magpie_diag" }
+regex = "1"
 # llvm-sys = { workspace = true }

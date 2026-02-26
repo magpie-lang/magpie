@@ -1746,3 +1746,459 @@ fn is_int_ty(ty: &str) -> bool {
 fn is_float_ty(ty: &str) -> bool {
     matches!(ty, "half" | "float" | "double")
 }
+
+use regex::Regex;
+use std::path::Path;
+
+#[derive(Clone, Debug, Default)]
+pub struct LlvmGenCtx {
+    pub locals: HashMap<u32, String>,
+    pub llvm_tys: HashMap<u32, String>,
+}
+
+impl LlvmGenCtx {
+    fn llvm_ty(&self, ty: TypeId) -> String {
+        self.llvm_tys
+            .get(&ty.0)
+            .cloned()
+            .unwrap_or_else(|| "ptr".to_string())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ExternDecl {
+    pub abi: String,
+    pub module: String,
+    pub functions: Vec<ExternFnDecl>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ExternFnDecl {
+    pub name: String,
+    pub ret_ty: String,
+    pub params: Vec<(String, String)>,
+    pub lib: String,
+}
+
+pub fn lower_ptr_ops(op: &MpirOp, ctx: &mut LlvmGenCtx) -> String {
+    match op {
+        MpirOp::PtrNull { .. } => "null".to_string(),
+        MpirOp::PtrAddr { p } => {
+            let ptr = mpir_value_to_llvm(p, ctx);
+            format!("ptrtoint ptr {ptr} to i64")
+        }
+        MpirOp::PtrFromAddr { addr, .. } => {
+            let addr = mpir_value_to_llvm(addr, ctx);
+            format!("inttoptr i64 {addr} to ptr")
+        }
+        MpirOp::PtrAdd { p, count } => {
+            let p = mpir_value_to_llvm(p, ctx);
+            let count = mpir_value_to_llvm(count, ctx);
+            format!("getelementptr i8, ptr {p}, i64 {count}")
+        }
+        MpirOp::PtrLoad { to, p } => {
+            let p = mpir_value_to_llvm(p, ctx);
+            let to_ty = ctx.llvm_ty(*to);
+            format!("load {to_ty}, ptr {p}")
+        }
+        MpirOp::PtrStore { to, p, v } => {
+            let p = mpir_value_to_llvm(p, ctx);
+            let v = mpir_value_to_llvm(v, ctx);
+            let to_ty = ctx.llvm_ty(*to);
+            format!("store {to_ty} {v}, ptr {p}")
+        }
+        _ => "; unsupported ptr opcode".to_string(),
+    }
+}
+
+pub fn lower_extern_module(ext: &ExternDecl) -> String {
+    let mut out = String::new();
+    for decl in &ext.functions {
+        let ret = mp_type_to_llvm(&decl.ret_ty);
+        let params = decl
+            .params
+            .iter()
+            .map(|(ty, _)| mp_type_to_llvm(ty))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let name = normalize_symbol_name(&decl.name);
+        let _ = writeln!(out, "declare {ret} @{name}({params})");
+    }
+    out
+}
+
+pub fn parse_c_header(header_path: &Path) -> Result<Vec<ExternFnDecl>, String> {
+    let src = std::fs::read_to_string(header_path)
+        .map_err(|e| format!("failed to read {}: {e}", header_path.display()))?;
+
+    let block_comment_re = Regex::new(r"(?s)/\*.*?\*/").map_err(|e| e.to_string())?;
+    let line_comment_re = Regex::new(r"(?m)//.*$").map_err(|e| e.to_string())?;
+    let preproc_re = Regex::new(r"(?m)^\s*#.*$").map_err(|e| e.to_string())?;
+    let decl_re = Regex::new(
+        r"(?m)^\s*(?:extern\s+)?([A-Za-z_][A-Za-z0-9_\s\*]*?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^;{}()]*)\)\s*;",
+    )
+    .map_err(|e| e.to_string())?;
+    let param_re = Regex::new(r"^\s*(.+?)\s*([A-Za-z_][A-Za-z0-9_]*)\s*$").map_err(|e| e.to_string())?;
+
+    let no_block = block_comment_re.replace_all(&src, "");
+    let no_line = line_comment_re.replace_all(&no_block, "");
+    let cleaned = preproc_re.replace_all(&no_line, "");
+
+    let lib_name = header_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("c")
+        .to_string();
+
+    let mut out = Vec::new();
+    for caps in decl_re.captures_iter(cleaned.as_ref()) {
+        let raw_ret = caps
+            .get(1)
+            .map(|m| m.as_str())
+            .ok_or_else(|| "missing return type".to_string())?;
+        let name = caps
+            .get(2)
+            .map(|m| m.as_str().to_string())
+            .ok_or_else(|| "missing function name".to_string())?;
+        let raw_params = caps
+            .get(3)
+            .map(|m| m.as_str())
+            .ok_or_else(|| "missing parameter list".to_string())?;
+
+        let ret_ty = map_c_type(raw_ret)
+            .ok_or_else(|| format!("unsupported C return type '{raw_ret}' in function '{name}'"))?;
+
+        let mut params = Vec::new();
+        if !raw_params.trim().is_empty() && raw_params.trim() != "void" {
+            for (idx, raw_param) in raw_params.split(',').enumerate() {
+                let raw_param = raw_param.trim();
+                if raw_param.is_empty() {
+                    continue;
+                }
+                if raw_param == "..." {
+                    return Err(format!("variadic extern function '{name}' is not supported yet"));
+                }
+
+                let (raw_ty, raw_name) = if let Some(pm) = param_re.captures(raw_param) {
+                    let pty = pm.get(1).map(|m| m.as_str()).unwrap_or(raw_param);
+                    let pname = pm
+                        .get(2)
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_else(|| format!("arg{idx}"));
+                    (pty.to_string(), pname)
+                } else {
+                    (raw_param.to_string(), format!("arg{idx}"))
+                };
+
+                let ty = map_c_type(raw_ty.as_str()).ok_or_else(|| {
+                    format!("unsupported C param type '{raw_ty}' in function '{name}'")
+                })?;
+                params.push((ty, sanitize_mp_ident(&raw_name)));
+            }
+        }
+
+        out.push(ExternFnDecl {
+            name,
+            ret_ty,
+            params,
+            lib: lib_name.clone(),
+        });
+    }
+
+    Ok(out)
+}
+
+pub fn generate_extern_mp(decls: &[ExternFnDecl], lib_name: &str) -> String {
+    let mut out = String::new();
+    let module = sanitize_mp_ident(lib_name);
+    let _ = writeln!(out, "extern \"c\" module {module} {{");
+    let _ = writeln!(
+        out,
+        "  ; TODO(ffi): review pointer return ownership attrs (owned vs borrowed)"
+    );
+
+    for decl in decls {
+        let fn_name = normalize_symbol_name(&decl.name);
+        let params = decl
+            .params
+            .iter()
+            .map(|(ty, name)| format!("%{}: {}", sanitize_mp_ident(name), ty))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let attrs = if is_pointer_mp_type(&decl.ret_ty) {
+            " attrs { returns=\"TODO: owned|borrowed\" }"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "  fn @{fn_name}({params}) -> {}{}",
+            decl.ret_ty, attrs
+        );
+    }
+
+    let _ = writeln!(out, "}}");
+    out
+}
+
+fn mpir_value_to_llvm(v: &MpirValue, ctx: &LlvmGenCtx) -> String {
+    match v {
+        MpirValue::Local(id) => ctx
+            .locals
+            .get(&id.0)
+            .cloned()
+            .unwrap_or_else(|| format!("%l{}", id.0)),
+        MpirValue::Const(c) => mp_const_to_llvm_lit(c),
+    }
+}
+
+fn mp_const_to_llvm_lit(c: &HirConst) -> String {
+    match &c.lit {
+        HirConstLit::IntLit(v) => v.to_string(),
+        HirConstLit::FloatLit(v) => float_lit(*v),
+        HirConstLit::BoolLit(v) => {
+            if *v {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
+        HirConstLit::StringLit(_) => "null".to_string(),
+        HirConstLit::Unit => "0".to_string(),
+    }
+}
+
+fn normalize_symbol_name(name: &str) -> &str {
+    name.strip_prefix('@').unwrap_or(name)
+}
+
+fn sanitize_mp_ident(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        return "arg".to_string();
+    }
+    if out.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    out
+}
+
+fn is_pointer_mp_type(ty: &str) -> bool {
+    ty.starts_with("rawptr<") || ty == "ptr"
+}
+
+fn map_c_type(raw_ty: &str) -> Option<String> {
+    let mut ty = raw_ty.trim().to_string();
+    for qualifier in ["const", "volatile", "register", "static", "extern", "inline"] {
+        ty = Regex::new(&format!(r"\b{qualifier}\b"))
+            .ok()?
+            .replace_all(&ty, "")
+            .to_string();
+    }
+
+    ty = ty.replace(" *", "*").replace("* ", "*");
+    ty = ty.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if ty.ends_with('*') {
+        let base = ty.trim_end_matches('*').trim();
+        if base == "void" {
+            return Some("rawptr<u8>".to_string());
+        }
+        let inner = match base {
+            "char" => "i8",
+            "int" => "i32",
+            "long" | "long long" => "i64",
+            "size_t" => "u64",
+            _ => "u8",
+        };
+        return Some(format!("rawptr<{inner}>"));
+    }
+
+    let mapped = match ty.as_str() {
+        "void" => "unit",
+        "char" => "i8",
+        "int" => "i32",
+        "long" | "long long" => "i64",
+        "size_t" => "u64",
+        "unsigned char" => "u8",
+        "unsigned int" => "u32",
+        "unsigned long" | "unsigned long long" => "u64",
+        _ => return None,
+    };
+    Some(mapped.to_string())
+}
+
+fn mp_type_to_llvm(mp_ty: &str) -> String {
+    match mp_ty.trim() {
+        "unit" | "void" => "void".to_string(),
+        "i1" | "bool" => "i1".to_string(),
+        "i8" | "u8" => "i8".to_string(),
+        "i16" | "u16" => "i16".to_string(),
+        "i32" | "u32" => "i32".to_string(),
+        "i64" | "u64" => "i64".to_string(),
+        "i128" | "u128" => "i128".to_string(),
+        "f16" => "half".to_string(),
+        "f32" => "float".to_string(),
+        "f64" => "double".to_string(),
+        t if t.starts_with("rawptr<") => "ptr".to_string(),
+        _ => "ptr".to_string(),
+    }
+}
+
+pub fn lower_ptr_null() -> String {
+    "  null".to_string()
+}
+
+pub fn lower_ptr_addr(reg: &str) -> String {
+    format!("  %addr = ptrtoint ptr {} to i64", reg)
+}
+
+pub fn lower_ptr_from_addr(reg: &str) -> String {
+    format!("  %ptr = inttoptr i64 {} to ptr", reg)
+}
+
+pub fn lower_ptr_add(ptr_reg: &str, count_reg: &str, elem_ty: &str) -> String {
+    format!(
+        "  %ptr = getelementptr {}, ptr {}, i64 {}",
+        elem_ty, ptr_reg, count_reg
+    )
+}
+
+pub fn lower_ptr_load(ptr_reg: &str, ty: &str) -> String {
+    format!("  %v = load {}, ptr {}", ty, ptr_reg)
+}
+
+pub fn lower_ptr_store(ptr_reg: &str, val_reg: &str, ty: &str) -> String {
+    format!("  store {} {}, ptr {}", ty, val_reg, ptr_reg)
+}
+
+pub fn lower_extern_fn_declare(name: &str, params: &[(String, String)], ret_ty: &str) -> String {
+    let llvm_ret = mp_type_to_llvm(ret_ty);
+    let llvm_params = params
+        .iter()
+        .map(|(ty, _)| mp_type_to_llvm(ty))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "declare {} @{}({})",
+        llvm_ret,
+        normalize_symbol_name(name),
+        llvm_params
+    )
+}
+
+pub fn parse_c_header_basic(source: &str) -> Vec<ExternFnDecl> {
+    let block_comment_re = match Regex::new(r"(?s)/\*.*?\*/") {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+    let line_comment_re = match Regex::new(r"(?m)//.*$") {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+    let preproc_re = match Regex::new(r"(?m)^\s*#.*$") {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+    let decl_re = match Regex::new(
+        r"(?m)^\s*(?:extern\s+)?([A-Za-z_][A-Za-z0-9_\s\*]*?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^;{}()]*)\)\s*;",
+    ) {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+    let param_re = match Regex::new(r"^\s*(.+?)\s*([A-Za-z_][A-Za-z0-9_]*)\s*$") {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+
+    let no_block = block_comment_re.replace_all(source, "");
+    let no_line = line_comment_re.replace_all(&no_block, "");
+    let cleaned = preproc_re.replace_all(&no_line, "");
+
+    let mut out = Vec::new();
+    'decls: for caps in decl_re.captures_iter(cleaned.as_ref()) {
+        let Some(raw_ret) = caps.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let Some(name) = caps.get(2).map(|m| m.as_str().to_string()) else {
+            continue;
+        };
+        let Some(raw_params) = caps.get(3).map(|m| m.as_str()) else {
+            continue;
+        };
+
+        let Some(ret_ty) = map_c_type(raw_ret) else {
+            continue;
+        };
+
+        let mut params = Vec::new();
+        if !raw_params.trim().is_empty() && raw_params.trim() != "void" {
+            for (idx, raw_param) in raw_params.split(',').enumerate() {
+                let raw_param = raw_param.trim();
+                if raw_param.is_empty() {
+                    continue;
+                }
+                if raw_param == "..." {
+                    continue 'decls;
+                }
+
+                let (raw_ty, raw_name) = if let Some(pm) = param_re.captures(raw_param) {
+                    let pty = pm.get(1).map(|m| m.as_str()).unwrap_or(raw_param);
+                    let pname = pm
+                        .get(2)
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_else(|| format!("arg{idx}"));
+                    (pty.to_string(), pname)
+                } else {
+                    (raw_param.to_string(), format!("arg{idx}"))
+                };
+
+                let Some(ty) = map_c_type(raw_ty.as_str()) else {
+                    continue 'decls;
+                };
+                params.push((ty, sanitize_mp_ident(&raw_name)));
+            }
+        }
+
+        out.push(ExternFnDecl {
+            name,
+            ret_ty,
+            params,
+            lib: "c".to_string(),
+        });
+    }
+
+    out
+}
+
+pub fn generate_extern_mp_module(decls: &[ExternFnDecl], lib_name: &str) -> String {
+    let mut out = String::new();
+    let module = sanitize_mp_ident(lib_name);
+    let _ = writeln!(out, "extern \"c\" module {module} {{");
+
+    for decl in decls {
+        let fn_name = normalize_symbol_name(&decl.name);
+        let params = decl
+            .params
+            .iter()
+            .map(|(ty, name)| format!("%{}: {}", sanitize_mp_ident(name), ty))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let attrs = if is_pointer_mp_type(&decl.ret_ty) {
+            " attrs { returns=\"TODO: owned|borrowed\" }"
+        } else {
+            ""
+        };
+        let _ = writeln!(out, "  fn @{fn_name}({params}) -> {}{}", decl.ret_ty, attrs);
+    }
+
+    let _ = writeln!(out, "}}");
+    out
+}
