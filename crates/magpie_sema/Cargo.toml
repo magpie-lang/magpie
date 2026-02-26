@@ -9,3 +9,5 @@ magpie_hir = { path = "../magpie_hir" }
 magpie_types = { path = "../magpie_types" }
 magpie_diag = { path = "../magpie_diag" }
 indexmap = { workspace = true }
+blake3 = { workspace = true }
+base32 = { workspace = true }
