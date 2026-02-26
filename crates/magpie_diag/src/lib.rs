@@ -114,6 +114,7 @@ pub mod codes {
     // SSA verification
     pub const MPS_PREFIX: &str = "MPS";
     // Async
+    pub const MPAS_PREFIX: &str = "MPAS";
     pub const MPAS0001: &str = "MPAS0001"; // SUSPEND_IN_NON_ASYNC
     // FFI
     pub const MPF0001: &str = "MPF0001"; // FFI_RETURN_OWNERSHIP_REQUIRED

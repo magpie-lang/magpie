@@ -34,8 +34,35 @@ pub enum PrimType {
     I1, I8, I16, I32, I64, I128,
     U1, U8, U16, U32, U64, U128,
     F16, F32, F64,
-    Bool,
+    Bool, // alias for I1
     Unit,
+}
+
+impl PrimType {
+    pub fn is_integer(&self) -> bool {
+        matches!(self, Self::I1 | Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::I128
+            | Self::U1 | Self::U8 | Self::U16 | Self::U32 | Self::U64 | Self::U128 | Self::Bool)
+    }
+
+    pub fn is_float(&self) -> bool {
+        matches!(self, Self::F16 | Self::F32 | Self::F64)
+    }
+
+    pub fn is_signed(&self) -> bool {
+        matches!(self, Self::I1 | Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::I128)
+    }
+
+    pub fn bit_width(&self) -> u32 {
+        match self {
+            Self::I1 | Self::U1 | Self::Bool => 1,
+            Self::I8 | Self::U8 => 8,
+            Self::I16 | Self::U16 | Self::F16 => 16,
+            Self::I32 | Self::U32 | Self::F32 => 32,
+            Self::I64 | Self::U64 | Self::F64 => 64,
+            Self::I128 | Self::U128 => 128,
+            Self::Unit => 0,
+        }
+    }
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
@@ -124,10 +151,40 @@ pub struct TypeCtx {
 
 impl TypeCtx {
     pub fn new() -> Self {
-        Self { types: Vec::new(), next_user_id: 1000 }
+        let mut ctx = Self { types: Vec::with_capacity(64), next_user_id: 1000 };
+        ctx.populate_fixed_types();
+        ctx
+    }
+
+    fn populate_fixed_types(&mut self) {
+        use fixed_type_ids::*;
+        let fixed = [
+            (UNIT, TypeKind::Prim(PrimType::Unit)),
+            (BOOL, TypeKind::Prim(PrimType::Bool)),
+            (I8, TypeKind::Prim(PrimType::I8)),
+            (I16, TypeKind::Prim(PrimType::I16)),
+            (I32, TypeKind::Prim(PrimType::I32)),
+            (I64, TypeKind::Prim(PrimType::I64)),
+            (I128, TypeKind::Prim(PrimType::I128)),
+            (U8, TypeKind::Prim(PrimType::U8)),
+            (U16, TypeKind::Prim(PrimType::U16)),
+            (U32, TypeKind::Prim(PrimType::U32)),
+            (U64, TypeKind::Prim(PrimType::U64)),
+            (U128, TypeKind::Prim(PrimType::U128)),
+            (U1, TypeKind::Prim(PrimType::U1)),
+            (F16, TypeKind::Prim(PrimType::F16)),
+            (F32, TypeKind::Prim(PrimType::F32)),
+            (F64, TypeKind::Prim(PrimType::F64)),
+            (STR, TypeKind::HeapHandle { hk: HandleKind::Unique, base: HeapBase::BuiltinStr }),
+            (STR_BUILDER, TypeKind::HeapHandle { hk: HandleKind::Unique, base: HeapBase::BuiltinStrBuilder }),
+        ];
+        for (id, kind) in fixed {
+            self.types.push((id, kind));
+        }
     }
 
     pub fn intern(&mut self, kind: TypeKind) -> TypeId {
+        // Fast path: check if already interned
         if let Some((id, _)) = self.types.iter().find(|(_, k)| k == &kind) {
             return *id;
         }
@@ -138,6 +195,31 @@ impl TypeCtx {
     }
 
     pub fn lookup(&self, id: TypeId) -> Option<&TypeKind> {
+        // Fast path for fixed IDs
+        if id.0 < 100 {
+            return self.types.iter().find(|(i, _)| i == &id).map(|(_, k)| k);
+        }
         self.types.iter().find(|(i, _)| i == &id).map(|(_, k)| k)
+    }
+
+    pub fn lookup_by_prim(&self, prim: PrimType) -> TypeId {
+        match prim {
+            PrimType::Unit => fixed_type_ids::UNIT,
+            PrimType::Bool | PrimType::I1 => fixed_type_ids::BOOL,
+            PrimType::I8 => fixed_type_ids::I8,
+            PrimType::I16 => fixed_type_ids::I16,
+            PrimType::I32 => fixed_type_ids::I32,
+            PrimType::I64 => fixed_type_ids::I64,
+            PrimType::I128 => fixed_type_ids::I128,
+            PrimType::U1 => fixed_type_ids::U1,
+            PrimType::U8 => fixed_type_ids::U8,
+            PrimType::U16 => fixed_type_ids::U16,
+            PrimType::U32 => fixed_type_ids::U32,
+            PrimType::U64 => fixed_type_ids::U64,
+            PrimType::U128 => fixed_type_ids::U128,
+            PrimType::F16 => fixed_type_ids::F16,
+            PrimType::F32 => fixed_type_ids::F32,
+            PrimType::F64 => fixed_type_ids::F64,
+        }
     }
 }
