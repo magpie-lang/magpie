@@ -1415,3 +1415,72 @@ fn emit_error(diag: &mut DiagnosticBag, code: &str, message: &str) {
 fn _block_id_to_usize(b: BlockId) -> usize {
     b.0 as usize
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magpie_types::{fixed_type_ids, FnId, HeapBase, ModuleId, Sid};
+
+    #[test]
+    fn test_move_only_detection() {
+        let mut type_ctx = TypeCtx::new();
+        let heap_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Unique,
+            base: HeapBase::BuiltinStr,
+        });
+
+        assert!(is_move_only(heap_ty, &type_ctx));
+        assert!(!is_move_only(fixed_type_ids::I32, &type_ctx));
+    }
+
+    #[test]
+    fn test_borrow_in_phi_rejected() {
+        let mut type_ctx = TypeCtx::new();
+        let borrow_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::BuiltinStr,
+        });
+
+        let module = HirModule {
+            module_id: ModuleId(0),
+            sid: Sid("M:OWNTEST0000".to_string()),
+            path: "test.own".to_string(),
+            functions: vec![HirFunction {
+                fn_id: FnId(0),
+                sid: Sid("F:OWNTEST0000".to_string()),
+                name: "phi_borrow".to_string(),
+                params: vec![(LocalId(0), borrow_ty)],
+                ret_ty: fixed_type_ids::UNIT,
+                blocks: vec![HirBlock {
+                    id: BlockId(0),
+                    instrs: vec![HirInstr {
+                        dst: LocalId(1),
+                        ty: borrow_ty,
+                        op: HirOp::Phi {
+                            ty: borrow_ty,
+                            incomings: vec![(BlockId(0), HirValue::Local(LocalId(0)))],
+                        },
+                    }],
+                    void_ops: vec![],
+                    terminator: HirTerminator::Ret(None),
+                }],
+                is_async: false,
+                is_unsafe: false,
+            }],
+            globals: vec![],
+            type_decls: vec![],
+        };
+
+        let mut diag = DiagnosticBag::new(16);
+        let _ = check_ownership(&module, &type_ctx, &mut diag);
+
+        assert!(
+            diag.diagnostics.iter().any(|d| d.code == codes::MPO0102),
+            "expected MPO0102 diagnostics, got: {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+}

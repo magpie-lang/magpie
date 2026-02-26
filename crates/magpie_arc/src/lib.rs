@@ -1157,3 +1157,110 @@ fn emit_error(diag: &mut DiagnosticBag, code: &str, message: &str) {
         suggested_fixes: vec![],
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magpie_types::{BlockId, Sid};
+
+    #[test]
+    fn test_arc_insertion_on_clone_shared() {
+        let mut type_ctx = TypeCtx::new();
+        let shared_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Shared,
+            base: HeapBase::BuiltinStr,
+        });
+
+        let mut module = MpirModule {
+            sid: Sid("M:ARCINSERT00".to_string()),
+            path: "test.arc".to_string(),
+            type_table: magpie_mpir::MpirTypeTable {
+                types: vec![(
+                    shared_ty,
+                    TypeKind::HeapHandle {
+                        hk: HandleKind::Shared,
+                        base: HeapBase::BuiltinStr,
+                    },
+                )],
+            },
+            functions: vec![MpirFn {
+                sid: Sid("F:ARCINSERT00".to_string()),
+                name: "clone_shared".to_string(),
+                params: vec![(LocalId(0), shared_ty)],
+                ret_ty: shared_ty,
+                blocks: vec![MpirBlock {
+                    id: BlockId(0),
+                    instrs: vec![MpirInstr {
+                        dst: LocalId(1),
+                        ty: shared_ty,
+                        op: MpirOp::CloneShared {
+                            v: MpirValue::Local(LocalId(0)),
+                        },
+                    }],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(LocalId(1)))),
+                }],
+                locals: vec![MpirLocalDecl {
+                    id: LocalId(1),
+                    ty: shared_ty,
+                    name: "tmp".to_string(),
+                }],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let mut diag = DiagnosticBag::new(16);
+        let _ = insert_arc_ops(&mut module, &type_ctx, &mut diag);
+
+        let void_ops = &module.functions[0].blocks[0].void_ops;
+        assert!(
+            void_ops.iter().any(|op| matches!(
+                op,
+                MpirOpVoid::ArcRetain {
+                    v: MpirValue::Local(LocalId(0))
+                }
+            )),
+            "expected ArcRetain(Local(0)), got: {:?}",
+            void_ops
+        );
+    }
+
+    #[test]
+    fn test_arc_optimize_pair_elimination() {
+        let type_ctx = TypeCtx::new();
+        let mut module = MpirModule {
+            sid: Sid("M:ARCOPTIM000".to_string()),
+            path: "test.arc".to_string(),
+            type_table: magpie_mpir::MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:ARCOPTIM000".to_string()),
+                name: "opt".to_string(),
+                params: vec![],
+                ret_ty: TypeId(0),
+                blocks: vec![MpirBlock {
+                    id: BlockId(0),
+                    instrs: vec![],
+                    void_ops: vec![
+                        MpirOpVoid::ArcRetain {
+                            v: MpirValue::Local(LocalId(0)),
+                        },
+                        MpirOpVoid::ArcRelease {
+                            v: MpirValue::Local(LocalId(0)),
+                        },
+                    ],
+                    terminator: MpirTerminator::Ret(None),
+                }],
+                locals: vec![],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        optimize_arc(&mut module, &type_ctx);
+        assert!(
+            module.functions[0].blocks[0].void_ops.is_empty(),
+            "expected retain/release pair to be removed"
+        );
+    }
+}

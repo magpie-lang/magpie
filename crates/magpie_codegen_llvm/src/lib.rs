@@ -2202,3 +2202,59 @@ pub fn generate_extern_mp_module(decls: &[ExternFnDecl], lib_name: &str) -> Stri
     let _ = writeln!(out, "}}");
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magpie_mpir::{MpirLocalDecl, MpirTypeTable};
+
+    #[test]
+    fn test_codegen_hello_world() {
+        let type_ctx = TypeCtx::new();
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+
+        let module = MpirModule {
+            sid: Sid("M:HELLOWORLD0".to_string()),
+            path: "hello.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:HELLOWORLD0".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![MpirInstr {
+                        dst: magpie_types::LocalId(0),
+                        ty: i32_ty,
+                        op: MpirOp::Const(HirConst {
+                            ty: i32_ty,
+                            lit: HirConstLit::IntLit(42),
+                        }),
+                    }],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(
+                        magpie_types::LocalId(0),
+                    ))),
+                }],
+                locals: vec![MpirLocalDecl {
+                    id: magpie_types::LocalId(0),
+                    ty: i32_ty,
+                    name: "retv".to_string(),
+                }],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("define"), "expected function definitions in IR");
+        assert!(llvm_ir.contains("ret"), "expected return instruction in IR");
+    }
+
+    #[test]
+    fn test_mangling() {
+        let sid = Sid("F:ABCDEFGHIJ".to_string());
+        assert_eq!(mangle_fn(&sid), "mp$0$FN$ABCDEFGHIJ");
+    }
+}

@@ -4626,3 +4626,63 @@ fn sema_contains_heap_handle(
     visiting.remove(&ty);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magpie_ast::{AstFile, AstFnDecl, AstHeader, AstType, ExportItem, ModulePath, Span, Spanned};
+
+    fn sp<T>(node: T) -> Spanned<T> {
+        Spanned::new(node, Span::dummy())
+    }
+
+    #[test]
+    fn test_generate_sid() {
+        let sid = generate_sid('M', "demo.main");
+        assert_eq!(sid.0.len(), 12);
+        assert!(sid.0.starts_with("M:"));
+        assert!(sid.is_valid());
+        assert!(
+            sid.0[2..]
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        );
+    }
+
+    #[test]
+    fn test_resolve_simple_module() {
+        let i32_ty = AstType {
+            ownership: None,
+            base: AstBaseType::Prim("i32".to_string()),
+        };
+
+        let ast = AstFile {
+            header: sp(AstHeader {
+                module_path: sp(ModulePath {
+                    segments: vec!["demo".to_string(), "main".to_string()],
+                }),
+                exports: vec![sp(ExportItem::Fn("main".to_string()))],
+                imports: vec![],
+                digest: sp(String::new()),
+            }),
+            decls: vec![sp(AstDecl::Fn(AstFnDecl {
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: sp(i32_ty),
+                meta: None,
+                blocks: vec![],
+                doc: None,
+            }))],
+        };
+
+        let mut diag = DiagnosticBag::new(16);
+        let resolved = resolve_modules(&[ast], &mut diag).expect("module should resolve");
+
+        assert!(!diag.has_errors(), "unexpected diagnostics: {:?}", diag.diagnostics);
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            resolved[0].symbol_table.functions.contains_key("main"),
+            "expected function symbol table entry for 'main'"
+        );
+    }
+}

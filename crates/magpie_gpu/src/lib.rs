@@ -1,9 +1,9 @@
 //! GPU kernel validation/layout helpers for Magpie GPU v0.1 (§31).
 
 use magpie_diag::{Diagnostic, DiagnosticBag, Severity};
-use magpie_mpir::{MpirFn, MpirOp, MpirOpVoid, MpirTerminator};
+use magpie_mpir::{HirConstLit, MpirFn, MpirOp, MpirOpVoid, MpirTerminator, MpirValue};
 use magpie_types::{fixed_type_ids, HeapBase, PrimType, Sid, TypeCtx, TypeId, TypeKind};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub const GPU_BACKEND_SPV: u32 = 1;
 
@@ -192,21 +192,11 @@ pub fn compute_kernel_layout(func: &MpirFn, type_ctx: &TypeCtx) -> KernelLayout 
     }
 }
 
-/// Minimal SPIR-V binary stub: 5-word module header.
-pub fn generate_spirv_stub(_func: &MpirFn) -> Vec<u8> {
-    let words: [u32; 5] = [
-        0x0723_0203, // Magic number
-        0x0001_0000, // Version 1.0
-        0,           // Generator magic
-        1,           // Bound (at least 1)
-        0,           // Reserved schema
-    ];
-
-    let mut out = Vec::with_capacity(words.len() * 4);
-    for w in words {
-        out.extend_from_slice(&w.to_le_bytes());
-    }
-    out
+/// SPIR-V generator for a GPU kernel MPIR function.
+pub fn generate_spirv(func: &MpirFn) -> Vec<u8> {
+    let mut builder = SpirvBuilder::new();
+    builder.emit_kernel_module(func);
+    builder.finalize()
 }
 
 pub fn sid_hash_64(sid: &Sid) -> u64 {
@@ -407,32 +397,121 @@ struct SpirvBuilder {
 }
 
 #[derive(Debug, Default)]
-struct SpirvTypeIds {
+struct SpirvKernelIds {
     void_ty: u32,
+    bool_ty: u32,
+    int_ty: u32,
+    float_ty: u32,
+    vec3_int_ty: u32,
+    ptr_input_vec3_int_ty: u32,
+    ptr_input_int_ty: u32,
+    runtime_array_int_ty: u32,
+    storage_buffer_struct_ty: u32,
+    ptr_storage_buffer_struct_ty: u32,
+    ptr_storage_buffer_int_ty: u32,
     void_fn_ty: u32,
-    runtime_array_u32_ty: Option<u32>,
-    storage_buffer_struct_ty: Option<u32>,
-    buffer_vars: Vec<u32>,
-    push_constant_struct_ty: Option<u32>,
-    push_constant_var: Option<u32>,
+    global_invocation_id_var: u32,
+    const_int_0: u32,
+    const_int_1: u32,
+    const_float_0: u32,
+    const_float_1: u32,
+    const_bool_false: u32,
+    const_bool_true: u32,
     interface_vars: Vec<u32>,
+}
+
+#[derive(Debug, Default)]
+struct SpirvKernelState {
+    local_types: HashMap<u32, TypeId>,
+    value_ids: HashMap<u32, u32>,
+    value_types: HashMap<u32, u32>,
+    buffer_vars: HashMap<u32, u32>,
+    block_labels: HashMap<u32, u32>,
 }
 
 impl SpirvBuilder {
     const SPIRV_MAGIC: u32 = 0x0723_0203;
-    const SPIRV_VERSION_1_0: u32 = 0x0001_0000;
+    const SPIRV_VERSION_1_6: u32 = 0x0001_0600;
+
+    const OP_MEMORY_MODEL: u16 = 14;
+    const OP_ENTRY_POINT: u16 = 15;
+    const OP_EXECUTION_MODE: u16 = 16;
+    const OP_CAPABILITY: u16 = 17;
+    const OP_TYPE_VOID: u16 = 19;
+    const OP_TYPE_BOOL: u16 = 20;
+    const OP_TYPE_INT: u16 = 21;
+    const OP_TYPE_FLOAT: u16 = 22;
+    const OP_TYPE_VECTOR: u16 = 23;
+    const OP_TYPE_RUNTIME_ARRAY: u16 = 29;
+    const OP_TYPE_STRUCT: u16 = 30;
+    const OP_TYPE_POINTER: u16 = 32;
+    const OP_TYPE_FUNCTION: u16 = 33;
+    const OP_CONSTANT_TRUE: u16 = 41;
+    const OP_CONSTANT_FALSE: u16 = 42;
+    const OP_CONSTANT: u16 = 43;
+    const OP_FUNCTION: u16 = 54;
+    const OP_FUNCTION_END: u16 = 56;
+    const OP_VARIABLE: u16 = 59;
+    const OP_LOAD: u16 = 61;
+    const OP_STORE: u16 = 62;
+    const OP_ACCESS_CHAIN: u16 = 65;
+    const OP_DECORATE: u16 = 71;
+    const OP_MEMBER_DECORATE: u16 = 72;
+    const OP_BITCAST: u16 = 124;
+    const OP_IADD: u16 = 128;
+    const OP_FADD: u16 = 129;
+    const OP_ISUB: u16 = 130;
+    const OP_FSUB: u16 = 131;
+    const OP_IMUL: u16 = 132;
+    const OP_FMUL: u16 = 133;
+    const OP_UDIV: u16 = 134;
+    const OP_SDIV: u16 = 135;
+    const OP_FDIV: u16 = 136;
+    const OP_UMOD: u16 = 137;
+    const OP_SREM: u16 = 138;
+    const OP_FREM: u16 = 140;
+    const OP_SELECT: u16 = 169;
+    const OP_IEQUAL: u16 = 170;
+    const OP_INOTEQUAL: u16 = 171;
+    const OP_UGREATER_THAN: u16 = 172;
+    const OP_SGREATER_THAN: u16 = 173;
+    const OP_UGREATER_THAN_EQUAL: u16 = 174;
+    const OP_SGREATER_THAN_EQUAL: u16 = 175;
+    const OP_ULESS_THAN: u16 = 176;
+    const OP_SLESS_THAN: u16 = 177;
+    const OP_ULESS_THAN_EQUAL: u16 = 178;
+    const OP_SLESS_THAN_EQUAL: u16 = 179;
+    const OP_FORD_EQUAL: u16 = 180;
+    const OP_FORD_NOT_EQUAL: u16 = 182;
+    const OP_FORD_LESS_THAN: u16 = 184;
+    const OP_FORD_GREATER_THAN: u16 = 186;
+    const OP_FORD_LESS_THAN_EQUAL: u16 = 188;
+    const OP_FORD_GREATER_THAN_EQUAL: u16 = 190;
+    const OP_SHIFT_RIGHT_LOGICAL: u16 = 194;
+    const OP_SHIFT_RIGHT_ARITHMETIC: u16 = 195;
+    const OP_SHIFT_LEFT_LOGICAL: u16 = 196;
+    const OP_BITWISE_OR: u16 = 197;
+    const OP_BITWISE_XOR: u16 = 198;
+    const OP_BITWISE_AND: u16 = 199;
+    const OP_LABEL: u16 = 248;
+    const OP_BRANCH: u16 = 249;
+    const OP_BRANCH_CONDITIONAL: u16 = 250;
+    const OP_RETURN: u16 = 253;
+
     const CAPABILITY_SHADER: u32 = 1;
     const ADDRESSING_MODEL_LOGICAL: u32 = 0;
     const MEMORY_MODEL_GLSL450: u32 = 1;
     const EXEC_MODEL_GL_COMPUTE: u32 = 5;
     const EXEC_MODE_LOCAL_SIZE: u32 = 17;
-    const STORAGE_CLASS_PUSH_CONSTANT: u32 = 9;
+    const STORAGE_CLASS_INPUT: u32 = 1;
     const STORAGE_CLASS_STORAGE_BUFFER: u32 = 12;
     const DECORATION_BLOCK: u32 = 2;
     const DECORATION_ARRAY_STRIDE: u32 = 6;
+    const DECORATION_BUILT_IN: u32 = 11;
     const DECORATION_BINDING: u32 = 33;
     const DECORATION_DESCRIPTOR_SET: u32 = 34;
     const DECORATION_OFFSET: u32 = 35;
+    const BUILTIN_GLOBAL_INVOCATION_ID: u32 = 28;
 
     fn new() -> Self {
         Self {
@@ -447,6 +526,30 @@ impl SpirvBuilder {
         id
     }
 
+    fn emit_kernel_module(&mut self, func: &MpirFn) {
+        self.emit_header(Self::SPIRV_VERSION_1_6, 0);
+        self.emit_capability(Self::CAPABILITY_SHADER);
+        self.emit_memory_model(
+            Self::ADDRESSING_MODEL_LOGICAL,
+            Self::MEMORY_MODEL_GLSL450,
+        );
+
+        let mut state = SpirvKernelState::default();
+        state.local_types = Self::collect_local_types(func);
+        let buffer_param_locals = Self::collect_buffer_param_locals(func);
+        let ids = self.emit_kernel_decls(func, &buffer_param_locals, &mut state);
+
+        let function_id = self.new_id();
+        self.emit_entry_point(
+            Self::EXEC_MODEL_GL_COMPUTE,
+            function_id,
+            &sanitize_spirv_entry_name(&func.name),
+            &ids.interface_vars,
+        );
+        self.emit_execution_mode(function_id, Self::EXEC_MODE_LOCAL_SIZE, &[64, 1, 1]);
+        self.emit_kernel_function(function_id, func, &ids, &mut state);
+    }
+
     fn emit_header(&mut self, version: u32, generator: u32) {
         self.words.clear();
         self.words.extend_from_slice(&[
@@ -459,11 +562,11 @@ impl SpirvBuilder {
     }
 
     fn emit_capability(&mut self, capability: u32) {
-        self.emit_inst(17, &[capability]); // OpCapability
+        self.emit_inst(Self::OP_CAPABILITY, &[capability]);
     }
 
     fn emit_memory_model(&mut self, addressing_model: u32, memory_model: u32) {
-        self.emit_inst(14, &[addressing_model, memory_model]); // OpMemoryModel
+        self.emit_inst(Self::OP_MEMORY_MODEL, &[addressing_model, memory_model]);
     }
 
     fn emit_entry_point(
@@ -476,125 +579,843 @@ impl SpirvBuilder {
         let mut ops = vec![execution_model, fn_id];
         ops.extend(Self::encode_literal_string(name));
         ops.extend_from_slice(interface_vars);
-        self.emit_inst(15, &ops); // OpEntryPoint
+        self.emit_inst(Self::OP_ENTRY_POINT, &ops);
     }
 
     fn emit_execution_mode(&mut self, fn_id: u32, mode: u32, literals: &[u32]) {
         let mut ops = vec![fn_id, mode];
         ops.extend_from_slice(literals);
-        self.emit_inst(16, &ops); // OpExecutionMode
+        self.emit_inst(Self::OP_EXECUTION_MODE, &ops);
     }
 
-    fn emit_decorations(&mut self, layout: &KernelLayout, ids: &SpirvTypeIds) {
-        if let Some(runtime_arr) = ids.runtime_array_u32_ty {
-            self.emit_inst(71, &[runtime_arr, Self::DECORATION_ARRAY_STRIDE, 4]); // OpDecorate
+    fn collect_local_types(func: &MpirFn) -> HashMap<u32, TypeId> {
+        let mut out = HashMap::new();
+        for (lid, ty) in &func.params {
+            out.insert(lid.0, *ty);
         }
-        if let Some(buf_struct) = ids.storage_buffer_struct_ty {
-            self.emit_inst(71, &[buf_struct, Self::DECORATION_BLOCK]); // OpDecorate
+        for local in &func.locals {
+            out.insert(local.id.0, local.ty);
         }
-
-        let mut buffer_bindings = layout
-            .params
-            .iter()
-            .filter_map(|p| (p.kind == KernelParamKind::Buffer).then_some(p.offset_or_binding));
-        for var_id in &ids.buffer_vars {
-            let binding = buffer_bindings.next().unwrap_or(0);
-            self.emit_inst(71, &[*var_id, Self::DECORATION_DESCRIPTOR_SET, 0]); // OpDecorate
-            self.emit_inst(71, &[*var_id, Self::DECORATION_BINDING, binding]); // OpDecorate
+        for block in &func.blocks {
+            for instr in &block.instrs {
+                out.insert(instr.dst.0, instr.ty);
+            }
         }
-
-        if let Some(push_struct) = ids.push_constant_struct_ty {
-            self.emit_inst(71, &[push_struct, Self::DECORATION_BLOCK]); // OpDecorate
-            self.emit_inst(72, &[push_struct, 0, Self::DECORATION_OFFSET, 0]); // OpMemberDecorate
-        }
+        out
     }
 
-    fn emit_types(&mut self, layout: &KernelLayout) -> SpirvTypeIds {
-        let mut ids = SpirvTypeIds::default();
+    fn collect_buffer_param_locals(func: &MpirFn) -> Vec<u32> {
+        let mut used_as_buffer = HashSet::new();
+        for block in &func.blocks {
+            for instr in &block.instrs {
+                if let MpirOp::GpuBufferLoad { buf, .. } = &instr.op {
+                    if let MpirValue::Local(local) = buf {
+                        used_as_buffer.insert(local.0);
+                    }
+                }
+            }
+            for op in &block.void_ops {
+                if let MpirOpVoid::GpuBufferStore { buf, .. } = op {
+                    if let MpirValue::Local(local) = buf {
+                        used_as_buffer.insert(local.0);
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for (local, ty) in &func.params {
+            if *ty == fixed_type_ids::GPU_BUFFER_BASE || used_as_buffer.contains(&local.0) {
+                out.push(local.0);
+            }
+        }
+        out
+    }
+
+    fn emit_kernel_decls(
+        &mut self,
+        func: &MpirFn,
+        buffer_param_locals: &[u32],
+        state: &mut SpirvKernelState,
+    ) -> SpirvKernelIds {
+        let mut ids = SpirvKernelIds::default();
 
         ids.void_ty = self.new_id();
-        self.emit_inst(19, &[ids.void_ty]); // OpTypeVoid
+        self.emit_inst(Self::OP_TYPE_VOID, &[ids.void_ty]);
 
-        let u8_ty = self.new_id();
-        self.emit_inst(21, &[u8_ty, 8, 0]); // OpTypeInt
+        ids.bool_ty = self.new_id();
+        self.emit_inst(Self::OP_TYPE_BOOL, &[ids.bool_ty]);
 
-        let u32_ty = self.new_id();
-        self.emit_inst(21, &[u32_ty, 32, 0]); // OpTypeInt
+        ids.int_ty = self.new_id();
+        self.emit_inst(Self::OP_TYPE_INT, &[ids.int_ty, 32, 0]);
+
+        ids.float_ty = self.new_id();
+        self.emit_inst(Self::OP_TYPE_FLOAT, &[ids.float_ty, 32]);
+
+        ids.vec3_int_ty = self.new_id();
+        self.emit_inst(Self::OP_TYPE_VECTOR, &[ids.vec3_int_ty, ids.int_ty, 3]);
+
+        ids.ptr_input_vec3_int_ty = self.new_id();
+        self.emit_inst(
+            Self::OP_TYPE_POINTER,
+            &[ids.ptr_input_vec3_int_ty, Self::STORAGE_CLASS_INPUT, ids.vec3_int_ty],
+        );
+
+        ids.ptr_input_int_ty = self.new_id();
+        self.emit_inst(
+            Self::OP_TYPE_POINTER,
+            &[ids.ptr_input_int_ty, Self::STORAGE_CLASS_INPUT, ids.int_ty],
+        );
+
+        ids.runtime_array_int_ty = self.new_id();
+        self.emit_inst(
+            Self::OP_TYPE_RUNTIME_ARRAY,
+            &[ids.runtime_array_int_ty, ids.int_ty],
+        );
+
+        ids.storage_buffer_struct_ty = self.new_id();
+        self.emit_inst(
+            Self::OP_TYPE_STRUCT,
+            &[ids.storage_buffer_struct_ty, ids.runtime_array_int_ty],
+        );
+
+        ids.ptr_storage_buffer_struct_ty = self.new_id();
+        self.emit_inst(
+            Self::OP_TYPE_POINTER,
+            &[
+                ids.ptr_storage_buffer_struct_ty,
+                Self::STORAGE_CLASS_STORAGE_BUFFER,
+                ids.storage_buffer_struct_ty,
+            ],
+        );
+
+        ids.ptr_storage_buffer_int_ty = self.new_id();
+        self.emit_inst(
+            Self::OP_TYPE_POINTER,
+            &[
+                ids.ptr_storage_buffer_int_ty,
+                Self::STORAGE_CLASS_STORAGE_BUFFER,
+                ids.int_ty,
+            ],
+        );
 
         ids.void_fn_ty = self.new_id();
-        self.emit_inst(33, &[ids.void_fn_ty, ids.void_ty]); // OpTypeFunction
+        self.emit_inst(Self::OP_TYPE_FUNCTION, &[ids.void_fn_ty, ids.void_ty]);
 
-        if layout.num_buffers > 0 {
-            let runtime_arr_u32_ty = self.new_id();
-            self.emit_inst(29, &[runtime_arr_u32_ty, u32_ty]); // OpTypeRuntimeArray
+        ids.const_int_0 = self.new_id();
+        self.emit_inst(Self::OP_CONSTANT, &[ids.int_ty, ids.const_int_0, 0]);
 
-            let storage_buffer_struct_ty = self.new_id();
-            self.emit_inst(30, &[storage_buffer_struct_ty, runtime_arr_u32_ty]); // OpTypeStruct
+        ids.const_int_1 = self.new_id();
+        self.emit_inst(Self::OP_CONSTANT, &[ids.int_ty, ids.const_int_1, 1]);
 
-            let storage_buffer_ptr_ty = self.new_id();
+        ids.const_float_0 = self.new_id();
+        self.emit_inst(
+            Self::OP_CONSTANT,
+            &[ids.float_ty, ids.const_float_0, 0.0_f32.to_bits()],
+        );
+
+        ids.const_float_1 = self.new_id();
+        self.emit_inst(
+            Self::OP_CONSTANT,
+            &[ids.float_ty, ids.const_float_1, 1.0_f32.to_bits()],
+        );
+
+        ids.const_bool_false = self.new_id();
+        self.emit_inst(Self::OP_CONSTANT_FALSE, &[ids.bool_ty, ids.const_bool_false]);
+
+        ids.const_bool_true = self.new_id();
+        self.emit_inst(Self::OP_CONSTANT_TRUE, &[ids.bool_ty, ids.const_bool_true]);
+
+        self.emit_inst(
+            Self::OP_DECORATE,
+            &[ids.runtime_array_int_ty, Self::DECORATION_ARRAY_STRIDE, 4],
+        );
+        self.emit_inst(
+            Self::OP_DECORATE,
+            &[ids.storage_buffer_struct_ty, Self::DECORATION_BLOCK],
+        );
+        self.emit_inst(
+            Self::OP_MEMBER_DECORATE,
+            &[
+                ids.storage_buffer_struct_ty,
+                0,
+                Self::DECORATION_OFFSET,
+                0,
+            ],
+        );
+
+        ids.global_invocation_id_var = self.new_id();
+        self.emit_inst(
+            Self::OP_VARIABLE,
+            &[
+                ids.ptr_input_vec3_int_ty,
+                ids.global_invocation_id_var,
+                Self::STORAGE_CLASS_INPUT,
+            ],
+        );
+        self.emit_inst(
+            Self::OP_DECORATE,
+            &[
+                ids.global_invocation_id_var,
+                Self::DECORATION_BUILT_IN,
+                Self::BUILTIN_GLOBAL_INVOCATION_ID,
+            ],
+        );
+        ids.interface_vars.push(ids.global_invocation_id_var);
+
+        for (binding, local_id) in buffer_param_locals.iter().enumerate() {
+            let var_id = self.new_id();
             self.emit_inst(
-                32,
+                Self::OP_VARIABLE,
                 &[
-                    storage_buffer_ptr_ty,
+                    ids.ptr_storage_buffer_struct_ty,
+                    var_id,
                     Self::STORAGE_CLASS_STORAGE_BUFFER,
-                    storage_buffer_struct_ty,
                 ],
-            ); // OpTypePointer
+            );
+            self.emit_inst(
+                Self::OP_DECORATE,
+                &[var_id, Self::DECORATION_DESCRIPTOR_SET, 0],
+            );
+            self.emit_inst(
+                Self::OP_DECORATE,
+                &[var_id, Self::DECORATION_BINDING, binding as u32],
+            );
 
-            for _ in 0..layout.num_buffers {
-                let var_id = self.new_id();
-                self.emit_inst(
-                    59,
-                    &[storage_buffer_ptr_ty, var_id, Self::STORAGE_CLASS_STORAGE_BUFFER],
-                ); // OpVariable
-                ids.buffer_vars.push(var_id);
-                ids.interface_vars.push(var_id);
-            }
-
-            ids.runtime_array_u32_ty = Some(runtime_arr_u32_ty);
-            ids.storage_buffer_struct_ty = Some(storage_buffer_struct_ty);
+            ids.interface_vars.push(var_id);
+            state.buffer_vars.insert(*local_id, var_id);
         }
 
-        if layout.push_const_size > 0 {
-            let push_size_const = self.new_id();
-            self.emit_inst(43, &[u32_ty, push_size_const, layout.push_const_size]); // OpConstant
-
-            let push_const_arr_ty = self.new_id();
-            self.emit_inst(28, &[push_const_arr_ty, u8_ty, push_size_const]); // OpTypeArray
-
-            let push_const_struct_ty = self.new_id();
-            self.emit_inst(30, &[push_const_struct_ty, push_const_arr_ty]); // OpTypeStruct
-
-            let push_const_ptr_ty = self.new_id();
-            self.emit_inst(
-                32,
-                &[
-                    push_const_ptr_ty,
-                    Self::STORAGE_CLASS_PUSH_CONSTANT,
-                    push_const_struct_ty,
-                ],
-            ); // OpTypePointer
-
-            let push_const_var = self.new_id();
-            self.emit_inst(
-                59,
-                &[push_const_ptr_ty, push_const_var, Self::STORAGE_CLASS_PUSH_CONSTANT],
-            ); // OpVariable
-
-            ids.push_constant_struct_ty = Some(push_const_struct_ty);
-            ids.push_constant_var = Some(push_const_var);
-            ids.interface_vars.push(push_const_var);
+        for (local, ty) in &func.params {
+            if state.buffer_vars.contains_key(&local.0) {
+                continue;
+            }
+            let spirv_ty = self.spirv_scalar_for_type_id(*ty, &ids);
+            let value_id = self.default_value_for_type(spirv_ty, &ids);
+            state.value_ids.insert(local.0, value_id);
+            state.value_types.insert(local.0, spirv_ty);
         }
 
         ids
     }
 
-    fn emit_function(&mut self, function_id: u32, ids: &SpirvTypeIds) {
-        self.emit_inst(54, &[ids.void_ty, function_id, 0, ids.void_fn_ty]); // OpFunction
-        let label = self.new_id();
-        self.emit_inst(248, &[label]); // OpLabel
-        self.emit_inst(253, &[]); // OpReturn
-        self.emit_inst(56, &[]); // OpFunctionEnd
+    fn emit_kernel_function(
+        &mut self,
+        function_id: u32,
+        func: &MpirFn,
+        ids: &SpirvKernelIds,
+        state: &mut SpirvKernelState,
+    ) {
+        self.emit_inst(
+            Self::OP_FUNCTION,
+            &[ids.void_ty, function_id, 0, ids.void_fn_ty],
+        );
+
+        if func.blocks.is_empty() {
+            let label = self.new_id();
+            self.emit_inst(Self::OP_LABEL, &[label]);
+            self.emit_inst(Self::OP_RETURN, &[]);
+            self.emit_inst(Self::OP_FUNCTION_END, &[]);
+            return;
+        }
+
+        for block in &func.blocks {
+            state.block_labels.insert(block.id.0, self.new_id());
+        }
+
+        for block in &func.blocks {
+            let label = state
+                .block_labels
+                .get(&block.id.0)
+                .copied()
+                .unwrap_or_else(|| self.new_id());
+            self.emit_inst(Self::OP_LABEL, &[label]);
+
+            for instr in &block.instrs {
+                self.emit_kernel_instr(instr, ids, state);
+            }
+            for op in &block.void_ops {
+                self.emit_kernel_void_op(op, ids, state);
+            }
+            self.emit_kernel_terminator(&block.terminator, ids, state, label);
+        }
+
+        self.emit_inst(Self::OP_FUNCTION_END, &[]);
+    }
+
+    fn emit_kernel_instr(
+        &mut self,
+        instr: &magpie_mpir::MpirInstr,
+        ids: &SpirvKernelIds,
+        state: &mut SpirvKernelState,
+    ) {
+        match &instr.op {
+            MpirOp::Const(c) => {
+                let dst_ty = self.spirv_scalar_for_type_id(instr.ty, ids);
+                let value_id = self.constant_from_literal(&c.lit, dst_ty, ids);
+                self.set_local_value(instr.dst.0, value_id, dst_ty, state);
+            }
+            MpirOp::Move { v }
+            | MpirOp::BorrowShared { v }
+            | MpirOp::BorrowMut { v }
+            | MpirOp::Share { v }
+            | MpirOp::CloneShared { v }
+            | MpirOp::CloneWeak { v }
+            | MpirOp::WeakDowngrade { v }
+            | MpirOp::WeakUpgrade { v } => {
+                if Self::is_buffer_type(instr.ty) {
+                    if let Some(buf_var) = self.resolve_buffer_var(v, state) {
+                        state.buffer_vars.insert(instr.dst.0, buf_var);
+                    }
+                    return;
+                }
+                let dst_ty = self.spirv_scalar_for_type_id(instr.ty, ids);
+                let value_id = self.resolve_value(v, dst_ty, ids, state);
+                self.set_local_value(instr.dst.0, value_id, dst_ty, state);
+            }
+
+            MpirOp::IAdd { lhs, rhs } | MpirOp::IAddWrap { lhs, rhs } => {
+                self.emit_binary_op(instr.dst.0, Self::OP_IADD, lhs, rhs, ids.int_ty, ids, state);
+            }
+            MpirOp::ISub { lhs, rhs } | MpirOp::ISubWrap { lhs, rhs } => {
+                self.emit_binary_op(instr.dst.0, Self::OP_ISUB, lhs, rhs, ids.int_ty, ids, state);
+            }
+            MpirOp::IMul { lhs, rhs } | MpirOp::IMulWrap { lhs, rhs } => {
+                self.emit_binary_op(instr.dst.0, Self::OP_IMUL, lhs, rhs, ids.int_ty, ids, state);
+            }
+            MpirOp::ISDiv { lhs, rhs } => {
+                self.emit_binary_op(instr.dst.0, Self::OP_SDIV, lhs, rhs, ids.int_ty, ids, state);
+            }
+            MpirOp::IUDiv { lhs, rhs } => {
+                self.emit_binary_op(instr.dst.0, Self::OP_UDIV, lhs, rhs, ids.int_ty, ids, state);
+            }
+            MpirOp::ISRem { lhs, rhs } => {
+                self.emit_binary_op(instr.dst.0, Self::OP_SREM, lhs, rhs, ids.int_ty, ids, state);
+            }
+            MpirOp::IURem { lhs, rhs } => {
+                self.emit_binary_op(instr.dst.0, Self::OP_UMOD, lhs, rhs, ids.int_ty, ids, state);
+            }
+            MpirOp::IAnd { lhs, rhs } => {
+                self.emit_binary_op(
+                    instr.dst.0,
+                    Self::OP_BITWISE_AND,
+                    lhs,
+                    rhs,
+                    ids.int_ty,
+                    ids,
+                    state,
+                );
+            }
+            MpirOp::IOr { lhs, rhs } => {
+                self.emit_binary_op(
+                    instr.dst.0,
+                    Self::OP_BITWISE_OR,
+                    lhs,
+                    rhs,
+                    ids.int_ty,
+                    ids,
+                    state,
+                );
+            }
+            MpirOp::IXor { lhs, rhs } => {
+                self.emit_binary_op(
+                    instr.dst.0,
+                    Self::OP_BITWISE_XOR,
+                    lhs,
+                    rhs,
+                    ids.int_ty,
+                    ids,
+                    state,
+                );
+            }
+            MpirOp::IShl { lhs, rhs } => {
+                self.emit_binary_op(
+                    instr.dst.0,
+                    Self::OP_SHIFT_LEFT_LOGICAL,
+                    lhs,
+                    rhs,
+                    ids.int_ty,
+                    ids,
+                    state,
+                );
+            }
+            MpirOp::ILshr { lhs, rhs } => {
+                self.emit_binary_op(
+                    instr.dst.0,
+                    Self::OP_SHIFT_RIGHT_LOGICAL,
+                    lhs,
+                    rhs,
+                    ids.int_ty,
+                    ids,
+                    state,
+                );
+            }
+            MpirOp::IAshr { lhs, rhs } => {
+                self.emit_binary_op(
+                    instr.dst.0,
+                    Self::OP_SHIFT_RIGHT_ARITHMETIC,
+                    lhs,
+                    rhs,
+                    ids.int_ty,
+                    ids,
+                    state,
+                );
+            }
+
+            MpirOp::FAdd { lhs, rhs } | MpirOp::FAddFast { lhs, rhs } => {
+                self.emit_binary_op(
+                    instr.dst.0,
+                    Self::OP_FADD,
+                    lhs,
+                    rhs,
+                    ids.float_ty,
+                    ids,
+                    state,
+                );
+            }
+            MpirOp::FSub { lhs, rhs } | MpirOp::FSubFast { lhs, rhs } => {
+                self.emit_binary_op(
+                    instr.dst.0,
+                    Self::OP_FSUB,
+                    lhs,
+                    rhs,
+                    ids.float_ty,
+                    ids,
+                    state,
+                );
+            }
+            MpirOp::FMul { lhs, rhs } | MpirOp::FMulFast { lhs, rhs } => {
+                self.emit_binary_op(
+                    instr.dst.0,
+                    Self::OP_FMUL,
+                    lhs,
+                    rhs,
+                    ids.float_ty,
+                    ids,
+                    state,
+                );
+            }
+            MpirOp::FDiv { lhs, rhs } | MpirOp::FDivFast { lhs, rhs } => {
+                self.emit_binary_op(
+                    instr.dst.0,
+                    Self::OP_FDIV,
+                    lhs,
+                    rhs,
+                    ids.float_ty,
+                    ids,
+                    state,
+                );
+            }
+            MpirOp::FRem { lhs, rhs } => {
+                self.emit_binary_op(
+                    instr.dst.0,
+                    Self::OP_FREM,
+                    lhs,
+                    rhs,
+                    ids.float_ty,
+                    ids,
+                    state,
+                );
+            }
+
+            MpirOp::ICmp { pred, lhs, rhs } => {
+                let lhs_id = self.resolve_value(lhs, ids.int_ty, ids, state);
+                let rhs_id = self.resolve_value(rhs, ids.int_ty, ids, state);
+                let opcode = match pred.to_ascii_lowercase().as_str() {
+                    "eq" => Self::OP_IEQUAL,
+                    "ne" => Self::OP_INOTEQUAL,
+                    "slt" => Self::OP_SLESS_THAN,
+                    "sgt" => Self::OP_SGREATER_THAN,
+                    "sle" => Self::OP_SLESS_THAN_EQUAL,
+                    "sge" => Self::OP_SGREATER_THAN_EQUAL,
+                    "ult" => Self::OP_ULESS_THAN,
+                    "ugt" => Self::OP_UGREATER_THAN,
+                    "ule" => Self::OP_ULESS_THAN_EQUAL,
+                    "uge" => Self::OP_UGREATER_THAN_EQUAL,
+                    _ => Self::OP_IEQUAL,
+                };
+                let result_id = self.new_id();
+                self.emit_inst(opcode, &[ids.bool_ty, result_id, lhs_id, rhs_id]);
+                self.set_local_value(instr.dst.0, result_id, ids.bool_ty, state);
+            }
+            MpirOp::FCmp { pred, lhs, rhs } => {
+                let lhs_id = self.resolve_value(lhs, ids.float_ty, ids, state);
+                let rhs_id = self.resolve_value(rhs, ids.float_ty, ids, state);
+                let opcode = match pred.to_ascii_lowercase().as_str() {
+                    "eq" => Self::OP_FORD_EQUAL,
+                    "ne" => Self::OP_FORD_NOT_EQUAL,
+                    "lt" => Self::OP_FORD_LESS_THAN,
+                    "gt" => Self::OP_FORD_GREATER_THAN,
+                    "le" => Self::OP_FORD_LESS_THAN_EQUAL,
+                    "ge" => Self::OP_FORD_GREATER_THAN_EQUAL,
+                    _ => Self::OP_FORD_EQUAL,
+                };
+                let result_id = self.new_id();
+                self.emit_inst(opcode, &[ids.bool_ty, result_id, lhs_id, rhs_id]);
+                self.set_local_value(instr.dst.0, result_id, ids.bool_ty, state);
+            }
+
+            MpirOp::GpuGlobalId => {
+                let ptr_id = self.new_id();
+                self.emit_inst(
+                    Self::OP_ACCESS_CHAIN,
+                    &[
+                        ids.ptr_input_int_ty,
+                        ptr_id,
+                        ids.global_invocation_id_var,
+                        ids.const_int_0,
+                    ],
+                );
+                let raw_id = self.new_id();
+                self.emit_inst(Self::OP_LOAD, &[ids.int_ty, raw_id, ptr_id]);
+                let dst_ty = self.spirv_scalar_for_type_id(instr.ty, ids);
+                let out_id = self.cast_value(raw_id, ids.int_ty, dst_ty, ids);
+                self.set_local_value(instr.dst.0, out_id, dst_ty, state);
+            }
+
+            MpirOp::GpuBufferLoad { buf, idx } => {
+                let dst_ty = self.spirv_scalar_for_type_id(instr.ty, ids);
+                if let Some(buf_var) = self.resolve_buffer_var(buf, state) {
+                    let idx_id = self.resolve_value(idx, ids.int_ty, ids, state);
+                    let ptr_id = self.new_id();
+                    self.emit_inst(
+                        Self::OP_ACCESS_CHAIN,
+                        &[
+                            ids.ptr_storage_buffer_int_ty,
+                            ptr_id,
+                            buf_var,
+                            ids.const_int_0,
+                            idx_id,
+                        ],
+                    );
+                    let raw_id = self.new_id();
+                    self.emit_inst(Self::OP_LOAD, &[ids.int_ty, raw_id, ptr_id]);
+                    let out_id = self.cast_value(raw_id, ids.int_ty, dst_ty, ids);
+                    self.set_local_value(instr.dst.0, out_id, dst_ty, state);
+                } else {
+                    let value_id = self.default_value_for_type(dst_ty, ids);
+                    self.set_local_value(instr.dst.0, value_id, dst_ty, state);
+                }
+            }
+
+            _ => {
+                if !Self::is_buffer_type(instr.ty) {
+                    let dst_ty = self.spirv_scalar_for_type_id(instr.ty, ids);
+                    let value_id = self.default_value_for_type(dst_ty, ids);
+                    self.set_local_value(instr.dst.0, value_id, dst_ty, state);
+                }
+            }
+        }
+    }
+
+    fn emit_binary_op(
+        &mut self,
+        dst_local: u32,
+        opcode: u16,
+        lhs: &MpirValue,
+        rhs: &MpirValue,
+        ty: u32,
+        ids: &SpirvKernelIds,
+        state: &mut SpirvKernelState,
+    ) {
+        let lhs_id = self.resolve_value(lhs, ty, ids, state);
+        let rhs_id = self.resolve_value(rhs, ty, ids, state);
+        let result_id = self.new_id();
+        self.emit_inst(opcode, &[ty, result_id, lhs_id, rhs_id]);
+        self.set_local_value(dst_local, result_id, ty, state);
+    }
+
+    fn emit_kernel_void_op(
+        &mut self,
+        op: &MpirOpVoid,
+        ids: &SpirvKernelIds,
+        state: &mut SpirvKernelState,
+    ) {
+        if let MpirOpVoid::GpuBufferStore { buf, idx, val } = op {
+            let Some(buf_var) = self.resolve_buffer_var(buf, state) else {
+                return;
+            };
+
+            let idx_id = self.resolve_value(idx, ids.int_ty, ids, state);
+            let val_id = self.resolve_value(val, ids.int_ty, ids, state);
+
+            let ptr_id = self.new_id();
+            self.emit_inst(
+                Self::OP_ACCESS_CHAIN,
+                &[
+                    ids.ptr_storage_buffer_int_ty,
+                    ptr_id,
+                    buf_var,
+                    ids.const_int_0,
+                    idx_id,
+                ],
+            );
+            self.emit_inst(Self::OP_STORE, &[ptr_id, val_id]);
+        }
+    }
+
+    fn emit_kernel_terminator(
+        &mut self,
+        term: &MpirTerminator,
+        ids: &SpirvKernelIds,
+        state: &mut SpirvKernelState,
+        current_label: u32,
+    ) {
+        match term {
+            MpirTerminator::Ret(_) => {
+                self.emit_inst(Self::OP_RETURN, &[]);
+            }
+            MpirTerminator::Br(bb) => {
+                let target = state
+                    .block_labels
+                    .get(&bb.0)
+                    .copied()
+                    .unwrap_or(current_label);
+                self.emit_inst(Self::OP_BRANCH, &[target]);
+            }
+            MpirTerminator::Cbr {
+                cond,
+                then_bb,
+                else_bb,
+            } => {
+                let cond_id = self.resolve_value(cond, ids.bool_ty, ids, state);
+                let then_label = state
+                    .block_labels
+                    .get(&then_bb.0)
+                    .copied()
+                    .unwrap_or(current_label);
+                let else_label = state
+                    .block_labels
+                    .get(&else_bb.0)
+                    .copied()
+                    .unwrap_or(current_label);
+                self.emit_inst(
+                    Self::OP_BRANCH_CONDITIONAL,
+                    &[cond_id, then_label, else_label],
+                );
+            }
+            MpirTerminator::Switch { default, .. } => {
+                let target = state
+                    .block_labels
+                    .get(&default.0)
+                    .copied()
+                    .unwrap_or(current_label);
+                self.emit_inst(Self::OP_BRANCH, &[target]);
+            }
+            MpirTerminator::Unreachable => {
+                self.emit_inst(Self::OP_RETURN, &[]);
+            }
+        }
+    }
+
+    fn resolve_buffer_var(&self, value: &MpirValue, state: &SpirvKernelState) -> Option<u32> {
+        match value {
+            MpirValue::Local(local) => state.buffer_vars.get(&local.0).copied(),
+            MpirValue::Const(_) => None,
+        }
+    }
+
+    fn resolve_value(
+        &mut self,
+        value: &MpirValue,
+        expected_ty: u32,
+        ids: &SpirvKernelIds,
+        state: &mut SpirvKernelState,
+    ) -> u32 {
+        match value {
+            MpirValue::Local(local) => {
+                if let Some(value_id) = state.value_ids.get(&local.0).copied() {
+                    let from_ty = state
+                        .value_types
+                        .get(&local.0)
+                        .copied()
+                        .unwrap_or(expected_ty);
+                    return self.cast_value(value_id, from_ty, expected_ty, ids);
+                }
+
+                let inferred_ty = state
+                    .local_types
+                    .get(&local.0)
+                    .copied()
+                    .map(|ty| self.spirv_scalar_for_type_id(ty, ids))
+                    .unwrap_or(expected_ty);
+                let default_id = self.default_value_for_type(inferred_ty, ids);
+                state.value_ids.insert(local.0, default_id);
+                state.value_types.insert(local.0, inferred_ty);
+                self.cast_value(default_id, inferred_ty, expected_ty, ids)
+            }
+            MpirValue::Const(c) => self.constant_from_literal(&c.lit, expected_ty, ids),
+        }
+    }
+
+    fn cast_value(&mut self, value_id: u32, from_ty: u32, to_ty: u32, ids: &SpirvKernelIds) -> u32 {
+        if from_ty == to_ty {
+            return value_id;
+        }
+
+        if to_ty == ids.bool_ty {
+            let result_id = self.new_id();
+            if from_ty == ids.float_ty {
+                self.emit_inst(
+                    Self::OP_FORD_NOT_EQUAL,
+                    &[ids.bool_ty, result_id, value_id, ids.const_float_0],
+                );
+            } else {
+                self.emit_inst(
+                    Self::OP_INOTEQUAL,
+                    &[ids.bool_ty, result_id, value_id, ids.const_int_0],
+                );
+            }
+            return result_id;
+        }
+
+        if from_ty == ids.bool_ty && to_ty == ids.int_ty {
+            let result_id = self.new_id();
+            self.emit_inst(
+                Self::OP_SELECT,
+                &[
+                    ids.int_ty,
+                    result_id,
+                    value_id,
+                    ids.const_int_1,
+                    ids.const_int_0,
+                ],
+            );
+            return result_id;
+        }
+
+        if from_ty == ids.bool_ty && to_ty == ids.float_ty {
+            let result_id = self.new_id();
+            self.emit_inst(
+                Self::OP_SELECT,
+                &[
+                    ids.float_ty,
+                    result_id,
+                    value_id,
+                    ids.const_float_1,
+                    ids.const_float_0,
+                ],
+            );
+            return result_id;
+        }
+
+        if (from_ty == ids.int_ty && to_ty == ids.float_ty)
+            || (from_ty == ids.float_ty && to_ty == ids.int_ty)
+        {
+            let result_id = self.new_id();
+            self.emit_inst(Self::OP_BITCAST, &[to_ty, result_id, value_id]);
+            return result_id;
+        }
+
+        value_id
+    }
+
+    fn set_local_value(
+        &self,
+        local_id: u32,
+        value_id: u32,
+        spirv_ty: u32,
+        state: &mut SpirvKernelState,
+    ) {
+        state.value_ids.insert(local_id, value_id);
+        state.value_types.insert(local_id, spirv_ty);
+    }
+
+    fn constant_from_literal(
+        &mut self,
+        lit: &HirConstLit,
+        expected_ty: u32,
+        ids: &SpirvKernelIds,
+    ) -> u32 {
+        match lit {
+            HirConstLit::IntLit(v) => {
+                if expected_ty == ids.bool_ty {
+                    return if *v == 0 {
+                        ids.const_bool_false
+                    } else {
+                        ids.const_bool_true
+                    };
+                }
+                if expected_ty == ids.float_ty {
+                    let id = self.new_id();
+                    self.emit_inst(
+                        Self::OP_CONSTANT,
+                        &[ids.float_ty, id, (*v as f32).to_bits()],
+                    );
+                    return id;
+                }
+                let id = self.new_id();
+                self.emit_inst(Self::OP_CONSTANT, &[expected_ty, id, *v as u32]);
+                id
+            }
+            HirConstLit::FloatLit(v) => {
+                if expected_ty == ids.float_ty {
+                    let id = self.new_id();
+                    self.emit_inst(
+                        Self::OP_CONSTANT,
+                        &[ids.float_ty, id, (*v as f32).to_bits()],
+                    );
+                    return id;
+                }
+                if expected_ty == ids.bool_ty {
+                    return if *v == 0.0 {
+                        ids.const_bool_false
+                    } else {
+                        ids.const_bool_true
+                    };
+                }
+                let id = self.new_id();
+                self.emit_inst(Self::OP_CONSTANT, &[expected_ty, id, *v as u32]);
+                id
+            }
+            HirConstLit::BoolLit(v) => {
+                if expected_ty == ids.bool_ty {
+                    if *v {
+                        ids.const_bool_true
+                    } else {
+                        ids.const_bool_false
+                    }
+                } else if expected_ty == ids.float_ty {
+                    if *v {
+                        ids.const_float_1
+                    } else {
+                        ids.const_float_0
+                    }
+                } else if *v {
+                    ids.const_int_1
+                } else {
+                    ids.const_int_0
+                }
+            }
+            HirConstLit::StringLit(_) | HirConstLit::Unit => self.default_value_for_type(expected_ty, ids),
+        }
+    }
+
+    fn default_value_for_type(&self, ty: u32, ids: &SpirvKernelIds) -> u32 {
+        if ty == ids.bool_ty {
+            ids.const_bool_false
+        } else if ty == ids.float_ty {
+            ids.const_float_0
+        } else {
+            ids.const_int_0
+        }
+    }
+
+    fn spirv_scalar_for_type_id(&self, ty: TypeId, ids: &SpirvKernelIds) -> u32 {
+        if matches!(
+            ty,
+            fixed_type_ids::F16 | fixed_type_ids::F32 | fixed_type_ids::F64
+        ) {
+            ids.float_ty
+        } else if matches!(ty, fixed_type_ids::BOOL | fixed_type_ids::U1) {
+            ids.bool_ty
+        } else {
+            ids.int_ty
+        }
+    }
+
+    fn is_buffer_type(ty: TypeId) -> bool {
+        ty == fixed_type_ids::GPU_BUFFER_BASE
     }
 
     fn finalize(mut self) -> Vec<u8> {
@@ -634,7 +1455,7 @@ impl SpirvBuilder {
     }
 }
 
-pub fn generate_spirv(
+pub fn generate_spirv_with_layout(
     func: &magpie_mpir::MpirFn,
     layout: &KernelLayout,
     type_ctx: &magpie_types::TypeCtx,
@@ -662,27 +1483,7 @@ pub fn generate_spirv(
         }
     }
 
-    let mut builder = SpirvBuilder::new();
-    builder.emit_header(SpirvBuilder::SPIRV_VERSION_1_0, 0);
-    builder.emit_capability(SpirvBuilder::CAPABILITY_SHADER);
-    builder.emit_memory_model(
-        SpirvBuilder::ADDRESSING_MODEL_LOGICAL,
-        SpirvBuilder::MEMORY_MODEL_GLSL450,
-    );
-
-    let ids = builder.emit_types(layout);
-    let entry_fn = builder.new_id();
-    builder.emit_entry_point(
-        SpirvBuilder::EXEC_MODEL_GL_COMPUTE,
-        entry_fn,
-        &sanitize_spirv_entry_name(&func.name),
-        &ids.interface_vars,
-    );
-    builder.emit_execution_mode(entry_fn, SpirvBuilder::EXEC_MODE_LOCAL_SIZE, &[1, 1, 1]);
-    builder.emit_decorations(layout, &ids);
-    builder.emit_function(entry_fn, &ids);
-
-    Ok(builder.finalize())
+    Ok(generate_spirv(func))
 }
 
 pub fn embed_spirv_as_llvm_const(spirv_bytes: &[u8], symbol_name: &str) -> String {
