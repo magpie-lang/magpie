@@ -1,0 +1,10 @@
+[package]
+name = "magpie_pkg"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+magpie_diag = { path = "../magpie_diag" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }

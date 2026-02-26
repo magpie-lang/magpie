@@ -1,0 +1,15 @@
+[package]
+name = "magpie_cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "magpie"
+path = "src/main.rs"
+
+[dependencies]
+magpie_driver = { path = "../magpie_driver" }
+magpie_diag = { path = "../magpie_diag" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/magpie_cli",
+    "crates/magpie_driver",
+    "crates/magpie_lex",
+    "crates/magpie_parse",
+    "crates/magpie_csnf",
+    "crates/magpie_ast",
+    "crates/magpie_hir",
+    "crates/magpie_sema",
+    "crates/magpie_types",
+    "crates/magpie_mono",
+    "crates/magpie_own",
+    "crates/magpie_mpir",
+    "crates/magpie_arc",
+    "crates/magpie_codegen_llvm",
+    "crates/magpie_codegen_wasm",
+    "crates/magpie_jit",
+    "crates/magpie_diag",
+    "crates/magpie_pkg",
+    "crates/magpie_memory",
+    "crates/magpie_ctx",
+    "crates/magpie_web",
+    "crates/magpie_gpu",
+    "crates/magpie_rt",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# Hashing
+blake3 = "1"
+base32 = "0.5"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Testing
+insta = { version = "1", features = ["json"] }
+pretty_assertions = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# LLVM (pinned)
+# llvm-sys = "180"  # Uncomment when LLVM is configured
+
+# Misc
+indexmap = { version = "2", features = ["serde"] }
+petgraph = "0.7"
+unicode-normalization = "0.1"

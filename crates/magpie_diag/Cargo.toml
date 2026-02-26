@@ -1,0 +1,9 @@
+[package]
+name = "magpie_diag"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+magpie_ast = { path = "../magpie_ast" }
+serde = { workspace = true }
+serde_json = { workspace = true }

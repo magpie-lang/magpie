@@ -1,0 +1,9 @@
+[package]
+name = "magpie_gpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+magpie_mpir = { path = "../magpie_mpir" }
+magpie_types = { path = "../magpie_types" }
+magpie_diag = { path = "../magpie_diag" }

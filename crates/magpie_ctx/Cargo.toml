@@ -1,0 +1,10 @@
+[package]
+name = "magpie_ctx"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+magpie_memory = { path = "../magpie_memory" }
+magpie_diag = { path = "../magpie_diag" }
+serde = { workspace = true }
+serde_json = { workspace = true }

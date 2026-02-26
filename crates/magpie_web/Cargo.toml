@@ -1,0 +1,10 @@
+[package]
+name = "magpie_web"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+magpie_types = { path = "../magpie_types" }
+magpie_diag = { path = "../magpie_diag" }
+serde = { workspace = true }
+serde_json = { workspace = true }

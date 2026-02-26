@@ -1,0 +1,8 @@
+[package]
+name = "magpie_jit"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+magpie_codegen_llvm = { path = "../magpie_codegen_llvm" }
+magpie_diag = { path = "../magpie_diag" }
