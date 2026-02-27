@@ -85,9 +85,19 @@ fn arithmetic_fixture_parses_and_builds() {
 }
 
 #[test]
+fn feature_harness_fixture_parses_and_builds() {
+    let fixture = fixture_path("feature_harness.mp");
+    parse_fixture(&fixture);
+    let entry = prepare_fixture_for_build(&fixture);
+    build_entry(&entry);
+}
+
+#[test]
 fn fixtures_build_via_driver_pipeline() {
     let hello_entry = prepare_fixture_for_build(&fixture_path("hello.mp"));
     let arithmetic_entry = prepare_fixture_for_build(&fixture_path("arithmetic.mp"));
+    let harness_entry = prepare_fixture_for_build(&fixture_path("feature_harness.mp"));
     build_entry(&hello_entry);
     build_entry(&arithmetic_entry);
+    build_entry(&harness_entry);
 }
