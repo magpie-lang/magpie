@@ -1,27 +1,49 @@
 ---
 name: magpie-engineer
-description: Extremely detailed, source-first guide for authoring Magpie (.mp), implementing compiler/runtime changes, and debugging parse/resolve/type/HIR/ownership/MPIR/codegen/link/runtime failures. Use for language grammar/semantics questions, opcode work, diagnostics triage, and production-grade validation.
+description: Extremely detailed, binary-first guide for authoring Magpie (.mp), operating with only the compiler CLI/binary, and debugging parse/resolve/type/HIR/ownership/MPIR/codegen/link/runtime failures. Includes grammar/semantics and error-code fix playbooks with incorrect/fixed examples.
 ---
 
-# Magpie Engineer Skill (Source of Truth: Code)
+# Magpie Engineer Skill (Binary-first: works without source access)
 
-Use this skill whenever you touch Magpie language files (`.mp`) or any compiler/runtime crate in this repo.
+Use this skill whenever you write/debug Magpie `.mp` programs or triage Magpie compiler failures.
+
+**Assumption for this skill:** the agent may only have access to the compiler binary/CLI outputs (no source tree).
 
 ---
 
 ## 0) Non-negotiable rules
 
-1. **Source code is canonical.**
-   - Trust only implementation + tests in this repository.
-   - Do **not** assume `SPEC.md` / `PLAN.md` are current.
-2. **Diagnose by pipeline stage + diagnostic code first**, then patch.
-3. **Smallest reproducer first** (fixture or tiny `.mp`).
-4. **Patch the owning layer only** (parser vs sema vs ownership vs codegen vs runtime).
+1. **Binary-first operation:** treat compiler diagnostics and emitted artifacts as truth.
+   - Use `magpie explain <CODE>` and `--output json` when available.
+   - Do **not** rely on outdated design docs.
+2. **Diagnose by pipeline stage + diagnostic code first**, then patch the program.
+3. **Smallest reproducer first** (one tiny `.mp` file, then grow).
+4. **Change one dimension at a time** (syntax, then types, then ownership, then backend).
 5. **Prove fixes with commands and exit codes.**
 
 ---
 
-## 1) Where truth lives (read in this order)
+## 1) Binary-only truth stack (no source required)
+
+When source is unavailable, use this evidence hierarchy:
+
+1. Compiler exit status + diagnostic codes (`--output json` preferred).
+2. `magpie explain <CODE>` output for immediate remediation guidance.
+3. Emitted artifacts (`.mpir`, `.ll`, `.mpdbg`, graphs) to localize failing stage.
+4. Minimal reproducer program that isolates one failing behavior.
+5. Only if source becomes available: inspect implementation details.
+
+Binary-only triage loop:
+
+1. Re-run build with machine-readable output and focused emits.
+2. Group diagnostics by code prefix (`MPP`, `MPS`, `MPT`, `MPO`, `MPL`, ...).
+3. Fix earliest-stage hard errors first.
+4. Rebuild after each small fix.
+5. Stop only when clean build + expected artifact set are produced.
+
+---
+
+## 2) Optional deep-reference map (use only if source is available)
 
 ### Language surface + grammar
 - `crates/magpie_lex/src/lib.rs` — tokenization, keyword/op spelling
@@ -54,7 +76,7 @@ Use this skill whenever you touch Magpie language files (`.mp`) or any compiler/
 
 ---
 
-## 2) CLI and execution workflow
+## 3) CLI and execution workflow
 
 Core commands:
 
@@ -76,7 +98,7 @@ Useful emit kinds from driver planning:
 
 ---
 
-## 3) Full lexical model (from lexer)
+## 4) Full lexical model (from lexer)
 
 ### Comments
 - `; ...` line comment
@@ -105,7 +127,7 @@ Useful emit kinds from driver planning:
 
 ---
 
-## 4) Full grammar skeleton (parser-authoritative)
+## 5) Full grammar skeleton (parser-authoritative)
 
 ## 4.1 File structure (strict order)
 
@@ -226,7 +248,7 @@ terminator := "ret" value_ref?
 
 ---
 
-## 5) Type grammar + type semantics
+## 6) Type grammar + type semantics
 
 ## 5.1 Ownership prefix
 
@@ -276,7 +298,7 @@ From `ast_type_to_type_id` and `lower_builtin_type`:
 
 ---
 
-## 6) Full opcode surface (parser + CSNF canonical spelling)
+## 7) Full opcode surface (parser + CSNF canonical spelling)
 
 Use exactly these names and keys.
 
@@ -457,7 +479,7 @@ These are **not** parser surface ops for `.mp` authoring; they are compiler-inte
 
 ---
 
-## 7) Semantic invariants by stage
+## 8) Semantic invariants by stage
 
 ## 7.1 Resolve/symbol layer (`MPS*`, `MPF*`)
 
@@ -555,7 +577,7 @@ Trait constraints for collection ops:
 
 ---
 
-## 8) Unsafe, async, and control-flow semantics
+## 9) Unsafe, async, and control-flow semantics
 
 ## 8.1 Unsafe
 
@@ -580,7 +602,7 @@ Note: diagnostic constant `MPAS0001` exists in diag codes, but current code path
 
 ---
 
-## 9) Canonical .mp authoring templates
+## 10) Canonical .mp authoring templates
 
 ## 9.1 Minimal valid module
 
@@ -620,7 +642,7 @@ bb1:
 
 ---
 
-## 10) Pipeline model for debugging
+## 11) Pipeline model for debugging
 
 Driver stage names (actual constants):
 1. `stage1_read_lex_parse`
@@ -641,7 +663,7 @@ When triaging failures, always name the failing stage.
 
 ---
 
-## 11) Error-driven fix playbooks
+## 12) Error-driven fix playbooks
 
 ## 11.1 Parse/lex (`MPP*`)
 
@@ -675,7 +697,7 @@ When triaging failures, always name the failing stage.
 
 ---
 
-## 12) How to implement a new language feature correctly
+## 13) How to implement a new language feature correctly
 
 For a new opcode/syntax/type feature:
 
@@ -694,7 +716,7 @@ Do not skip intermediate layers; partial implementation causes stage-mismatch re
 
 ---
 
-## 13) Comprehensive testing strategy (language + semantics)
+## 14) Comprehensive testing strategy (language + semantics)
 
 ## 13.1 Fast local loop
 
@@ -722,7 +744,7 @@ Every bug fix should add one of:
 
 ---
 
-## 14) High-value gotchas (easy to miss)
+## 15) High-value gotchas (easy to miss)
 
 1. **Header order is strict** in parser.
 2. **Call argument keys are not semantic** today; order is what lowering preserves.
@@ -736,7 +758,7 @@ Every bug fix should add one of:
 
 ---
 
-## 15) Production-ready completion checklist
+## 16) Production-ready completion checklist
 
 Before declaring done:
 
@@ -750,7 +772,7 @@ Before declaring done:
 
 ---
 
-## 16) Response protocol for failures/fixes
+## 17) Response protocol for failures/fixes
 
 Always report in this order:
 1. Stage + diagnostic code(s)
@@ -763,7 +785,7 @@ Never claim “fixed” without command evidence.
 
 ---
 
-## 17) Per-op type/ownership contract matrix (implementation-grounded)
+## 18) Per-op type/ownership contract matrix (implementation-grounded)
 
 Use this section when writing or reviewing `.mp` operations. It states what is currently enforced by code (not wishful design).
 
@@ -898,7 +920,7 @@ When adding GPU semantics, extend sema/ownership checks explicitly; current stat
 
 ---
 
-## 18) Move/consume semantics matrix (ownership checker model)
+## 19) Move/consume semantics matrix (ownership checker model)
 
 These are the values the ownership checker treats as consumed (move candidates), per `op_consumed_locals` / `op_void_consumed_locals`.
 
@@ -936,3 +958,1488 @@ Many read/projection/math ops do not directly mark args as consumed in ownership
 - most parse/read-only intrinsics.
 
 Use this when diagnosing “use of moved value” (`MPO0007`) vs “move while borrowed” (`MPO0011`).
+
+---
+
+## 20) Error-code cookbook (binary-only, with incorrect/fixed examples)
+
+Use this whenever you only have the compiler binary.
+
+### 20.0 Rapid workflow for any code
+
+1. Reproduce:
+   - `magpie build --entry <file.mp> --output json --emit mpir,llvm-ir,mpdbg`
+2. Explain:
+   - `magpie explain <CODE>`
+3. Apply minimal fix.
+4. Rebuild until the code disappears.
+
+For each code below, **Bad** is a minimal failing pattern and **Fix** is the smallest stable correction.
+
+### 20.1 Parse / IO / artifact codes
+
+#### MPP0001 — Source I/O / lexer-level read issue
+
+Bad:
+```bash
+magpie build --entry ./missing/main.mp
+```
+
+Fix:
+```bash
+mkdir -p src
+cat > src/main.mp <<'MP'
+module demo.main
+exports { @main }
+imports { }
+digest "0000000000000000"
+
+fn @main() -> i64 {
+bb0:
+  ret const.i64 0
+}
+MP
+magpie build --entry ./src/main.mp
+```
+
+#### MPP0002 — Syntax/tokenization error
+
+Bad:
+```mp
+module demo.main
+exports { @main }
+imports { }
+digest "0000000000000000"
+
+fn @main() -> i64 {
+bb0:
+  %x: i64 = i.add { lhs=const.i64 1 rhs=const.i64 2 }
+  ret %x
+}
+```
+
+Fix:
+```mp
+module demo.main
+exports { @main }
+imports { }
+digest "0000000000000000"
+
+fn @main() -> i64 {
+bb0:
+  %x: i64 = i.add { lhs=const.i64 1, rhs=const.i64 2 }
+  ret %x
+}
+```
+
+#### MPP0003 — Artifact emission failure
+
+Bad:
+```bash
+magpie build --entry src/main.mp --emit llvm-ir --output json
+# writing artifact fails due to unwritable destination/disk issues
+```
+
+Fix:
+```bash
+# ensure writable working/output dirs and free disk, then rebuild
+magpie build --entry src/main.mp --emit llvm-ir --output json
+```
+
+### 20.2 Resolve / SSA / unsafe-context codes (MPS*)
+
+#### MPS0001 — duplicate definition (module path or SSA local)
+
+Bad:
+```mp
+fn @main() -> i64 {
+bb0:
+  %x: i64 = const.i64 1
+  %x: i64 = const.i64 2
+  ret %x
+}
+```
+
+Fix:
+```mp
+fn @main() -> i64 {
+bb0:
+  %x: i64 = const.i64 1
+  %y: i64 = const.i64 2
+  ret %y
+}
+```
+
+#### MPS0002 — unresolved reference / use-before-def
+
+Bad:
+```mp
+fn @main() -> i64 {
+bb0:
+  %z: i64 = i.add { lhs=%x, rhs=const.i64 1 }
+  ret %z
+}
+```
+
+Fix:
+```mp
+fn @main() -> i64 {
+bb0:
+  %x: i64 = const.i64 10
+  %z: i64 = i.add { lhs=%x, rhs=const.i64 1 }
+  ret %z
+}
+```
+
+#### MPS0003 — dominance violation
+
+Bad:
+```mp
+fn @f(%c: bool) -> i64 {
+bb0:
+  cbr %c bb1 bb2
+bb1:
+  %x: i64 = const.i64 1
+  br bb3
+bb2:
+  br bb3
+bb3:
+  %y: i64 = i.add { lhs=%x, rhs=const.i64 1 }
+  ret %y
+}
+```
+
+Fix (use phi):
+```mp
+fn @f(%c: bool) -> i64 {
+bb0:
+  cbr %c bb1 bb2
+bb1:
+  %x1: i64 = const.i64 1
+  br bb3
+bb2:
+  %x2: i64 = const.i64 2
+  br bb3
+bb3:
+  %x: i64 = phi i64 { [bb1:%x1], [bb2:%x2] }
+  %y: i64 = i.add { lhs=%x, rhs=const.i64 1 }
+  ret %y
+}
+```
+
+#### MPS0004 / MPS0005 / MPS0006 — import conflict / ambiguity
+
+Bad:
+```mp
+imports { a.mod::{@foo}, b.mod::{@foo} }
+```
+
+Fix:
+```mp
+imports { a.mod::{@foo_a}, b.mod::{@foo_b} }
+; or call fully-qualified symbols instead of conflicting short names
+```
+
+#### MPS0008 — invalid CFG target
+
+Bad:
+```mp
+fn @main() -> i64 {
+bb0:
+  br bb9
+}
+```
+
+Fix:
+```mp
+fn @main() -> i64 {
+bb0:
+  br bb1
+bb1:
+  ret const.i64 0
+}
+```
+
+#### MPS0009 — duplicate block label
+
+Bad:
+```mp
+fn @main() -> i64 {
+bb0:
+  br bb0
+bb0:
+  ret const.i64 0
+}
+```
+
+Fix:
+```mp
+fn @main() -> i64 {
+bb0:
+  br bb1
+bb1:
+  ret const.i64 0
+}
+```
+
+#### MPS0010 — structural/type invariant failure (verify stage)
+
+Bad pattern:
+```mp
+; usually emitted after malformed IR shape or invalid transformed CFG
+```
+
+Fix pattern:
+```mp
+; restore canonical block structure and valid types, then rebuild from source
+```
+
+#### MPS0011 — duplicate SSA local in lowering
+
+Bad:
+```mp
+%x: i64 = const.i64 1
+%x: i64 = const.i64 2
+```
+
+Fix:
+```mp
+%x: i64 = const.i64 1
+%y: i64 = const.i64 2
+```
+
+#### MPS0012 — call arity mismatch
+
+Bad:
+```mp
+%r: i64 = call @add { a=const.i64 1 }
+```
+
+Fix:
+```mp
+%r: i64 = call @add { a=const.i64 1, b=const.i64 2 }
+```
+
+#### MPS0013 — expected single arg value / value-shape mismatch
+
+Bad:
+```mp
+; passing list where scalar is required by an internal lowering site
+```
+
+Fix:
+```mp
+; pass exactly one scalar value where scalar is required
+```
+
+#### MPS0014 / MPS0015 / MPS0016 — fn-ref used where plain value required
+
+Bad:
+```mp
+%r: i64 = call @f { x=@g }
+```
+
+Fix:
+```mp
+%r: i64 = call @f { x=const.i64 1 }
+```
+
+#### MPS0017 — invalid branch predicate type
+
+Bad:
+```mp
+cbr const.i64 1 bb1 bb2
+```
+
+Fix:
+```mp
+%cond: bool = icmp.eq { lhs=const.i64 1, rhs=const.i64 1 }
+cbr %cond bb1 bb2
+```
+
+#### MPS0020 / MPS0021 / MPS0022 / MPS0023 — no-overload namespace duplicates
+
+Bad:
+```mp
+fn @dup() -> i64 { bb0: ret const.i64 0 }
+fn @dup() -> i64 { bb0: ret const.i64 1 }
+```
+
+Fix:
+```mp
+fn @dup0() -> i64 { bb0: ret const.i64 0 }
+fn @dup1() -> i64 { bb0: ret const.i64 1 }
+```
+
+#### MPS0024 — ptr.* outside unsafe context
+
+Bad:
+```mp
+%p: rawptr<i64> = ptr.null<i64>
+```
+
+Fix:
+```mp
+unsafe {
+  %p: rawptr<i64> = ptr.null<i64>
+}
+```
+
+#### MPS0025 — unsafe fn call outside unsafe context
+
+Bad:
+```mp
+%v: i64 = call @dangerous { }
+```
+
+Fix:
+```mp
+unsafe {
+  %v: i64 = call @dangerous { }
+}
+```
+
+### 20.3 HIR invariant codes (MPHIR*)
+
+#### MPHIR01 — getfield object must be borrow/mutborrow
+
+Bad:
+```mp
+%p: TPoint = new TPoint { x=const.i64 1, y=const.i64 2 }
+%x: i64 = getfield { obj=%p, field=x }
+```
+
+Fix:
+```mp
+%p: TPoint = new TPoint { x=const.i64 1, y=const.i64 2 }
+%pb: borrow TPoint = borrow.shared { v=%p }
+%x: i64 = getfield { obj=%pb, field=x }
+```
+
+#### MPHIR02 — setfield object must be mutborrow
+
+Bad:
+```mp
+%pb: borrow TPoint = borrow.shared { v=%p }
+setfield { obj=%pb, field=x, val=const.i64 3 }
+```
+
+Fix:
+```mp
+%pm: mutborrow TPoint = borrow.mut { v=%p }
+setfield { obj=%pm, field=x, val=const.i64 3 }
+```
+
+#### MPHIR03 — borrow escapes via return
+
+Bad:
+```mp
+fn @leak(%p: TPoint) -> borrow TPoint {
+bb0:
+  %pb: borrow TPoint = borrow.shared { v=%p }
+  ret %pb
+}
+```
+
+Fix:
+```mp
+fn @ok(%p: TPoint) -> i64 {
+bb0:
+  %pb: borrow TPoint = borrow.shared { v=%p }
+  %x: i64 = getfield { obj=%pb, field=x }
+  ret %x
+}
+```
+
+### 20.4 Type system codes (MPT*)
+
+#### MPT0001 — unknown primitive
+
+Bad:
+```mp
+%x: i99 = const.i64 0
+```
+
+Fix:
+```mp
+%x: i64 = const.i64 0
+```
+
+#### MPT0002 — `shared`/`weak` invalid on `TOption`
+
+Bad:
+```mp
+%x: shared TOption<i64> = const.TOption<i64> unit
+```
+
+Fix:
+```mp
+%x: TOption<i64> = enum.new<None> { }
+```
+
+#### MPT0003 — `shared`/`weak` invalid on `TResult`
+
+Bad:
+```mp
+%x: weak TResult<i64, i64> = enum.new<Ok> { v=const.i64 1 }
+```
+
+Fix:
+```mp
+%x: TResult<i64, i64> = enum.new<Ok> { v=const.i64 1 }
+```
+
+#### MPT1005 — value struct contains heap handle
+
+Bad:
+```mp
+value struct TBad {
+  field s: Str
+}
+```
+
+Fix:
+```mp
+heap struct TGood {
+  field s: Str
+}
+```
+
+#### MPT1020 — value enum deferred in v0.1
+
+Bad:
+```mp
+value enum TTag {
+  variant A { }
+}
+```
+
+Fix:
+```mp
+heap enum TTag {
+  variant A { }
+}
+```
+
+#### MPT1021 — aggregate type deferred in v0.1
+
+Bad pattern:
+```mp
+; uses deferred aggregate type forms not enabled for v0.1
+```
+
+Fix pattern:
+```mp
+; replace with supported builtins (Array/Map/struct) for v0.1
+```
+
+#### MPT1023 — missing required trait impl
+
+Bad:
+```mp
+heap struct TPoint { field x: i64 }
+; arr.sort over Array<TPoint> without ord impl
+```
+
+Fix:
+```mp
+sig TOrdPoint(borrow TPoint, borrow TPoint) -> i32
+fn @ord_point(%a: borrow TPoint, %b: borrow TPoint) -> i32 {
+bb0:
+  ret const.i32 0
+}
+impl ord for TPoint = @ord_point
+```
+
+#### MPT1030 — suspend.call on non-function target form in v0.1
+
+Bad:
+```mp
+; suspend.call through unsupported callable target in v0.1
+```
+
+Fix:
+```mp
+; call concrete function symbol directly or remove suspend.call pattern
+```
+
+#### MPT1200 — orphan impl
+
+Bad:
+```mp
+; impl hash for foreign type declared in another module, trait also foreign
+```
+
+Fix:
+```mp
+; either move impl to owning type module or define trait locally
+```
+
+#### MPT2001 — call arity mismatch
+
+Bad:
+```mp
+%r: i64 = call @sum2 { a=const.i64 1 }
+```
+
+Fix:
+```mp
+%r: i64 = call @sum2 { a=const.i64 1, b=const.i64 2 }
+```
+
+#### MPT2002 — call arg unknown type
+
+Bad:
+```mp
+%r: i64 = call @f { a=%missing }
+```
+
+Fix:
+```mp
+%a: i64 = const.i64 1
+%r: i64 = call @f { a=%a }
+```
+
+#### MPT2003 — call arg type mismatch
+
+Bad:
+```mp
+%r: i64 = call @takes_i64 { a=const.bool true }
+```
+
+Fix:
+```mp
+%r: i64 = call @takes_i64 { a=const.i64 1 }
+```
+
+#### MPT2004 — call target not found
+
+Bad:
+```mp
+%r: i64 = call @does_not_exist { }
+```
+
+Fix:
+```mp
+fn @does_exist() -> i64 { bb0: ret const.i64 0 }
+%r: i64 = call @does_exist { }
+```
+
+#### MPT2005 — invalid generic type argument
+
+Bad:
+```mp
+%r: i64 = call @id<TMissing> { x=const.i64 1 }
+```
+
+Fix:
+```mp
+%r: i64 = call @id<i64> { x=const.i64 1 }
+```
+
+#### MPT2006 — getfield object unknown type
+
+Bad:
+```mp
+%x: i64 = getfield { obj=%missing, field=x }
+```
+
+Fix:
+```mp
+%p: TPoint = new TPoint { x=const.i64 1, y=const.i64 2 }
+%pb: borrow TPoint = borrow.shared { v=%p }
+%x: i64 = getfield { obj=%pb, field=x }
+```
+
+#### MPT2007 — getfield requires borrow/mutborrow struct
+
+Bad:
+```mp
+%x: i64 = getfield { obj=const.i64 1, field=x }
+```
+
+Fix:
+```mp
+%pb: borrow TPoint = borrow.shared { v=%p }
+%x: i64 = getfield { obj=%pb, field=x }
+```
+
+#### MPT2008 — getfield target not a struct
+
+Bad:
+```mp
+%b: borrow Str = borrow.shared { v=const.Str "hi" }
+%x: i64 = getfield { obj=%b, field=x }
+```
+
+Fix:
+```mp
+; use struct type with actual field x
+```
+
+#### MPT2009 — missing struct field
+
+Bad:
+```mp
+%x: i64 = getfield { obj=%pb, field=z }
+```
+
+Fix:
+```mp
+%x: i64 = getfield { obj=%pb, field=x }
+```
+
+#### MPT2010 — cast operand unknown
+
+Bad:
+```mp
+%x: i64 = cast<i64, i32> { v=%missing }
+```
+
+Fix:
+```mp
+%a: i64 = const.i64 1
+%x: i32 = cast<i64, i32> { v=%a }
+```
+
+#### MPT2011 — cast only primitive->primitive
+
+Bad:
+```mp
+%x: i64 = cast<Str, i64> { v=%s }
+```
+
+Fix:
+```mp
+%x: i32 = cast<i64, i32> { v=const.i64 7 }
+```
+
+#### MPT2012 / MPT2013 / MPT2014 / MPT2015 — numeric family typing
+
+Bad:
+```mp
+%r: i64 = i.add { lhs=const.i64 1, rhs=const.bool true }
+```
+
+Fix:
+```mp
+%r: i64 = i.add { lhs=const.i64 1, rhs=const.i64 2 }
+```
+
+#### MPT2016 — duplicate field arg
+
+Bad:
+```mp
+%p: TPoint = new TPoint { x=const.i64 1, x=const.i64 2, y=const.i64 3 }
+```
+
+Fix:
+```mp
+%p: TPoint = new TPoint { x=const.i64 1, y=const.i64 3 }
+```
+
+#### MPT2017 — unknown field in constructor/variant args
+
+Bad:
+```mp
+%p: TPoint = new TPoint { x=const.i64 1, z=const.i64 3 }
+```
+
+Fix:
+```mp
+%p: TPoint = new TPoint { x=const.i64 1, y=const.i64 3 }
+```
+
+#### MPT2018 — field value unknown type
+
+Bad:
+```mp
+%p: TPoint = new TPoint { x=%missing, y=const.i64 3 }
+```
+
+Fix:
+```mp
+%x0: i64 = const.i64 1
+%p: TPoint = new TPoint { x=%x0, y=const.i64 3 }
+```
+
+#### MPT2019 — field type mismatch
+
+Bad:
+```mp
+%p: TPoint = new TPoint { x=const.bool true, y=const.i64 3 }
+```
+
+Fix:
+```mp
+%p: TPoint = new TPoint { x=const.i64 1, y=const.i64 3 }
+```
+
+#### MPT2020 — missing required field
+
+Bad:
+```mp
+%p: TPoint = new TPoint { x=const.i64 1 }
+```
+
+Fix:
+```mp
+%p: TPoint = new TPoint { x=const.i64 1, y=const.i64 2 }
+```
+
+#### MPT2021 — `new` target must be struct
+
+Bad:
+```mp
+%x: i64 = new i64 { }
+```
+
+Fix:
+```mp
+%p: TPoint = new TPoint { x=const.i64 1, y=const.i64 2 }
+```
+
+#### MPT2022 — unknown struct target
+
+Bad:
+```mp
+%p: TMissing = new TMissing { x=const.i64 1 }
+```
+
+Fix:
+```mp
+heap struct TPoint { field x: i64 field y: i64 }
+%p: TPoint = new TPoint { x=const.i64 1, y=const.i64 2 }
+```
+
+#### MPT2023 / MPT2024 — invalid variant for TOption/TResult
+
+Bad:
+```mp
+%x: TOption<i64> = enum.new<Bad> { }
+```
+
+Fix:
+```mp
+%x: TOption<i64> = enum.new<Some> { v=const.i64 1 }
+```
+
+Bad:
+```mp
+%r: TResult<i64, i64> = enum.new<Bad> { }
+```
+
+Fix:
+```mp
+%r: TResult<i64, i64> = enum.new<Ok> { v=const.i64 1 }
+```
+
+#### MPT2025 / MPT2026 / MPT2027 — enum.new target/variant mismatch
+
+Bad:
+```mp
+%p: TPoint = enum.new<Some> { v=const.i64 1 }
+```
+
+Fix:
+```mp
+%o: TOption<i64> = enum.new<Some> { v=const.i64 1 }
+```
+
+#### MPT2028 / MPT2029 / MPT2030 / MPT2031 — trait impl signature mismatch
+
+Bad:
+```mp
+fn @ord_point(%a: borrow TPoint) -> i64 { bb0: ret const.i64 0 }
+impl ord for TPoint = @ord_point
+```
+
+Fix:
+```mp
+fn @ord_point(%a: borrow TPoint, %b: borrow TPoint) -> i32 {
+bb0:
+  ret const.i32 0
+}
+impl ord for TPoint = @ord_point
+```
+
+#### MPT2032 — impl target function missing
+
+Bad:
+```mp
+impl hash for TPoint = @hash_point_missing
+```
+
+Fix:
+```mp
+fn @hash_point(%p: borrow TPoint) -> u64 {
+bb0:
+  ret const.u64 0
+}
+impl hash for TPoint = @hash_point
+```
+
+### 20.5 Ownership codes (MPO*)
+
+#### MPO0003 — borrow escapes scope
+
+Bad:
+```mp
+%pb: borrow TPoint = borrow.shared { v=%p }
+arr.push { arr=%arr, val=%pb }
+```
+
+Fix:
+```mp
+; store owned/shared values, not borrow handles
+arr.push { arr=%arr, val=%p }
+```
+
+#### MPO0004 — wrong ownership mode for mut/read op
+
+Bad:
+```mp
+%sb: shared Array<i64> = share { v=%arr }
+arr.push { arr=%sb, val=const.i64 1 }
+```
+
+Fix:
+```mp
+arr.push { arr=%arr, val=const.i64 1 }
+; or obtain mutborrow receiver when required
+```
+
+#### MPO0007 — use after move
+
+Bad:
+```mp
+%sp: shared TPoint = share { v=%p }
+%pb: borrow TPoint = borrow.shared { v=%p }
+```
+
+Fix:
+```mp
+%sp: shared TPoint = share { v=%p }
+%cp: shared TPoint = clone.shared { v=%sp }
+; avoid reusing moved %p
+```
+
+#### MPO0011 — move while borrowed
+
+Bad:
+```mp
+%pb: borrow TPoint = borrow.shared { v=%p }
+%sp: shared TPoint = share { v=%p }
+```
+
+Fix:
+```mp
+%pb: borrow TPoint = borrow.shared { v=%p }
+; finish borrow uses, then in later block move/share
+br bb1
+bb1:
+%sp: shared TPoint = share { v=%p }
+```
+
+#### MPO0101 — borrow crosses block boundary
+
+Bad:
+```mp
+bb0:
+  %pb: borrow TPoint = borrow.shared { v=%p }
+  br bb1
+bb1:
+  %x: i64 = getfield { obj=%pb, field=x }
+```
+
+Fix:
+```mp
+bb0:
+  br bb1
+bb1:
+  %pb: borrow TPoint = borrow.shared { v=%p }
+  %x: i64 = getfield { obj=%pb, field=x }
+```
+
+#### MPO0102 — borrow in phi
+
+Bad:
+```mp
+%pb: borrow TPoint = phi borrow TPoint { [bb1:%p1b], [bb2:%p2b] }
+```
+
+Fix:
+```mp
+%p: TPoint = phi TPoint { [bb1:%p1], [bb2:%p2] }
+%pb: borrow TPoint = borrow.shared { v=%p }
+```
+
+#### MPO0103 — map.get requires Dupable V
+
+Bad:
+```mp
+%v: TOption<TPoint> = map.get { map=%m_b, key=const.i64 1 }
+```
+
+Fix:
+```mp
+%vref: borrow TPoint = map.get_ref { map=%m_b, key=const.i64 1 }
+; or change map value type to Dupable
+```
+
+#### MPO0201 — spawn/send capture rule violation
+
+Bad:
+```mp
+; spawn-like callable captures non-send borrow/mutborrow values
+```
+
+Fix:
+```mp
+; ensure callable captures only send-safe owned/shared data
+; remove borrow captures before spawn boundary
+```
+
+### 20.6 FFI code
+
+#### MPF0001 — extern rawptr return missing ownership attr
+
+Bad:
+```mp
+extern "c" module ffi {
+  fn @open() -> rawptr<i64>
+}
+```
+
+Fix:
+```mp
+extern "c" module ffi {
+  fn @open() -> rawptr<i64> attrs { returns="owned" }
+}
+```
+
+### 20.7 Link / emit / budget / lint codes (MPL*, MPLINK*)
+
+#### MPL0001 — unknown emit kind
+
+Bad:
+```bash
+magpie build --entry src/main.mp --emit foo
+```
+
+Fix:
+```bash
+magpie build --entry src/main.mp --emit exe,llvm-ir,mpir
+```
+
+#### MPL0002 — requested artifact missing
+
+Bad:
+```bash
+magpie build --entry src/main.mp --emit exe,shared-lib
+# build reports success path issue but one requested artifact absent
+```
+
+Fix:
+```bash
+magpie build --entry src/main.mp --emit exe --output json
+# resolve upstream codegen/link errors until requested artifact exists
+```
+
+#### MPL0801 — LLM budget too small
+
+Bad:
+```bash
+magpie build --entry src/main.mp --llm --llm-token-budget 100
+```
+
+Fix:
+```bash
+magpie build --entry src/main.mp --llm --llm-token-budget 12000
+# or use --llm-budget-policy minimal
+```
+
+#### MPL0802 — tokenizer fallback
+
+Bad:
+```bash
+magpie build --entry src/main.mp --llm --llm-tokenizer custom:missing
+```
+
+Fix:
+```bash
+magpie build --entry src/main.mp --llm --llm-tokenizer approx:utf8_4chars
+```
+
+#### MPL2001 / MPL2002 / MPL2003 / MPL2005 / MPL2007 / MPL2020 / MPL2021
+
+Bad patterns:
+```mp
+; oversized functions, dead code, unnecessary borrows, empty blocks,
+; generic explosion, mixed generics-mode usage
+```
+
+Fix patterns:
+```mp
+; split large functions, remove dead/empty code, simplify borrows,
+; constrain generic instantiations, use one generics mode consistently
+```
+
+#### MPLINK01 — primary link path failed
+
+Bad:
+```bash
+magpie build --entry src/main.mp --emit exe
+# native link toolchain missing/misconfigured
+```
+
+Fix:
+```bash
+# install/repair linker toolchain for target triple, then rebuild
+magpie build --entry src/main.mp --emit exe
+```
+
+#### MPLINK02 — fallback link also unavailable
+
+Bad:
+```bash
+magpie build --entry src/main.mp --emit exe
+```
+
+Fix:
+```bash
+# ensure clang/llc/system linker availability for target
+# until fixed, use --emit llvm-ir,mpir for non-native debugging
+magpie build --entry src/main.mp --emit llvm-ir,mpir
+```
+
+### 20.8 MPIR pipeline code
+
+#### MPM0001 — MPIR lowering produced no modules
+
+Bad pattern:
+```bash
+magpie build --entry src/main.mp --emit mpir
+# lowering receives empty resolved module set
+```
+
+Fix pattern:
+```bash
+# verify entry file parses/resolves and exports expected module/function symbols
+magpie build --entry src/main.mp --emit mpir --output json
+```
+
+### 20.9 Family fallback for codes not listed above
+
+When `magpie explain <CODE>` returns family-level guidance only:
+
+- `MPO*`: ownership lifetime/move/borrow violation. Reduce borrow scope, avoid borrow escapes, and use clones intentionally.
+- `MPT*`: type/trait contract violation. Align types exactly and satisfy required trait impls.
+- `MPS*`: SSA/CFG/resolve invariant violation. Ensure defs dominate uses and control-flow targets are valid.
+- `MPL*`: lint/policy/artifact constraints. Adjust command flags, code structure, or output budget.
+
+If unsure, create a tiny reproducer with one function and one failing op, then iterate.
+
+### 20.10 Individual-code expansions for grouped ranges
+
+#### MPS0000 — generic module resolution failure
+
+Bad:
+```mp
+; unresolved/invalid module/import graph with no narrower code selected
+```
+
+Fix:
+```mp
+; ensure module headers are valid and all imports resolve uniquely
+```
+
+#### MPS0004 — import/local namespace conflict
+
+Bad:
+```mp
+imports { util.math::{@sum} }
+fn @sum() -> i64 { bb0: ret const.i64 0 }
+```
+
+Fix:
+```mp
+imports { util.math::{@sum_util} }
+fn @sum() -> i64 { bb0: ret const.i64 0 }
+```
+
+#### MPS0005 — type import/local type conflict
+
+Bad:
+```mp
+imports { util.types::{TPoint} }
+heap struct TPoint { field x: i64 field y: i64 }
+```
+
+Fix:
+```mp
+imports { util.types::{TPointExt} }
+heap struct TPoint { field x: i64 field y: i64 }
+```
+
+#### MPS0006 — ambiguous import name
+
+Bad:
+```mp
+imports { a.mod::{@foo}, b.mod::{@foo} }
+```
+
+Fix:
+```mp
+imports { a.mod::{@foo_a}, b.mod::{@foo_b} }
+```
+
+#### MPS0014 — invalid function reference in scalar-value position
+
+Bad:
+```mp
+; scalar-only site receives fn ref
+%r: i64 = call @f { x=@g }
+```
+
+Fix:
+```mp
+%r: i64 = call @f { x=const.i64 1 }
+```
+
+#### MPS0015 — invalid function reference inside list lowered as plain values
+
+Bad:
+```mp
+%r: i64 = call @f { xs=[@g] }
+```
+
+Fix:
+```mp
+%r: i64 = call @f { xs=[const.i64 1] }
+```
+
+#### MPS0016 — invalid plain-value argument uses fn ref
+
+Bad:
+```mp
+%r: i64 = call @f { x=@g }
+```
+
+Fix:
+```mp
+%r: i64 = call @f { x=const.i64 7 }
+```
+
+#### MPS0020 — duplicate function/global symbol
+
+Bad:
+```mp
+global @x: i64 = const.i64 1
+fn @x() -> i64 { bb0: ret const.i64 0 }
+```
+
+Fix:
+```mp
+global @x_global: i64 = const.i64 1
+fn @x() -> i64 { bb0: ret const.i64 0 }
+```
+
+#### MPS0021 — duplicate type symbol in module
+
+Bad:
+```mp
+heap struct TPoint { field x: i64 field y: i64 }
+heap struct TPoint { field x: i64 field y: i64 }
+```
+
+Fix:
+```mp
+heap struct TPoint { field x: i64 field y: i64 }
+heap struct TPoint2 { field x: i64 field y: i64 }
+```
+
+#### MPS0022 — duplicate @ namespace symbol
+
+Bad:
+```mp
+fn @main() -> i64 { bb0: ret const.i64 0 }
+global @main: i64 = const.i64 1
+```
+
+Fix:
+```mp
+fn @main() -> i64 { bb0: ret const.i64 0 }
+global @main_value: i64 = const.i64 1
+```
+
+#### MPS0023 — duplicate `sig` symbol
+
+Bad:
+```mp
+sig TOrdPoint(borrow TPoint, borrow TPoint) -> i32
+sig TOrdPoint(borrow TPoint, borrow TPoint) -> i32
+```
+
+Fix:
+```mp
+sig TOrdPoint(borrow TPoint, borrow TPoint) -> i32
+sig THashPoint(borrow TPoint) -> u64
+```
+
+#### MPT2012 — numeric lhs unknown
+
+Bad:
+```mp
+%r: i64 = i.add { lhs=%missing, rhs=const.i64 1 }
+```
+
+Fix:
+```mp
+%a: i64 = const.i64 10
+%r: i64 = i.add { lhs=%a, rhs=const.i64 1 }
+```
+
+#### MPT2013 — numeric rhs unknown
+
+Bad:
+```mp
+%r: i64 = i.add { lhs=const.i64 1, rhs=%missing }
+```
+
+Fix:
+```mp
+%b: i64 = const.i64 2
+%r: i64 = i.add { lhs=const.i64 1, rhs=%b }
+```
+
+#### MPT2014 — numeric operands have mismatched types
+
+Bad:
+```mp
+%r: i64 = i.add { lhs=const.i64 1, rhs=const.i32 2 }
+```
+
+Fix:
+```mp
+%r: i64 = i.add { lhs=const.i64 1, rhs=const.i64 2 }
+```
+
+#### MPT2015 — wrong primitive family for numeric op
+
+Bad:
+```mp
+%r: i64 = i.add { lhs=const.bool true, rhs=const.bool false }
+```
+
+Fix:
+```mp
+%r: i64 = i.add { lhs=const.i64 1, rhs=const.i64 2 }
+```
+
+#### MPT2023 — invalid variant for TOption
+
+Bad:
+```mp
+%o: TOption<i64> = enum.new<Ok> { v=const.i64 1 }
+```
+
+Fix:
+```mp
+%o: TOption<i64> = enum.new<Some> { v=const.i64 1 }
+```
+
+#### MPT2024 — invalid variant for TResult
+
+Bad:
+```mp
+%r: TResult<i64, i64> = enum.new<Some> { v=const.i64 1 }
+```
+
+Fix:
+```mp
+%r: TResult<i64, i64> = enum.new<Ok> { v=const.i64 1 }
+```
+
+#### MPT2025 — enum.new result type is not enum metadata target
+
+Bad:
+```mp
+%p: TPoint = enum.new<Any> { }
+```
+
+Fix:
+```mp
+%e: TMyEnum = enum.new<MyVariant> { }
+```
+
+#### MPT2026 — user enum variant not found
+
+Bad:
+```mp
+%e: TMyEnum = enum.new<MissingVariant> { }
+```
+
+Fix:
+```mp
+%e: TMyEnum = enum.new<ExistingVariant> { }
+```
+
+#### MPT2027 — enum.new target type must be enum
+
+Bad:
+```mp
+%x: i64 = enum.new<Any> { }
+```
+
+Fix:
+```mp
+%e: TMyEnum = enum.new<ExistingVariant> { }
+```
+
+#### MPT2028 — trait impl parameter count mismatch
+
+Bad:
+```mp
+fn @hash_point(%a: borrow TPoint, %b: borrow TPoint) -> u64 { bb0: ret const.u64 0 }
+impl hash for TPoint = @hash_point
+```
+
+Fix:
+```mp
+fn @hash_point(%a: borrow TPoint) -> u64 { bb0: ret const.u64 0 }
+impl hash for TPoint = @hash_point
+```
+
+#### MPT2029 — trait impl return type mismatch
+
+Bad:
+```mp
+fn @eq_point(%a: borrow TPoint, %b: borrow TPoint) -> i64 { bb0: ret const.i64 1 }
+impl eq for TPoint = @eq_point
+```
+
+Fix:
+```mp
+fn @eq_point(%a: borrow TPoint, %b: borrow TPoint) -> bool { bb0: ret const.bool true }
+impl eq for TPoint = @eq_point
+```
+
+#### MPT2030 — trait impl first parameter must be borrow target type
+
+Bad:
+```mp
+fn @ord_point(%a: TPoint, %b: borrow TPoint) -> i32 { bb0: ret const.i32 0 }
+impl ord for TPoint = @ord_point
+```
+
+Fix:
+```mp
+fn @ord_point(%a: borrow TPoint, %b: borrow TPoint) -> i32 { bb0: ret const.i32 0 }
+impl ord for TPoint = @ord_point
+```
+
+#### MPT2031 — trait impl parameters must both match borrow target
+
+Bad:
+```mp
+fn @eq_point(%a: borrow TPoint, %b: borrow TOther) -> bool { bb0: ret const.bool true }
+impl eq for TPoint = @eq_point
+```
+
+Fix:
+```mp
+fn @eq_point(%a: borrow TPoint, %b: borrow TPoint) -> bool { bb0: ret const.bool true }
+impl eq for TPoint = @eq_point
+```
+
+#### MPL2001 — lint/code-quality violation (see diagnostic message)
+
+Bad:
+```mp
+; compiler-reported lint pattern (e.g., oversized or problematic function body)
+```
+
+Fix:
+```mp
+; refactor into smaller helpers as suggested by diagnostic text
+```
+
+#### MPL2002 — lint/code-quality violation (unused/dead symbol class)
+
+Bad:
+```mp
+fn @unused() -> i64 { bb0: ret const.i64 0 }
+```
+
+Fix:
+```mp
+; remove unused symbol or reference/export it intentionally
+```
+
+#### MPL2003 — lint/code-quality violation (unnecessary borrow class)
+
+Bad:
+```mp
+%pb: borrow TPoint = borrow.shared { v=%p }
+; immediate pass-through where owned/shared would suffice
+```
+
+Fix:
+```mp
+; pass %p directly when borrow semantics are unnecessary
+```
+
+#### MPL2005 — lint/code-quality violation (empty block class)
+
+Bad:
+```mp
+bb1:
+  unreachable
+; structurally pointless empty flow region around it
+```
+
+Fix:
+```mp
+; remove dead/empty block and simplify control flow
+```
+
+#### MPL2007 — lint/code-quality violation (unreachable code class)
+
+Bad:
+```mp
+bb0:
+  ret const.i64 0
+  %x: i64 = const.i64 1
+```
+
+Fix:
+```mp
+bb0:
+  %x: i64 = const.i64 1
+  ret %x
+```
+
+#### MPL2020 — monomorphization pressure too high
+
+Bad:
+```mp
+; huge generic instantiation fan-out across many type arguments
+```
+
+Fix:
+```mp
+; reduce generic permutations or switch to shared generics mode
+```
+
+#### MPL2021 — mixed generics mode conflict
+
+Bad:
+```bash
+# build/config mixes incompatible generics strategies in one target/profile
+```
+
+Fix:
+```bash
+# pick one generics strategy consistently for this build profile
+```
