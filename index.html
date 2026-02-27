@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Magpie | The LLM-First Systems Language</title>
+    <meta name="description" content="The world's first programming language built for LLMs and AI Agents.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <!-- Background Elements -->
+    <div class="glow-bg top-glow"></div>
+    <div class="glow-bg bottom-glow"></div>
+
+    <header class="navbar">
+        <div class="container nav-container">
+            <a href="#" class="brand">
+                <span class="logo-emoji">🐦</span>
+                <span class="brand-name">Magpie</span>
+            </a>
+            <nav class="nav-links">
+                <a href="#features">Features</a>
+                <a href="#syntax">Syntax</a>
+                <a href="https://github.com/magpie-lang/magpie/" target="_blank" rel="noopener noreferrer">GitHub</a>
+                <button class="btn btn-primary nav-btn">Get Started</button>
+            </nav>
+        </div>
+    </header>
+
+    <main>
+        <section class="hero">
+            <div class="container hero-container">
+                <div class="hero-content">
+                    <div class="badge">v0.1 Available Now</div>
+                    <h1 class="hero-title">
+                        The world's first programming language built for <span class="text-gradient">LLMs and AI
+                            Agents</span>
+                    </h1>
+                    <p class="hero-subtitle">
+                        Magpie is an experimental, deterministic language with explicit ownership, ARC-managed
+                        lifetimes, and canonical formatting designed exclusively to be written and read by AI.
+                    </p>
+                    <div class="hero-actions">
+                        <a href="https://github.com/magpie-lang/magpie/blob/main/DOCUMENTATION.md" target="_blank"
+                            rel="noopener noreferrer" class="btn btn-primary btn-lg">Read the Docs</a>
+                        <button class="btn btn-secondary btn-lg">
+                            <span class="icon">💻</span> magpie new demo
+                        </button>
+                    </div>
+                </div>
+
+                <div class="hero-visual">
+                    <div class="code-window">
+                        <div class="window-header">
+                            <div class="window-controls">
+                                <span></span><span></span><span></span>
+                            </div>
+                            <div class="window-title">magpie build --emit mpir</div>
+                        </div>
+                        <div class="window-body">
+                            <pre><code class="language-mp">module demo.main
+exports { @main }
+imports { }
+digest "8a5f3...91b"
+
+fn @main() -> i64 {
+bb0:
+  %res: i64 = call @compute {}
+  ret %res
+}</code></pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="features" class="features">
+            <div class="container">
+                <div class="section-header">
+                    <h2>Engineered for Attention</h2>
+                    <p>Every language feature optimizes for Transformer context windows, attention span, and
+                        deterministic generation.</p>
+                </div>
+
+                <div class="features-grid">
+                    <!-- Feature 1 -->
+                    <div class="feature-card">
+                        <div class="feature-icon">📊</div>
+                        <h3>Token Budgets</h3>
+                        <p>The compiler enforces hard limits on diagnostic and graph outputs, ensuring your agent's
+                            context window is never unexpectedly flooded.</p>
+                    </div>
+
+                    <!-- Feature 2 -->
+                    <div class="feature-card">
+                        <div class="feature-icon">✨</div>
+                        <h3>CSNF Formatting</h3>
+                        <p>Canonical Source Normal Form (CSNF) rewrites code to a deterministic, singular token layout,
+                            eliminating format drift over edits.</p>
+                    </div>
+
+                    <!-- Feature 3 -->
+                    <div class="feature-card">
+                        <div class="feature-icon">🛡️</div>
+                        <h3>ARC + Ownership</h3>
+                        <p>Predictable ARC-managed heap lifetimes combined with Rust-like borrowing constraints
+                            guarantee memory safety without GC pauses.</p>
+                    </div>
+
+                    <!-- Feature 4 -->
+                    <div class="feature-card">
+                        <div class="feature-icon">🧩</div>
+                        <h3>Explicit SSA Syntax</h3>
+                        <p>No hidden control flow, no operator overloading, and explicit basic blocks mean agents never
+                            have to guess what your code actually does.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="syntax" class="syntax-showcase">
+            <div class="container">
+                <div class="section-header">
+                    <h2>No Surprises. Just Explicit Semantics.</h2>
+                    <p>Magpie's surface syntax is heavily inspired by LLVM IR, minimizing ambiguity for AI code
+                        generators.</p>
+                </div>
+
+                <div class="code-compare">
+                    <div class="code-window pane">
+                        <div class="window-header">
+                            <div class="window-title">Surface Magpie (.mp)</div>
+                        </div>
+                        <div class="window-body">
+                            <pre><code>fn @calculate_score(%base: i32, %bonus: i32) -> i32 {
+bb0:
+  %total: i32 = i.add { lhs=%base, rhs=%bonus }
+  %is_high: bool = icmp.sgt { lhs=%total, rhs=const.i32 100 }
+  cbr %is_high bbHigh bbLow
+
+bbHigh:
+  %capped: i32 = const.i32 100
+  ret %capped
+
+bbLow:
+  ret %total
+}</code></pre>
+                        </div>
+                    </div>
+
+                    <div class="code-window pane pane-alt">
+                        <div class="window-header">
+                            <div class="window-title">Magpie IR (.mpir)</div>
+                        </div>
+                        <div class="window-body">
+                            <pre><code>define i32 @calculate_score(i32 %base, i32 %bonus) {
+bb0:
+  %total = add i32 %base, %bonus
+  %is_high = icmp sgt i32 %total, 100
+  br i1 %is_high, label %bbHigh, label %bbLow
+
+bbHigh:
+  ret i32 100
+
+bbLow:
+  ret i32 %total
+}</code></pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="cta">
+            <div class="container cta-container">
+                <h2>Ready to build for the future?</h2>
+                <p>Download the compiler, read the spec, and start creating deterministic programs today.</p>
+                <div class="cta-actions">
+                    <button class="btn btn-primary btn-lg">Install Magpie v0.1</button>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <div class="container footer-container">
+            <div class="footer-brand">
+                <div class="logo">
+                    <span class="logo-emoji">🐦</span>
+                    <span class="brand-name">Magpie</span>
+                </div>
+                <p>The LLM-first systems programming language.</p>
+            </div>
+
+            <div class="footer-links">
+                <div class="link-group">
+                    <h4>Resources</h4>
+                    <a href="#">Documentation</a>
+                    <a href="#">Specification</a>
+                    <a href="#">Quick Start</a>
+                </div>
+                <div class="link-group">
+                    <h4>Community</h4>
+                    <a href="https://github.com/magpie-lang/magpie/" target="_blank"
+                        rel="noopener noreferrer">GitHub</a>
+                    <a href="#">Twitter</a>
+                </div>
+            </div>
+        </div>
+        <div class="container footer-bottom">
+            <p>&copy; 2026 Magpie Language Project. Open Source.</p>
+        </div>
+    </footer>
+</body>
+
+</html>
