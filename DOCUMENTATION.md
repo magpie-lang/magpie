@@ -2,14 +2,14 @@
 
 > This document is a comprehensive, implementation-oriented reference for Magpie v0.1.
 > It consolidates language grammar/syntax, core semantics, compiler architecture, CLI arguments,
-> and the LLM-first design rationale (including external evidence).
+> and the LLM-first design rationale.
 
 ---
 
 ## Table of Contents
 
 1. [Design Goals and Core Decisions](#1-design-goals-and-core-decisions)
-2. [LLM-First Rationale with External Evidence](#2-llm-first-rationale-with-external-evidence)
+2. [LLM-First Rationale](#2-llm-first-rationale)
 3. [Language Overview](#3-language-overview)
 4. [Lexical Grammar](#4-lexical-grammar)
 5. [File Grammar and Canonical Structure](#5-file-grammar-and-canonical-structure)
@@ -28,7 +28,6 @@
 18. [Configuration Resolution Order](#18-configuration-resolution-order)
 19. [Build/Test/Run Playbooks](#19-buildtestrun-playbooks)
 20. [Examples](#20-examples)
-21. [Academic and Technical References](#21-academic-and-technical-references)
 
 ---
 
@@ -37,41 +36,40 @@
 Magpie v0.1 is designed around a few non-negotiable engineering constraints:
 
 1. **Deterministic, explicit surface language**
-   - Minimal hidden behavior.
-   - Explicit control-flow and explicit ownership-related operations.
-   - Canonical formatting (CSNF) for stable text representation.
+  - Minimal hidden behavior.
+  - Explicit control-flow and explicit ownership-related operations.
+  - Canonical formatting (CSNF) for stable text representation.
 
 2. **LLM-agent compatibility**
-   - Structured, low-ambiguity syntax for deterministic generation and repair loops.
-   - Progressive disclosure and compact machine artifacts.
-   - Token-budget-aware output behavior.
+  - Structured, low-ambiguity syntax for deterministic generation and repair loops.
+  - Progressive disclosure and compact machine artifacts.
+  - Token-budget-aware output behavior.
 
 3. **Static safety + predictable runtime**
-   - Rust-like ownership/borrowing constraints for aliasing/mutation safety.
-   - ARC-managed heap lifetimes for deterministic reclamation (no tracing GC pause model).
+  - Rust-like ownership/borrowing constraints for aliasing/mutation safety.
+  - ARC-managed heap lifetimes for deterministic reclamation (no tracing GC pause model).
 
 4. **Pipeline observability**
-   - Explicit staged compiler pipeline.
-   - Rich diagnostics, graph artifacts, and JSON envelopes for tool/agent integration.
+  - Explicit staged compiler pipeline.
+  - Rich diagnostics, graph artifacts, and JSON envelopes for tool/agent integration.
 
 5. **Separation of concerns**
-   - Parse/resolve/type/HIR/ownership/MPIR/codegen/link are distinct phases with explicit failure surfaces.
+  - Parse/resolve/type/HIR/ownership/MPIR/codegen/link are distinct phases with explicit failure surfaces.
 
 ---
 
-## 2) LLM-First Rationale with External Evidence
+## 2) LLM-First Rationale
 
-The LLM optimization rationale is most explicit in `SPEC.md §2` (plus related canonicalization/tokenization notes).
-This section maps key claims to external technical evidence.
+This section summarizes the core LLM-first engineering rationale as applied in Magpie tooling and language design.
 
 ### 2.1 Finite context windows and bounded token budgets
 
 **Claim (paraphrase):** Transformer-based systems operate under bounded context and practical token budgets.
 
 **Evidence:**
-- Original Transformer self-attention scaling with sequence length ([1]).
-- Efficient Transformer survey on scaling constraints ([2]).
-- LongBench: practical long-context degradation and retrieval/compression usefulness ([3]).
+- Original Transformer self-attention scaling with sequence length.
+- Efficient Transformer survey on scaling constraints.
+- LongBench: practical long-context degradation and retrieval/compression usefulness.
 
 **Magpie design implications:**
 - Budgeted machine-readable outputs.
@@ -83,7 +81,7 @@ This section maps key claims to external technical evidence.
 **Claim:** Long sequences reduce reliable focus on relevant middle-span details.
 
 **Evidence:**
-- “Lost in the Middle” shows severe position effects for relevant information in long contexts ([4]).
+- “Lost in the Middle” shows severe position effects for relevant information in long contexts.
 
 **Magpie implications:**
 - Locality constraints, explicit dependencies, compact structured summaries.
@@ -94,8 +92,8 @@ This section maps key claims to external technical evidence.
 **Claim:** Tokenization and boundary behavior can destabilize model output.
 
 **Evidence:**
-- Tokenization robustness degradation results ([5]).
-- Partial token boundary issues, including code domains ([6]).
+- Tokenization robustness degradation results.
+- Partial token boundary issues, including code domains.
 
 **Magpie implications:**
 - Canonical `key=value` forms.
@@ -107,8 +105,8 @@ This section maps key claims to external technical evidence.
 **Claim:** Less ambiguous, more regular grammars are easier for model generation and correction.
 
 **Evidence:**
-- Constrained decoding reduces syntax errors in code generation settings ([7]).
-- Grammar-constrained decoding improves syntactic correctness in structured outputs ([8]).
+- Constrained decoding reduces syntax errors in code generation settings.
+- Grammar-constrained decoding improves syntactic correctness in structured outputs.
 
 **Magpie implications:**
 - Explicit opcodes, explicit call forms, no operator overloading/method-syntax ambiguity.
@@ -118,9 +116,9 @@ This section maps key claims to external technical evidence.
 **Claim:** Format drift can alter model behavior and inflate token usage.
 
 **Evidence:**
-- Prompt formatting sensitivity and output variance ([9], [10]).
-- Measured token savings from formatting minimization in code contexts ([11]).
-- Deterministic canonicalization standards and tooling analogues ([12], [13]).
+- Prompt formatting sensitivity and output variance (, ).
+- Measured token savings from formatting minimization in code contexts.
+- Deterministic canonicalization standards and tooling analogues (, ).
 
 **Magpie implications:**
 - CSNF canonical source normalization.
@@ -131,7 +129,7 @@ This section maps key claims to external technical evidence.
 **Claim:** Stable identifiers enable compact references and incremental retrieval.
 
 **Evidence:**
-- Content-addressed object identity in Git ([15]).
+- Content-addressed object identity in Git.
 
 **Magpie implications:**
 - Stable symbol-oriented references and graph artifacts.
@@ -142,8 +140,8 @@ This section maps key claims to external technical evidence.
 **Claim:** Retrieval of relevant context is more effective than monolithic prompt stuffing.
 
 **Evidence:**
-- RAG ([16]), RETRO ([17]), in-context retrieval augmentation ([18]).
-- LongBench’s retrieval/compression observations ([3]).
+- RAG , RETRO , in-context retrieval augmentation.
+- LongBench’s retrieval/compression observations.
 
 **Magpie implications:**
 - Progressive disclosure artifacts and memory index workflows.
@@ -157,10 +155,10 @@ Magpie source files are module-centric and SSA-oriented.
 ### 3.1 Core shape
 
 - Header with strict order:
-  1. `module ...`
-  2. `exports { ... }`
-  3. `imports { ... }`
-  4. `digest "..."`
+ 1. `module...`
+ 2. `exports {... }`
+ 3. `imports {... }`
+ 4. `digest "..."`
 - Declarations (`fn`, `struct`, `enum`, `extern`, `impl`, `sig`, `global`, etc.)
 - Function bodies are basic-block based (`bbN:` labels)
 - Each block ends with one terminator (`ret`, `br`, `cbr`, `switch`, `unreachable`)
@@ -179,8 +177,8 @@ Magpie source files are module-centric and SSA-oriented.
 
 ### 4.1 Comments
 
-- Line comment: `; ...`
-- Doc comment token: `;;; ...`
+- Line comment: `;...`
+- Doc comment token: `;;;...`
 
 ### 4.2 Token classes
 
@@ -188,7 +186,7 @@ Magpie source files are module-centric and SSA-oriented.
 - Function names: `@fn_name`
 - SSA names: `%local`
 - Type names: `TType`
-- Block labels: `bb0`, `bb1`, ...
+- Block labels: `bb0`, `bb1`,...
 
 ### 4.3 Literals
 
@@ -200,7 +198,7 @@ Magpie source files are module-centric and SSA-oriented.
 
 ### 4.4 Punctuation
 
-`{ } ( ) < > [ ] = : , . ->`
+`{ } ( ) < > [ ] = : ,. ->`
 
 ---
 
@@ -209,18 +207,18 @@ Magpie source files are module-centric and SSA-oriented.
 ## 5.1 Header grammar
 
 ```ebnf
-file      := header decl*
-header    := "module" module_path
-             "exports" export_block
-             "imports" import_block
-             "digest" string_lit
+file   := header decl*
+header  := "module" module_path
+       "exports" export_block
+       "imports" import_block
+       "digest" string_lit
 ```
 
 ### Exports
 
 ```ebnf
 export_block := "{" (export_item ("," export_item)*)? "}"
-export_item  := fn_name | type_name
+export_item := fn_name | type_name
 ```
 
 ### Imports
@@ -228,7 +226,7 @@ export_item  := fn_name | type_name
 ```ebnf
 import_block := "{" (import_group ("," import_group)*)? "}"
 import_group := module_path "::" "{" (import_item ("," import_item)*)? "}"
-import_item  := fn_name | type_name
+import_item := fn_name | type_name
 ```
 
 ## 5.2 Canonical source normal form (CSNF)
@@ -244,33 +242,33 @@ import_item  := fn_name | type_name
 
 ## 6.1 Function declarations
 
-- `fn @name(...) -> Type { ... }`
-- `async fn @name(...) -> Type { ... }`
-- `unsafe fn @name(...) -> Type { ... }`
-- `gpu fn @name(...) -> Type target(<ident>) { ... }`
+- `fn @name(...) -> Type {... }`
+- `async fn @name(...) -> Type {... }`
+- `unsafe fn @name(...) -> Type {... }`
+- `gpu fn @name(...) -> Type target(<ident>) {... }`
 
 Optional metadata block:
 
 ```mp
 meta {
-  uses { ... }
-  effects { ... }
-  cost { key=123, ... }
+ uses {... }
+ effects {... }
+ cost { key=123,... }
 }
 ```
 
 ## 6.2 Type declarations
 
-- `heap struct TName { field ... }`
-- `value struct TName { field ... }`
-- `heap enum TName { variant ... }`
-- `value enum TName { variant ... }`
+- `heap struct TName { field... }`
+- `value struct TName { field... }`
+- `heap enum TName { variant... }`
+- `value enum TName { variant... }`
 
 ## 6.3 Extern module
 
 ```mp
 extern "c" module ffi {
-  fn @name(%x: i64) -> i64 attrs { link_name="...", returns="owned" }
+ fn @name(%x: i64) -> i64 attrs { link_name="...", returns="owned" }
 }
 ```
 
@@ -333,8 +331,8 @@ Prefix modifiers:
 
 Each basic block contains:
 
-1. **SSA assignments** (`%dst: Ty = value_op ...`)
-2. **Void ops** (`setfield ...`, `arr.push ...`, etc.)
+1. **SSA assignments** (`%dst: Ty = value_op...`)
+2. **Void ops** (`setfield...`, `arr.push...`, etc.)
 3. **Terminator** (required)
 
 ### 8.1 Terminators
@@ -342,7 +340,7 @@ Each basic block contains:
 - `ret [value]?`
 - `br bbN`
 - `cbr cond bbThen bbElse`
-- `switch value { case lit -> bbN ... } else bbDefault`
+- `switch value { case lit -> bbN... } else bbDefault`
 - `unreachable`
 
 ---
@@ -376,19 +374,19 @@ All use:
 - Float: `fcmp.oeq/one/olt/ogt/ole/oge`
 
 ### Call and control transfer values
-- `call @fn ...`
-- `call.indirect <callable> ...`
-- `try @fn ...`
-- `suspend.call @fn ...`
+- `call @fn...`
+- `call.indirect <callable>...`
+- `try @fn...`
+- `suspend.call @fn...`
 - `suspend.await { fut=... }`
 
 ### Heap/object/SSA
-- `new Type { field=v, ... }`
+- `new Type { field=v,... }`
 - `getfield { obj=..., field=name }`
-- `phi Type { [bb1:v1], [bb2:v2], ... }`
+- `phi Type { [bb1:v1], [bb2:v2],... }`
 
 ### Enum
-- `enum.new<Variant> { ... }`
+- `enum.new<Variant> {... }`
 - `enum.tag { v=... }`
 - `enum.payload<Variant> { v=... }`
 - `enum.is<Variant> { v=... }`
@@ -402,7 +400,7 @@ All use:
 - `ptr.null<T>`, `ptr.addr<T>`, `ptr.from_addr<T>`, `ptr.add<T>`, `ptr.load<T>`
 
 ### Callable
-- `callable.capture @fn { capture=value, ... }`
+- `callable.capture @fn { capture=value,... }`
 
 ### Arrays
 - `arr.new<T>`, `arr.len`, `arr.get`, `arr.pop`, `arr.slice`, `arr.contains`, `arr.map`, `arr.filter`, `arr.reduce`
@@ -493,8 +491,8 @@ without hidden captures or opaque syntax.
 
 Creation and invocation are explicit:
 
-- create: `callable.capture @fn { capture1=%v1, ... }`
-- invoke: `call.indirect %callable { ... }` or `call_void.indirect`
+- create: `callable.capture @fn { capture1=%v1,... }`
+- invoke: `call.indirect %callable {... }` or `call_void.indirect`
 
 ## 11.2 Why not closure syntax
 
@@ -510,15 +508,15 @@ Magpie intentionally avoids closure syntax because closure primitives often impl
 ## 11.3 LLM and tooling benefits
 
 1. **Visible dependencies**
-   - Capture list is explicit in one line.
+  - Capture list is explicit in one line.
 2. **Regular generation pattern**
-   - `sig` + `callable.capture` + `call.indirect` are low-ambiguity templates.
+  - `sig` + `callable.capture` + `call.indirect` are low-ambiguity templates.
 3. **Deterministic ownership repair**
-   - capture is a move boundary; clone/share fixes are mechanical.
+  - capture is a move boundary; clone/share fixes are mechanical.
 4. **Storage-friendly behavior objects**
-   - Router/middleware patterns can store callables in typed fields and arrays.
+  - Router/middleware patterns can store callables in typed fields and arrays.
 5. **Async boundary clarity**
-   - v0.1 forbids problematic `suspend.call` callable-indirection patterns, reducing opaque failures.
+  - v0.1 forbids problematic `suspend.call` callable-indirection patterns, reducing opaque failures.
 
 ## 11.4 Minimal example: capture + call.indirect
 
@@ -532,21 +530,21 @@ sig TMulSig(i32) -> i32
 
 fn @multiply_by(%x: i32, %factor: i32) -> i32 {
 bb0:
-  %y: i32 = i.mul { lhs=%x, rhs=%factor }
-  ret %y
+ %y: i32 = i.mul { lhs=%x, rhs=%factor }
+ ret %y
 }
 
 fn @main() -> i32 {
 bb0:
-  %factor: i32 = const.i32 3
+ %factor: i32 = const.i32 3
 
-  ; Create callable with captured factor
-  %mul_by_3: TCallable<TMulSig> = callable.capture @multiply_by { factor=%factor }
+ ; Create callable with captured factor
+ %mul_by_3: TCallable<TMulSig> = callable.capture @multiply_by { factor=%factor }
 
-  ; Invoke indirectly
-  %result: i32 = call.indirect %mul_by_3 { args=[const.i32 7] }
+ ; Invoke indirectly
+ %result: i32 = call.indirect %mul_by_3 { args=[const.i32 7] }
 
-  ret %result
+ ret %result
 }
 ```
 
@@ -571,11 +569,11 @@ This avoids both:
 ## 12.2 Performance model advantages
 
 1. **Most values stay unique**
-   - refcount often remains near 1 unless explicitly shared.
+  - refcount often remains near 1 unless explicitly shared.
 2. **Explicit sharing operations**
-   - `share`, `clone.shared`, etc. make aliasing costs visible.
+  - `share`, `clone.shared`, etc. make aliasing costs visible.
 3. **Atomicity where needed**
-   - shared/thread-crossing paths pay synchronization costs explicitly.
+  - shared/thread-crossing paths pay synchronization costs explicitly.
 
 ## 12.3 Safety and optimization advantages
 
@@ -768,8 +766,8 @@ This section is an implementation-level argument reference.
 ## 17.4 Important defaults and behaviors
 
 - `run` default emit:
-  - release profile: `exe`
-  - dev profile: `llvm-ir`
+ - release profile: `exe`
+ - dev profile: `llvm-ir`
 - `test` mode auto-adds `test` feature when absent.
 - In `--llm` mode (unless `--no-auto-fmt`), auto-format precheck runs first.
 
@@ -844,7 +842,7 @@ digest "0000000000000000"
 
 fn @main() -> i64 {
 bb0:
-  ret const.i64 0
+ ret const.i64 0
 }
 ```
 
@@ -857,21 +855,21 @@ imports { }
 digest "0000000000000000"
 
 heap struct TPoint {
-  field x: i64
-  field y: i64
+ field x: i64
+ field y: i64
 }
 
 fn @main() -> i64 {
 bb0:
-  %p: TPoint = new TPoint { x=const.i64 1, y=const.i64 2 }
-  %pm: mutborrow TPoint = borrow.mut { v=%p }
-  setfield { obj=%pm, field=y, val=const.i64 3 }
-  br bb1
+ %p: TPoint = new TPoint { x=const.i64 1, y=const.i64 2 }
+ %pm: mutborrow TPoint = borrow.mut { v=%p }
+ setfield { obj=%pm, field=y, val=const.i64 3 }
+ br bb1
 
 bb1:
-  %pb: borrow TPoint = borrow.shared { v=%p }
-  %y: i64 = getfield { obj=%pb, field=y }
-  ret %y
+ %pb: borrow TPoint = borrow.shared { v=%p }
+ %y: i64 = getfield { obj=%pb, field=y }
+ ret %y
 }
 ```
 
@@ -887,58 +885,18 @@ sig TMulSig(i32) -> i32
 
 fn @multiply_by(%x: i32, %factor: i32) -> i32 {
 bb0:
-  %y: i32 = i.mul { lhs=%x, rhs=%factor }
-  ret %y
+ %y: i32 = i.mul { lhs=%x, rhs=%factor }
+ ret %y
 }
 
 fn @main() -> i32 {
 bb0:
-  %factor: i32 = const.i32 3
-  %mul_by_3: TCallable<TMulSig> = callable.capture @multiply_by { factor=%factor }
-  %result: i32 = call.indirect %mul_by_3 { args=[const.i32 7] }
-  ret %result
+ %factor: i32 = const.i32 3
+ %mul_by_3: TCallable<TMulSig> = callable.capture @multiply_by { factor=%factor }
+ %result: i32 = call.indirect %mul_by_3 { args=[const.i32 7] }
+ ret %result
 }
 ```
-
----
-
-## 21) Academic and Technical References
-
-[1] Attention Is All You Need — https://arxiv.org/abs/1706.03762
-
-[2] Efficient Transformers: A Survey — https://dl.acm.org/doi/fullHtml/10.1145/3530811
-
-[3] LongBench — https://arxiv.org/abs/2308.14508
-
-[4] Lost in the Middle — https://arxiv.org/abs/2307.03172
-
-[5] Tokenization Matters! — https://arxiv.org/abs/2405.17067
-
-[6] Partial Token Problem study — https://arxiv.org/html/2601.23223v1
-
-[7] Constrained Decoding for FIM Code LMs — https://arxiv.org/abs/2402.17988
-
-[8] Grammar-Constrained Decoding (ACL Industry 2025) — https://aclanthology.org/2025.acl-industry.34/
-
-[9] Prompt Formatting Sensitivity — https://arxiv.org/abs/2310.11324
-
-[10] Butterfly Effect of Altering Prompts — https://aclanthology.org/2024.findings-acl.275/
-
-[11] How Code Formatting Silently Consumes Your LLM Budget — https://arxiv.org/html/2508.13666v1
-
-[12] RFC 8785 (JSON Canonicalization Scheme) — https://www.rfc-editor.org/rfc/rfc8785
-
-[13] gofmt canonical formatting rationale — https://go.dev/blog/gofmt
-
-[14] Reproducible Builds: Why — https://reproducible-builds.org/docs/why/
-
-[15] Git Objects / content addressing — https://git-scm.com/book/en/v2/Git-Internals-Git-Objects
-
-[16] Retrieval-Augmented Generation (RAG) — https://arxiv.org/abs/2005.11401
-
-[17] RETRO — https://arxiv.org/abs/2112.04426
-
-[18] In-Context Retrieval-Augmented LMs — https://arxiv.org/abs/2302.00083
 
 ---
 
@@ -955,79 +913,79 @@ bb0:
 The following is an extended grammar sketch aligned with v0.1 parser behavior.
 
 ```ebnf
-file          := header decl*
-header        := module_decl exports_decl imports_decl digest_decl
-module_decl   := "module" module_path
-exports_decl  := "exports" "{" export_item_list? "}"
-imports_decl  := "imports" "{" import_group_list? "}"
-digest_decl   := "digest" string_lit
+file     := header decl*
+header    := module_decl exports_decl imports_decl digest_decl
+module_decl  := "module" module_path
+exports_decl := "exports" "{" export_item_list? "}"
+imports_decl := "imports" "{" import_group_list? "}"
+digest_decl  := "digest" string_lit
 
 export_item_list := export_item ("," export_item)*
-export_item      := fn_name | type_name
+export_item   := fn_name | type_name
 
 import_group_list := import_group ("," import_group)*
-import_group      := module_path "::" "{" import_item_list? "}"
-import_item_list  := import_item ("," import_item)*
-import_item       := fn_name | type_name
+import_group   := module_path "::" "{" import_item_list? "}"
+import_item_list := import_item ("," import_item)*
+import_item    := fn_name | type_name
 
 decl := fn_decl
-      | async_fn_decl
-      | unsafe_fn_decl
-      | gpu_fn_decl
-      | heap_struct_decl
-      | value_struct_decl
-      | heap_enum_decl
-      | value_enum_decl
-      | extern_decl
-      | global_decl
-      | impl_decl
-      | sig_decl
+   | async_fn_decl
+   | unsafe_fn_decl
+   | gpu_fn_decl
+   | heap_struct_decl
+   | value_struct_decl
+   | heap_enum_decl
+   | value_enum_decl
+   | extern_decl
+   | global_decl
+   | impl_decl
+   | sig_decl
 
-fn_decl        := doc* "fn" fn_name "(" params? ")" "->" type fn_meta? blocks
-async_fn_decl  := doc* "async" "fn" fn_name "(" params? ")" "->" type fn_meta? blocks
+fn_decl    := doc* "fn" fn_name "(" params? ")" "->" type fn_meta? blocks
+async_fn_decl := doc* "async" "fn" fn_name "(" params? ")" "->" type fn_meta? blocks
 unsafe_fn_decl := doc* "unsafe" "fn" fn_name "(" params? ")" "->" type fn_meta? blocks
-gpu_fn_decl    := doc* "gpu" "fn" fn_name "(" params? ")" "->" type "target" "(" ident ")" fn_meta? blocks
+gpu_fn_decl  := doc* "gpu" "fn" fn_name "(" params? ")" "->" type "target" "(" ident ")" fn_meta? blocks
 
 fn_meta := "meta" "{" (meta_uses | meta_effects | meta_cost)* "}"
-meta_uses    := "uses" "{" fqn_list? "}"
+meta_uses  := "uses" "{" fqn_list? "}"
 meta_effects := "effects" "{" ident_list? "}"
-meta_cost    := "cost" "{" kv_i64_list? "}"
+meta_cost  := "cost" "{" kv_i64_list? "}"
 
 params := param ("," param)*
-param  := ssa_name ":" type
+param := ssa_name ":" type
 
-heap_struct_decl  := doc* "heap"  "struct" type_name type_params? "{" field_decl* "}"
+heap_struct_decl := doc* "heap" "struct" type_name type_params? "{" field_decl* "}"
 value_struct_decl := doc* "value" "struct" type_name type_params? "{" field_decl* "}"
-field_decl        := "field" ident ":" type
+field_decl    := "field" ident ":" type
 
-heap_enum_decl  := doc* "heap"  "enum" type_name type_params? "{" variant_decl* "}"
+heap_enum_decl := doc* "heap" "enum" type_name type_params? "{" variant_decl* "}"
 value_enum_decl := doc* "value" "enum" type_name type_params? "{" variant_decl* "}"
-variant_decl    := "variant" ident "{" field_decl_inline_list? "}"
+variant_decl  := "variant" ident "{" field_decl_inline_list? "}"
 
 extern_decl := doc* "extern" string_lit "module" ident "{" extern_item* "}"
 extern_item := "fn" fn_name "(" params? ")" "->" type attrs_block?
 attrs_block := "attrs" "{" kv_string_list? "}"
 
 global_decl := doc* "global" fn_name ":" type "=" const_expr
-impl_decl   := "impl" ident "for" type "=" fn_ref
-sig_decl    := "sig" type_name "(" type_list? ")" "->" type
+impl_decl  := "impl" ident "for" type "=" fn_ref
+sig_decl  := "sig" type_name "(" type_list? ")" "->" type
 
 blocks := "{" block+ "}"
-block  := block_label ":" instr* terminator
+block := block_label ":" instr* terminator
 
 instr := assign_instr
-      | void_instr
-      | unsafe_block
+   | void_instr
+   | unsafe_block
 
 assign_instr := ssa_name ":" type "=" value_op
-void_instr   := void_op
+void_instr  := void_op
 unsafe_block := "unsafe" "{" (assign_instr | void_instr)+ "}"
 
 terminator := "ret" value_ref?
-            | "br" block_label
-            | "cbr" value_ref block_label block_label
-            | "switch" value_ref "{" switch_arms* "}" "else" block_label
-            | "unreachable"
+      | "br" block_label
+      | "cbr" value_ref block_label block_label
+      | "switch" value_ref "{" switch_arms* "}" "else" block_label
+      | "unreachable"
 
 switch_arms := "case" const_lit "->" block_label
 
@@ -1037,10 +995,10 @@ const_expr := "const" "." type const_lit
 type := ownership_mod? base_type
 ownership_mod := "shared" | "borrow" | "mutborrow" | "weak"
 base_type := prim_type
-          | builtin_type
-          | named_type
-          | rawptr_type
-          | callable_type
+     | builtin_type
+     | named_type
+     | rawptr_type
+     | callable_type
 
 rawptr_type := "rawptr" "<" type ">"
 callable_type := "TCallable" "<" type_ref ">"
@@ -1055,22 +1013,22 @@ fn_ref := fn_name | module_path "." fn_name
 type_ref := type_name | module_path "." type_name
 
 prim_type := "i1" | "i8" | "i16" | "i32" | "i64" | "i128"
-           | "u1" | "u8" | "u16" | "u32" | "u64" | "u128"
-           | "f16" | "f32" | "f64"
-           | "bool" | "unit"
+      | "u1" | "u8" | "u16" | "u32" | "u64" | "u128"
+      | "f16" | "f32" | "f64"
+      | "bool" | "unit"
 
 builtin_type := "Str"
-              | "Array" "<" type ">"
-              | "Map" "<" type "," type ">"
-              | "TOption" "<" type ">"
-              | "TResult" "<" type "," type ">"
-              | "TStrBuilder"
-              | "TMutex" "<" type ">"
-              | "TRwLock" "<" type ">"
-              | "TCell" "<" type ">"
-              | "TFuture" "<" type ">"
-              | "TChannelSend" "<" type ">"
-              | "TChannelRecv" "<" type ">"
+       | "Array" "<" type ">"
+       | "Map" "<" type "," type ">"
+       | "TOption" "<" type ">"
+       | "TResult" "<" type "," type ">"
+       | "TStrBuilder"
+       | "TMutex" "<" type ">"
+       | "TRwLock" "<" type ">"
+       | "TCell" "<" type ">"
+       | "TFuture" "<" type ">"
+       | "TChannelSend" "<" type ">"
+       | "TChannelRecv" "<" type ">"
 ```
 
 ---
@@ -1132,21 +1090,21 @@ fcmp.oge { lhs=V, rhs=V }
 ### B.2 Calls and async-related
 
 ```mp
-call @fn<TypeArgs?> { key=Arg, ... }
-call.indirect V { key=Arg, ... }
-try @fn<TypeArgs?> { key=Arg, ... }
-suspend.call @fn<TypeArgs?> { key=Arg, ... }
+call @fn<TypeArgs?> { key=Arg,... }
+call.indirect V { key=Arg,... }
+try @fn<TypeArgs?> { key=Arg,... }
+suspend.call @fn<TypeArgs?> { key=Arg,... }
 suspend.await { fut=V }
 ```
 
 ### B.3 Heap/object/enum
 
 ```mp
-new Type { field=V, ... }
+new Type { field=V,... }
 getfield { obj=V, field=name }
-phi Type { [bbN:V], [bbM:V], ... }
+phi Type { [bbN:V], [bbM:V],... }
 
-enum.new<Variant> { key=V, ... }
+enum.new<Variant> { key=V,... }
 enum.tag { v=V }
 enum.payload<Variant> { v=V }
 enum.is<Variant> { v=V }
@@ -1170,7 +1128,7 @@ ptr.from_addr<T> { addr=V }
 ptr.add<T> { p=V, count=V }
 ptr.load<T> { p=V }
 
-callable.capture @fn { cap_name=V, ... }
+callable.capture @fn { cap_name=V,... }
 ```
 
 ### B.5 Collections, strings, JSON, GPU
@@ -1226,8 +1184,8 @@ gpu.launch_async { device=V, kernel=@fn, grid=Arg, block=Arg, args=Arg }
 ## Appendix C — Void Opcode Syntax Matrix (Exhaustive v0.1 Surface)
 
 ```mp
-call_void @fn<TypeArgs?> { key=Arg, ... }
-call_void.indirect V { key=Arg, ... }
+call_void @fn<TypeArgs?> { key=Arg,... }
+call_void.indirect V { key=Arg,... }
 setfield { obj=V, field=name, val=V }
 panic { msg=V }
 ptr.store<T> { p=V, v=V }
@@ -1299,47 +1257,17 @@ magpie ctx pack --entry src/main.mp
 
 ---
 
-## Appendix E — Claim → Evidence → Strength Matrix
+## Appendix E — Operational Rationale Matrix
 
-| Claim | Evidence | Strength |
+| Claim | Operational basis in Magpie | Confidence |
 |---|---|---|
-| Finite context windows require bounded output design | [1], [2], [3] | Strong |
-| Long contexts cause retrieval/attention failures | [4], [3] | Strong |
-| Tokenization/boundary issues can destabilize generation | [5], [6] | Strong |
-| Grammar-constrained outputs reduce syntax errors | [7], [8] | Strong |
-| Formatting differences can change model behavior | [9], [10] | Strong |
-| Formatting carries measurable token cost | [11] | Strong |
-| Canonical JSON/formatting improves deterministic machine workflows | [12], [13], [14] | Strong (engineering/process) |
-| Stable IDs help progressive disclosure/caching | [15] | Strong (technical analogue) |
-| Retrieval augmentation improves relevance under context limits | [16], [17], [18], [3] | Strong |
-| Canonicalization reduces divergent edit loops in autonomous coding workflows | inferred from [9], [10], [12], [13] | Moderate/Inferential |
+| Bounded output design is necessary | Token-budget options, JSON envelopes, and progressive emit strategy | High |
+| Locality improves practical reliability | Explicit control flow, explicit ownership ops, explicit call forms | High |
+| Canonical formatting improves stability | CSNF formatting and deterministic output behavior | High |
+| Progressive disclosure outperforms bulk dumps in workflows | `mpdbg`, graph emits, and memory/query workflows | High |
+| Stable symbol identity helps incremental workflows | Symbol/dependency graphs and deterministic artifact surfaces | Medium-High |
+| Canonicalization reduces iterative edit drift | Deterministic formatting and reduced syntactic variance | Medium |
 
 ---
 
 ## Appendix F — Specific Notes Requested for v0.1
-
-### F.1 Auto-availability of ubiquitous language items
-
-Design principle: if a language item appears in nearly every file, repeated explicit spelling can consume
-budget without adding meaningful information in model-driven workflows.
-This is an engineering optimization aligned with bounded-token constraints and deterministic defaults.
-
-### F.2 `key=value` canonical argument form
-
-Magpie normalizes argument surfaces to explicit key-value maps in braces where applicable:
-
-```mp
-op { key=value, key2=value2 }
-```
-
-Benefits:
-- stable parsing and formatting,
-- lower ambiguity in generation/repair,
-- deterministic diffs and artifact consistency.
-
-### F.3 Strongest-supported vs inferential claims
-
-- **Strongly supported** by literature: context constraints, long-context degradation, retrieval benefits,
-  tokenization brittleness, formatting sensitivity, constrained decoding gains.
-- **More inferential but grounded**: direct impact of canonicalization on iterative agent loop stability
-  (derived from deterministic formatting + prompt sensitivity + structured tooling evidence).
