@@ -693,6 +693,7 @@ pub struct HirModule {
 ///    it is defined).
 ///
 /// Returns `Ok(())` if no errors were emitted, `Err(())` otherwise.
+#[allow(clippy::result_unit_err)]
 pub fn verify_hir(
     module: &HirModule,
     type_ctx: &TypeCtx,
@@ -724,22 +725,23 @@ fn emit_error(diag: &mut DiagnosticBag, code: &str, msg: &str) {
         explanation_md: None,
         why: None,
         suggested_fixes: vec![],
+        rag_bundle: Vec::new(),
+        related_docs: Vec::new(),
     });
 }
 
 fn is_borrow_type(ty: TypeId, type_ctx: &TypeCtx) -> bool {
     use magpie_types::HandleKind;
-    match type_ctx.lookup(ty) {
+    matches!(
+        type_ctx.lookup(ty),
         Some(TypeKind::HeapHandle {
             hk: HandleKind::Borrow,
             ..
-        }) => true,
-        Some(TypeKind::HeapHandle {
+        }) | Some(TypeKind::HeapHandle {
             hk: HandleKind::MutBorrow,
             ..
-        }) => true,
-        _ => false,
-    }
+        })
+    )
 }
 
 fn is_mutborrow_type(ty: TypeId, type_ctx: &TypeCtx) -> bool {

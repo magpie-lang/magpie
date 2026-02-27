@@ -599,6 +599,8 @@ impl<'a> Lexer<'a> {
             explanation_md: None,
             why: None,
             suggested_fixes: Vec::new(),
+            rag_bundle: Vec::new(),
+            related_docs: Vec::new(),
         });
     }
 
@@ -867,7 +869,11 @@ mod tests {
         assert_eq!(tokens[5].text, "%x");
         assert_eq!(tokens[7].text, "TNum");
         assert_eq!(tokens[14].text, "true");
-        assert_eq!(diag.error_count(), 0, "valid source should lex without errors");
+        assert_eq!(
+            diag.error_count(),
+            0,
+            "valid source should lex without errors"
+        );
     }
 
     #[test]

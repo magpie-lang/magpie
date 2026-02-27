@@ -19,9 +19,11 @@ magpie_mono = { path = "../magpie_mono" }
 magpie_own = { path = "../magpie_own" }
 magpie_mpir = { path = "../magpie_mpir" }
 magpie_arc = { path = "../magpie_arc" }
+magpie_gpu = { path = "../magpie_gpu" }
 magpie_diag = { path = "../magpie_diag" }
 magpie_pkg = { path = "../magpie_pkg" }
 magpie_memory = { path = "../magpie_memory" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+blake3 = { workspace = true }
 regex = "1"

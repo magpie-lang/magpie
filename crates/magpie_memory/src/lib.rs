@@ -2,6 +2,8 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +59,8 @@ pub struct MmsIndex {
     pub avgdl: f64,
     pub k1: f64,
     pub b: f64,
+    #[serde(default)]
+    pub source_fingerprints: Vec<MmsSourceFingerprint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,11 +71,35 @@ pub struct MmsResult {
     pub item: MmsItem,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MmsStalenessIssue {
+    pub item_id: String,
+    pub path: String,
+    pub reason: String,
+    #[serde(default)]
+    pub expected_digest: String,
+    #[serde(default)]
+    pub actual_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MmsSourceFingerprint {
+    pub path: String,
+    pub digest: String,
+}
+
 pub fn tokenize_mms(text: &str) -> Vec<MmsTerm> {
     tokenize_impl(text, TokenizeMode::Document)
 }
 
 pub fn build_index(items: &[MmsItem]) -> MmsIndex {
+    build_index_with_sources(items, &[])
+}
+
+pub fn build_index_with_sources(
+    items: &[MmsItem],
+    source_fingerprints: &[MmsSourceFingerprint],
+) -> MmsIndex {
     let mut inverted_index: HashMap<String, Vec<MmsPosting>> = HashMap::new();
     let mut doc_lens = Vec::with_capacity(items.len());
 
@@ -105,6 +133,19 @@ pub fn build_index(items: &[MmsItem]) -> MmsIndex {
         total_len as f64 / n_docs as f64
     };
 
+    let mut source_digest_by_path = BTreeMap::new();
+    for fingerprint in source_fingerprints {
+        let path = fingerprint.path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        source_digest_by_path.insert(path.to_string(), fingerprint.digest.clone());
+    }
+    let source_fingerprints = source_digest_by_path
+        .into_iter()
+        .map(|(path, digest)| MmsSourceFingerprint { path, digest })
+        .collect();
+
     MmsIndex {
         items: items.to_vec(),
         inverted_index,
@@ -113,6 +154,7 @@ pub fn build_index(items: &[MmsItem]) -> MmsIndex {
         avgdl,
         k1: BM25_K1,
         b: BM25_B,
+        source_fingerprints,
     }
 }
 
@@ -187,6 +229,105 @@ pub fn query_bm25(index: &MmsIndex, query: &str, k: usize) -> Vec<MmsResult> {
     results
 }
 
+pub fn validate_index_staleness(
+    index: &MmsIndex,
+    base_dir: &Path,
+    max_issues: usize,
+) -> Vec<MmsStalenessIssue> {
+    let mut issues = Vec::new();
+    for source in &index.source_fingerprints {
+        if max_issues > 0 && issues.len() >= max_issues {
+            break;
+        }
+
+        if source.path.trim().is_empty() {
+            continue;
+        }
+
+        let path = resolve_item_path(base_dir, &source.path);
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let actual_source_digest = stable_hash_hex(&bytes);
+                if !source.digest.is_empty() && source.digest != actual_source_digest {
+                    issues.push(MmsStalenessIssue {
+                        item_id: "source".to_string(),
+                        path: path.to_string_lossy().to_string(),
+                        reason: "source_digest_mismatch".to_string(),
+                        expected_digest: source.digest.clone(),
+                        actual_digest: actual_source_digest,
+                    });
+                }
+            }
+            Err(_) => {
+                issues.push(MmsStalenessIssue {
+                    item_id: "source".to_string(),
+                    path: path.to_string_lossy().to_string(),
+                    reason: "source_unreadable".to_string(),
+                    expected_digest: source.digest.clone(),
+                    actual_digest: String::new(),
+                });
+            }
+        }
+    }
+
+    for item in &index.items {
+        if max_issues > 0 && issues.len() >= max_issues {
+            break;
+        }
+
+        if item.fqn.trim().is_empty() {
+            continue;
+        }
+
+        let expected_source_digest = stable_hash_hex(item.fqn.as_bytes());
+        if !item.source_digest.is_empty() && item.source_digest != expected_source_digest {
+            issues.push(MmsStalenessIssue {
+                item_id: item.item_id.clone(),
+                path: item.fqn.clone(),
+                reason: "source_digest_mismatch".to_string(),
+                expected_digest: item.source_digest.clone(),
+                actual_digest: expected_source_digest,
+            });
+            if max_issues > 0 && issues.len() >= max_issues {
+                break;
+            }
+        }
+
+        let path = resolve_item_path(base_dir, &item.fqn);
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let actual_body_digest = stable_hash_hex(&bytes);
+                if !item.body_digest.is_empty() && item.body_digest != actual_body_digest {
+                    issues.push(MmsStalenessIssue {
+                        item_id: item.item_id.clone(),
+                        path: path.to_string_lossy().to_string(),
+                        reason: "body_digest_mismatch".to_string(),
+                        expected_digest: item.body_digest.clone(),
+                        actual_digest: actual_body_digest,
+                    });
+                }
+            }
+            Err(_) => {
+                issues.push(MmsStalenessIssue {
+                    item_id: item.item_id.clone(),
+                    path: path.to_string_lossy().to_string(),
+                    reason: "artifact_unreadable".to_string(),
+                    expected_digest: item.body_digest.clone(),
+                    actual_digest: String::new(),
+                });
+            }
+        }
+    }
+
+    issues.sort_by(|lhs, rhs| {
+        lhs.item_id
+            .cmp(&rhs.item_id)
+            .then(lhs.path.cmp(&rhs.path))
+            .then(lhs.reason.cmp(&rhs.reason))
+    });
+    issues
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TokenizeMode {
     Document,
@@ -206,6 +347,27 @@ fn tokenize_impl(text: &str, mode: TokenizeMode) -> Vec<MmsTerm> {
     }
 
     with_stopwords
+}
+
+fn resolve_item_path(base_dir: &Path, raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        base_dir.join(path)
+    }
+}
+
+fn stable_hash_hex(input: &[u8]) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+
+    let mut hash = OFFSET_BASIS;
+    for byte in input {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{:016x}", hash)
 }
 
 fn normalize_input(text: &str) -> String {
@@ -321,8 +483,8 @@ fn match_diag(text: &str, start: usize) -> Option<usize> {
         return None;
     }
 
-    if seg[0].to_ascii_lowercase() == b'm'
-        && seg[1].to_ascii_lowercase() == b'p'
+    if matches!(seg[0], b'm' | b'M')
+        && matches!(seg[1], b'p' | b'P')
         && seg[2].is_ascii_alphabetic()
         && seg[3].is_ascii_digit()
         && seg[4].is_ascii_digit()
@@ -667,6 +829,8 @@ fn compare_results(a: &MmsResult, b: &MmsResult) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_item(
         item_id: &str,
@@ -734,5 +898,90 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(diag_terms, vec!["MPP0001", "MPP0002"]);
+    }
+
+    #[test]
+    fn validate_index_staleness_reports_body_digest_mismatches() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "magpie_memory_stale_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+
+        let artifact = dir.join("artifact.txt");
+        fs::write(&artifact, "v1").expect("artifact should be written");
+
+        let mut token_cost = BTreeMap::new();
+        token_cost.insert("approx:utf8_4chars".to_string(), 1);
+
+        let fqn = artifact.to_string_lossy().to_string();
+        let item = MmsItem {
+            item_id: "I:1".to_string(),
+            kind: "symbol_capsule".to_string(),
+            sid: "S:1".to_string(),
+            fqn: fqn.clone(),
+            module_sid: "M:1".to_string(),
+            source_digest: stable_hash_hex(fqn.as_bytes()),
+            body_digest: stable_hash_hex(b"v1"),
+            text: "v1".to_string(),
+            tags: vec![],
+            priority: 10,
+            token_cost,
+        };
+
+        let index = build_index(&[item]);
+        let clean = validate_index_staleness(&index, &dir, 8);
+        assert!(clean.is_empty(), "fresh artifact should not be stale");
+
+        fs::write(&artifact, "v2").expect("artifact should be rewritten");
+        let stale = validate_index_staleness(&index, &dir, 8);
+        assert!(!stale.is_empty(), "changed artifact should be stale");
+        assert_eq!(stale[0].reason, "body_digest_mismatch");
+
+        fs::remove_file(&artifact).expect("artifact should be removed");
+        fs::remove_dir_all(&dir).expect("temp dir should be removed");
+    }
+
+    #[test]
+    fn validate_index_staleness_reports_source_digest_mismatches() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "magpie_memory_source_stale_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+
+        let source = dir.join("src/main.mp");
+        fs::create_dir_all(source.parent().expect("source parent should exist"))
+            .expect("source parent dir should be created");
+        fs::write(&source, "module demo.main\ndigest \"x\"\n").expect("source should be written");
+
+        let source_path = source.to_string_lossy().to_string();
+        let fingerprint = MmsSourceFingerprint {
+            path: source_path.clone(),
+            digest: stable_hash_hex(b"module demo.main\ndigest \"x\"\n"),
+        };
+
+        let index = build_index_with_sources(&[], &[fingerprint]);
+        let clean = validate_index_staleness(&index, &dir, 8);
+        assert!(clean.is_empty(), "fresh source should not be stale");
+
+        fs::write(&source, "module demo.main\ndigest \"y\"\n").expect("source should be rewritten");
+        let stale = validate_index_staleness(&index, &dir, 8);
+        assert!(!stale.is_empty(), "changed source should be stale");
+        assert_eq!(stale[0].reason, "source_digest_mismatch");
+        assert_eq!(stale[0].item_id, "source");
+
+        fs::remove_file(&source).expect("source should be removed");
+        fs::remove_dir_all(&dir).expect("temp dir should be removed");
     }
 }

@@ -1,6 +1,7 @@
 //! magpie_jit
 //!
 //! REPL/JIT scaffolding for SPEC §23.
+#![allow(clippy::result_unit_err)]
 
 use magpie_ast::FileId;
 use magpie_codegen_llvm::codegen_module;
@@ -65,7 +66,7 @@ pub fn parse_repl_command(input: &str) -> ReplCommand {
     if trimmed == ":quit" {
         return ReplCommand::Quit;
     }
-    if trimmed == ":diag" {
+    if trimmed == ":diag" || trimmed == ":diag last" {
         return ReplCommand::DiagLast;
     }
     if let Some(rest) = trimmed.strip_prefix(":type") {
@@ -149,7 +150,7 @@ pub fn eval_cell(session: &mut ReplSession, code: &str, diag: &mut DiagnosticBag
     let diag_start = diag.diagnostics.len();
     session.cell_counter = session.cell_counter.saturating_add(1);
     let cell_id = session.cell_counter;
-    let module_name = format!("repl.cell.{cell_id}");
+    let module_name = format!("repl.cell.c{cell_id}");
     let fn_name = format!("__repl_eval_{cell_id}");
 
     let wrapped_source = wrap_cell_source(&module_name, &fn_name, code);
@@ -386,6 +387,8 @@ pub fn load_session(serialized: &str) -> Result<ReplSession, String> {
                     explanation_md: None,
                     why: None,
                     suggested_fixes: Vec::new(),
+                    rag_bundle: Vec::new(),
+                    related_docs: Vec::new(),
                 });
             }
             "mod" => {
@@ -448,20 +451,14 @@ fn eval_source_to_artifacts(source: &str, diag: &mut DiagnosticBag) -> Result<Ev
     let resolved_modules = resolve_modules(std::slice::from_ref(&ast), diag)?;
 
     let mut type_ctx = TypeCtx::new();
-    for resolved in &resolved_modules {
+    if let Some(resolved) = resolved_modules.first() {
         let hir_module = lower_to_hir(resolved, &mut type_ctx, diag)?;
         let mpir_module = lower_hir_module_to_mpir(&hir_module, &type_ctx);
         let mpir = print_mpir(&mpir_module, &type_ctx);
         let llvm_ir = match codegen_module(&mpir_module, &type_ctx) {
             Ok(llvm_ir) => llvm_ir,
             Err(err) => {
-                emit_diag(
-                    diag,
-                    "MPG0001",
-                    Severity::Error,
-                    "llvm codegen failed",
-                    err,
-                );
+                emit_diag(diag, "MPG0001", Severity::Error, "llvm codegen failed", err);
                 return Err(());
             }
         };
@@ -544,6 +541,8 @@ fn emit_diag(
         explanation_md: None,
         why: None,
         suggested_fixes: Vec::new(),
+        rag_bundle: Vec::new(),
+        related_docs: Vec::new(),
     });
 }
 
@@ -610,4 +609,15 @@ fn unescape_field(s: &str) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_repl_command_accepts_diag_last_alias() {
+        assert_eq!(parse_repl_command(":diag"), ReplCommand::DiagLast);
+        assert_eq!(parse_repl_command(":diag last"), ReplCommand::DiagLast);
+    }
 }

@@ -1,15 +1,45 @@
 //! magpie_codegen_llvm
+#![allow(clippy::too_many_arguments, clippy::write_with_newline)]
 
 use magpie_mpir::{
     HirConst, HirConstLit, MpirBlock, MpirFn, MpirInstr, MpirModule, MpirOp, MpirOpVoid,
     MpirTerminator, MpirValue,
 };
-use magpie_types::{HeapBase, PrimType, Sid, TypeCtx, TypeId, TypeKind};
+use magpie_types::{fixed_type_ids, HeapBase, PrimType, Sid, TypeCtx, TypeId, TypeKind};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
+const MP_RT_HEADER_SIZE: u64 = 32;
+const MP_RT_FLAG_HEAP: u32 = 0x1;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CodegenOptions {
+    pub shared_generics: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeTypeRegistryInfo {
+    symbol: String,
+    count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CallbackUsage {
+    hash: bool,
+    eq: bool,
+    cmp: bool,
+}
+
 pub fn codegen_module(mpir: &MpirModule, type_ctx: &TypeCtx) -> Result<String, String> {
-    let mut cg = LlvmTextCodegen::new(mpir, type_ctx);
+    codegen_module_with_options(mpir, type_ctx, CodegenOptions::default())
+}
+
+pub fn codegen_module_with_options(
+    mpir: &MpirModule,
+    type_ctx: &TypeCtx,
+    options: CodegenOptions,
+) -> Result<String, String> {
+    let mut cg = LlvmTextCodegen::new(mpir, type_ctx, options);
     cg.codegen_module()
 }
 
@@ -17,10 +47,11 @@ struct LlvmTextCodegen<'a> {
     mpir: &'a MpirModule,
     type_ctx: &'a TypeCtx,
     type_map: BTreeMap<u32, TypeKind>,
+    options: CodegenOptions,
 }
 
 impl<'a> LlvmTextCodegen<'a> {
-    fn new(mpir: &'a MpirModule, type_ctx: &'a TypeCtx) -> Self {
+    fn new(mpir: &'a MpirModule, type_ctx: &'a TypeCtx, options: CodegenOptions) -> Self {
         let mut type_map = BTreeMap::new();
         for (tid, kind) in &mpir.type_table.types {
             type_map.insert(tid.0, kind.clone());
@@ -32,6 +63,7 @@ impl<'a> LlvmTextCodegen<'a> {
             mpir,
             type_ctx,
             type_map,
+            options,
         }
     }
 
@@ -52,17 +84,43 @@ impl<'a> LlvmTextCodegen<'a> {
             .filter_map(|(id, kind)| matches!(kind, TypeKind::ValueStruct { .. }).then_some(*id))
             .collect::<Vec<_>>();
         for id in value_struct_ids {
-            writeln!(out, "%mp_t{} = type {{}}", id).map_err(|e| e.to_string())?;
+            let layout = self.type_ctx.compute_layout(TypeId(id));
+            let size = layout.size.max(1);
+            writeln!(out, "%mp_t{} = type [{} x i8]", id, size).map_err(|e| e.to_string())?;
         }
+        let generics_mode = if self.options.shared_generics {
+            1_u8
+        } else {
+            0_u8
+        };
+        writeln!(
+            out,
+            "@\"mp$0$ABI$generics_mode\" = weak_odr constant i8 {generics_mode}"
+        )
+        .map_err(|e| e.to_string())?;
         if !out.ends_with('\n') {
             writeln!(out).map_err(|e| e.to_string())?;
         }
 
         self.emit_declarations(&mut out)?;
         writeln!(out).map_err(|e| e.to_string())?;
+        let runtime_registry = self.emit_runtime_type_registry_globals(&mut out)?;
+        if runtime_registry.is_some() {
+            writeln!(out).map_err(|e| e.to_string())?;
+        }
+        self.emit_trait_callback_wrappers(&mut out)?;
+        writeln!(out).map_err(|e| e.to_string())?;
 
         writeln!(out, "define internal void @{}() {{", module_init).map_err(|e| e.to_string())?;
         writeln!(out, "entry:").map_err(|e| e.to_string())?;
+        if let Some(reg) = runtime_registry {
+            writeln!(
+                out,
+                "  call void @mp_rt_register_types(ptr getelementptr inbounds ([{} x %MpRtTypeInfo], ptr @{}, i64 0, i64 0), i32 {})",
+                reg.count, reg.symbol, reg.count
+            )
+            .map_err(|e| e.to_string())?;
+        }
         writeln!(out, "  ret void").map_err(|e| e.to_string())?;
         writeln!(out, "}}").map_err(|e| e.to_string())?;
         writeln!(out).map_err(|e| e.to_string())?;
@@ -73,19 +131,24 @@ impl<'a> LlvmTextCodegen<'a> {
             out.push('\n');
         }
 
-        self.emit_c_main(&mut out, module_init.as_str(), main_fn)?;
+        if main_fn.is_some() {
+            self.emit_c_main(&mut out, module_init.as_str(), main_fn)?;
+        }
         Ok(out)
     }
 
     fn emit_declarations(&self, out: &mut String) -> Result<(), String> {
         let decls = [
             "declare void @mp_rt_init()",
+            "declare void @mp_gpu_register_all_kernels()",
+            "declare ptr @mp_rt_alloc(i32, i64, i64, i32)",
+            "declare void @mp_rt_register_types(ptr, i32)",
             "declare void @mp_rt_retain_strong(ptr)",
             "declare void @mp_rt_release_strong(ptr)",
             "declare void @mp_rt_retain_weak(ptr)",
             "declare void @mp_rt_release_weak(ptr)",
             "declare ptr @mp_rt_weak_upgrade(ptr)",
-            "declare noreturn void @mp_rt_panic(ptr)",
+            "declare void @mp_rt_panic(ptr) noreturn",
             "declare ptr @mp_rt_arr_new(i32, i64, i64)",
             "declare i64 @mp_rt_arr_len(ptr)",
             "declare ptr @mp_rt_arr_get(ptr, i64)",
@@ -100,6 +163,9 @@ impl<'a> LlvmTextCodegen<'a> {
             "declare ptr @mp_rt_arr_filter(ptr, ptr)",
             "declare void @mp_rt_arr_reduce(ptr, ptr, i64, ptr)",
             "declare ptr @mp_rt_callable_new(ptr, ptr)",
+            "declare ptr @mp_rt_callable_fn_ptr(ptr)",
+            "declare ptr @mp_rt_callable_data_ptr(ptr)",
+            "declare i64 @mp_rt_callable_capture_size(ptr)",
             "declare ptr @mp_rt_map_new(i32, i32, i64, i64, i64, ptr, ptr)",
             "declare i64 @mp_rt_map_len(ptr)",
             "declare ptr @mp_rt_map_get(ptr, ptr, i64)",
@@ -112,8 +178,13 @@ impl<'a> LlvmTextCodegen<'a> {
             "declare ptr @mp_rt_str_concat(ptr, ptr)",
             "declare i64 @mp_rt_str_len(ptr)",
             "declare i32 @mp_rt_str_eq(ptr, ptr)",
+            "declare i32 @mp_rt_str_cmp(ptr, ptr)",
             "declare ptr @mp_rt_str_slice(ptr, i64, i64)",
             "declare ptr @mp_rt_str_bytes(ptr, ptr)",
+            "declare i64 @mp_std_hash_str(ptr)",
+            "declare i64 @mp_rt_bytes_hash(ptr, i64)",
+            "declare i32 @mp_rt_bytes_eq(ptr, ptr, i64)",
+            "declare i32 @mp_rt_bytes_cmp(ptr, ptr, i64)",
             "declare ptr @mp_rt_json_encode(ptr, i32)",
             "declare ptr @mp_rt_json_decode(ptr, i32)",
             "declare i64 @mp_rt_str_parse_i64(ptr)",
@@ -129,6 +200,11 @@ impl<'a> LlvmTextCodegen<'a> {
             "declare ptr @mp_rt_strbuilder_build(ptr)",
             "declare i32 @mp_rt_future_poll(ptr)",
             "declare void @mp_rt_future_take(ptr, ptr)",
+            "declare i64 @mp_rt_gpu_buffer_len(ptr)",
+            "declare i32 @mp_rt_gpu_buffer_read(ptr, i64, ptr, i64)",
+            "declare i32 @mp_rt_gpu_buffer_write(ptr, i64, ptr, i64)",
+            "declare i32 @mp_rt_gpu_launch_sync(ptr, i64, i32, i32, i32, i32, i32, i32, ptr, i64, ptr)",
+            "declare i32 @mp_rt_gpu_launch_async(ptr, i64, i32, i32, i32, i32, i32, i32, ptr, i64, ptr, ptr)",
             "declare { i8, i1 } @llvm.sadd.with.overflow.i8(i8, i8)",
             "declare { i8, i1 } @llvm.ssub.with.overflow.i8(i8, i8)",
             "declare { i8, i1 } @llvm.smul.with.overflow.i8(i8, i8)",
@@ -151,6 +227,297 @@ impl<'a> LlvmTextCodegen<'a> {
         Ok(())
     }
 
+    fn emit_runtime_type_registry_globals(
+        &self,
+        out: &mut String,
+    ) -> Result<Option<RuntimeTypeRegistryInfo>, String> {
+        #[derive(Clone, Debug)]
+        struct Entry {
+            type_id: u32,
+            payload_size: u64,
+            payload_align: u64,
+            debug_fqn: String,
+        }
+
+        let mut entries = Vec::new();
+        for (type_id, kind) in &self.type_map {
+            let Some((type_sid, _)) = (match kind {
+                TypeKind::HeapHandle {
+                    base: HeapBase::UserType { type_sid, targs },
+                    ..
+                } => Some((type_sid.clone(), targs)),
+                _ => None,
+            }) else {
+                continue;
+            };
+
+            let layout = self
+                .type_ctx
+                .user_enum_layout(&type_sid)
+                .or_else(|| self.type_ctx.user_struct_layout(&type_sid))
+                .unwrap_or(magpie_types::TypeLayout {
+                    size: 0,
+                    align: 1,
+                    fields: Vec::new(),
+                });
+
+            entries.push(Entry {
+                type_id: *type_id,
+                payload_size: layout.size.max(1),
+                payload_align: layout.align.max(1),
+                debug_fqn: self.type_ctx.type_str(TypeId(*type_id)),
+            });
+        }
+
+        if entries.is_empty() {
+            return Ok(None);
+        }
+
+        writeln!(
+            out,
+            "%MpRtTypeInfo = type {{ i32, i32, i64, i64, ptr, ptr }}"
+        )
+        .map_err(|e| e.to_string())?;
+
+        let mut name_symbols = Vec::with_capacity(entries.len());
+        for (idx, entry) in entries.iter().enumerate() {
+            let (bytes_len, literal) = llvm_c_string_literal(&entry.debug_fqn);
+            let sym = format!("mp_type_debug_name_{}", idx);
+            writeln!(
+                out,
+                "@{sym} = private constant [{bytes_len} x i8] c\"{literal}\""
+            )
+            .map_err(|e| e.to_string())?;
+            name_symbols.push((sym, bytes_len));
+        }
+
+        let type_entries = entries
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let (name_sym, name_len) = &name_symbols[idx];
+                format!(
+                    "%MpRtTypeInfo {{ i32 {}, i32 {}, i64 {}, i64 {}, ptr null, ptr getelementptr inbounds ([{} x i8], ptr @{}, i64 0, i64 0) }}",
+                    entry.type_id,
+                    MP_RT_FLAG_HEAP,
+                    entry.payload_size,
+                    entry.payload_align,
+                    name_len,
+                    name_sym
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let symbol = format!("mp_type_registry_{}", sid_suffix(&self.mpir.sid));
+        writeln!(
+            out,
+            "@{symbol} = private constant [{} x %MpRtTypeInfo] [{}]",
+            entries.len(),
+            type_entries
+        )
+        .map_err(|e| e.to_string())?;
+
+        Ok(Some(RuntimeTypeRegistryInfo {
+            symbol,
+            count: entries.len(),
+        }))
+    }
+
+    fn emit_trait_callback_wrappers(&self, out: &mut String) -> Result<(), String> {
+        let usage = self.collect_trait_callback_usage();
+        if usage.is_empty() {
+            return Ok(());
+        }
+
+        for (tid, flags) in usage {
+            let ty = TypeId(tid);
+            if flags.hash {
+                self.emit_hash_wrapper(out, ty)?;
+                writeln!(out).map_err(|e| e.to_string())?;
+            }
+            if flags.eq {
+                self.emit_eq_wrapper(out, ty)?;
+                writeln!(out).map_err(|e| e.to_string())?;
+            }
+            if flags.cmp {
+                self.emit_cmp_wrapper(out, ty)?;
+                writeln!(out).map_err(|e| e.to_string())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn emit_hash_wrapper(&self, out: &mut String, ty: TypeId) -> Result<(), String> {
+        let sym = callback_hash_symbol(ty);
+        writeln!(out, "define weak_odr i64 @{sym}(ptr %x_bytes) {{").map_err(|e| e.to_string())?;
+        writeln!(out, "entry:").map_err(|e| e.to_string())?;
+        if self.is_str_handle_ty(ty) {
+            writeln!(out, "  %x = load ptr, ptr %x_bytes").map_err(|e| e.to_string())?;
+            writeln!(out, "  %h = call i64 @mp_std_hash_str(ptr %x)").map_err(|e| e.to_string())?;
+            writeln!(out, "  ret i64 %h").map_err(|e| e.to_string())?;
+        } else {
+            writeln!(
+                out,
+                "  %h = call i64 @mp_rt_bytes_hash(ptr %x_bytes, i64 {})",
+                self.size_of_ty(ty)
+            )
+            .map_err(|e| e.to_string())?;
+            writeln!(out, "  ret i64 %h").map_err(|e| e.to_string())?;
+        }
+        writeln!(out, "}}").map_err(|e| e.to_string())
+    }
+
+    fn emit_eq_wrapper(&self, out: &mut String, ty: TypeId) -> Result<(), String> {
+        let sym = callback_eq_symbol(ty);
+        writeln!(
+            out,
+            "define weak_odr i32 @{sym}(ptr %a_bytes, ptr %b_bytes) {{"
+        )
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "entry:").map_err(|e| e.to_string())?;
+        if self.is_str_handle_ty(ty) {
+            writeln!(out, "  %a = load ptr, ptr %a_bytes").map_err(|e| e.to_string())?;
+            writeln!(out, "  %b = load ptr, ptr %b_bytes").map_err(|e| e.to_string())?;
+            writeln!(out, "  %eq = call i32 @mp_rt_str_eq(ptr %a, ptr %b)")
+                .map_err(|e| e.to_string())?;
+            writeln!(out, "  ret i32 %eq").map_err(|e| e.to_string())?;
+        } else {
+            writeln!(
+                out,
+                "  %eq = call i32 @mp_rt_bytes_eq(ptr %a_bytes, ptr %b_bytes, i64 {})",
+                self.size_of_ty(ty)
+            )
+            .map_err(|e| e.to_string())?;
+            writeln!(out, "  ret i32 %eq").map_err(|e| e.to_string())?;
+        }
+        writeln!(out, "}}").map_err(|e| e.to_string())
+    }
+
+    fn emit_cmp_wrapper(&self, out: &mut String, ty: TypeId) -> Result<(), String> {
+        let sym = callback_cmp_symbol(ty);
+        writeln!(
+            out,
+            "define weak_odr i32 @{sym}(ptr %a_bytes, ptr %b_bytes) {{"
+        )
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "entry:").map_err(|e| e.to_string())?;
+        if self.is_str_handle_ty(ty) {
+            writeln!(out, "  %a = load ptr, ptr %a_bytes").map_err(|e| e.to_string())?;
+            writeln!(out, "  %b = load ptr, ptr %b_bytes").map_err(|e| e.to_string())?;
+            writeln!(out, "  %ord = call i32 @mp_rt_str_cmp(ptr %a, ptr %b)")
+                .map_err(|e| e.to_string())?;
+            writeln!(out, "  ret i32 %ord").map_err(|e| e.to_string())?;
+        } else {
+            writeln!(
+                out,
+                "  %ord = call i32 @mp_rt_bytes_cmp(ptr %a_bytes, ptr %b_bytes, i64 {})",
+                self.size_of_ty(ty)
+            )
+            .map_err(|e| e.to_string())?;
+            writeln!(out, "  ret i32 %ord").map_err(|e| e.to_string())?;
+        }
+        writeln!(out, "}}").map_err(|e| e.to_string())
+    }
+
+    fn collect_trait_callback_usage(&self) -> BTreeMap<u32, CallbackUsage> {
+        fn mark(
+            usage: &mut BTreeMap<u32, CallbackUsage>,
+            ty: TypeId,
+            hash: bool,
+            eq: bool,
+            cmp: bool,
+        ) {
+            let entry = usage.entry(ty.0).or_default();
+            entry.hash |= hash;
+            entry.eq |= eq;
+            entry.cmp |= cmp;
+        }
+
+        fn value_type(local_tys: &HashMap<u32, TypeId>, v: &MpirValue) -> Option<TypeId> {
+            match v {
+                MpirValue::Local(id) => local_tys.get(&id.0).copied(),
+                MpirValue::Const(c) => Some(c.ty),
+            }
+        }
+
+        let mut usage = BTreeMap::<u32, CallbackUsage>::new();
+
+        for f in &self.mpir.functions {
+            let mut local_tys = HashMap::<u32, TypeId>::new();
+            for (pid, pty) in &f.params {
+                local_tys.insert(pid.0, *pty);
+            }
+            for l in &f.locals {
+                local_tys.insert(l.id.0, l.ty);
+            }
+            for b in &f.blocks {
+                for i in &b.instrs {
+                    local_tys.insert(i.dst.0, i.ty);
+                }
+            }
+
+            for b in &f.blocks {
+                for i in &b.instrs {
+                    match &i.op {
+                        MpirOp::MapNew { key_ty, .. } => {
+                            mark(&mut usage, *key_ty, true, true, false);
+                        }
+                        MpirOp::ArrContains { val, .. } => {
+                            if let Some(elem_ty) = value_type(&local_tys, val) {
+                                mark(&mut usage, elem_ty, false, true, false);
+                            }
+                        }
+                        MpirOp::ArrSort { arr } => {
+                            if let Some(elem_ty) = self.array_elem_type_for_value(arr, &local_tys) {
+                                mark(&mut usage, elem_ty, false, false, true);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for vop in &b.void_ops {
+                    if let MpirOpVoid::ArrSort { arr } = vop {
+                        if let Some(elem_ty) = self.array_elem_type_for_value(arr, &local_tys) {
+                            mark(&mut usage, elem_ty, false, false, true);
+                        }
+                    }
+                }
+            }
+        }
+
+        usage
+    }
+
+    fn array_elem_type_for_value(
+        &self,
+        value: &MpirValue,
+        local_tys: &HashMap<u32, TypeId>,
+    ) -> Option<TypeId> {
+        let arr_ty = match value {
+            MpirValue::Local(id) => local_tys.get(&id.0).copied(),
+            MpirValue::Const(c) => Some(c.ty),
+        }?;
+        match self.kind_of(arr_ty) {
+            Some(TypeKind::HeapHandle {
+                base: HeapBase::BuiltinArray { elem },
+                ..
+            }) => Some(*elem),
+            _ => None,
+        }
+    }
+
+    fn is_str_handle_ty(&self, ty: TypeId) -> bool {
+        matches!(
+            self.kind_of(ty),
+            Some(TypeKind::HeapHandle {
+                base: HeapBase::BuiltinStr,
+                ..
+            })
+        )
+    }
+
     fn codegen_fn(&self, f: &MpirFn) -> Result<String, String> {
         let mut fb = FnBuilder::new(self, f)?;
         fb.codegen()?;
@@ -167,6 +534,7 @@ impl<'a> LlvmTextCodegen<'a> {
         writeln!(out, "entry:").map_err(|e| e.to_string())?;
         writeln!(out, "  call void @mp_rt_init()").map_err(|e| e.to_string())?;
         writeln!(out, "  call void @{}()", module_init).map_err(|e| e.to_string())?;
+        writeln!(out, "  call void @mp_gpu_register_all_kernels()").map_err(|e| e.to_string())?;
         if let Some(magpie_main) = main_fn {
             let fn_name = mangle_fn(&magpie_main.sid);
             let ret_ty = self.llvm_ty(magpie_main.ret_ty);
@@ -216,10 +584,14 @@ impl<'a> LlvmTextCodegen<'a> {
             Some(TypeKind::HeapHandle { .. }) => "ptr".to_string(),
             Some(TypeKind::RawPtr { .. }) => "ptr".to_string(),
             Some(TypeKind::BuiltinOption { inner }) => {
-                format!("{{ {}, i1 }}", self.llvm_ty(*inner))
+                format!("{{ {}, i1 }}", self.llvm_storage_ty(*inner))
             }
             Some(TypeKind::BuiltinResult { ok, err }) => {
-                format!("{{ i1, {}, {} }}", self.llvm_ty(*ok), self.llvm_ty(*err))
+                format!(
+                    "{{ i1, {}, {} }}",
+                    self.llvm_storage_ty(*ok),
+                    self.llvm_storage_ty(*err)
+                )
             }
             Some(TypeKind::Arr { n, elem }) => format!("[{} x {}]", n, self.llvm_ty(*elem)),
             Some(TypeKind::Vec { n, elem }) => format!("<{} x {}>", n, self.llvm_ty(*elem)),
@@ -237,6 +609,15 @@ impl<'a> LlvmTextCodegen<'a> {
             }
             Some(TypeKind::ValueStruct { .. }) => format!("%mp_t{}", ty.0),
             None => "ptr".to_string(),
+        }
+    }
+
+    fn llvm_storage_ty(&self, ty: TypeId) -> String {
+        let ty = self.llvm_ty(ty);
+        if ty == "void" {
+            "i8".to_string()
+        } else {
+            ty
         }
     }
 
@@ -261,6 +642,29 @@ impl<'a> LlvmTextCodegen<'a> {
             Some(TypeKind::Tuple { elems }) => elems.iter().map(|e| self.size_of_ty(*e)).sum(),
             Some(TypeKind::ValueStruct { .. }) => 0,
             None => 8,
+        }
+    }
+
+    fn is_gpu_buffer_param_ty(&self, ty: TypeId) -> bool {
+        if ty == fixed_type_ids::GPU_BUFFER_BASE {
+            return true;
+        }
+        match self.kind_of(ty) {
+            Some(TypeKind::HeapHandle { base, .. }) => !matches!(
+                base,
+                HeapBase::BuiltinStr
+                    | HeapBase::BuiltinArray { .. }
+                    | HeapBase::BuiltinMap { .. }
+                    | HeapBase::BuiltinStrBuilder
+                    | HeapBase::BuiltinMutex { .. }
+                    | HeapBase::BuiltinRwLock { .. }
+                    | HeapBase::BuiltinCell { .. }
+                    | HeapBase::BuiltinFuture { .. }
+                    | HeapBase::BuiltinChannelSend { .. }
+                    | HeapBase::BuiltinChannelRecv { .. }
+                    | HeapBase::Callable { .. }
+            ),
+            _ => false,
         }
     }
 
@@ -407,6 +811,12 @@ impl<'a> FnBuilder<'a> {
                 let op = self.value(v)?;
                 self.assign_or_copy(i.dst, i.ty, op)?;
             }
+            MpirOp::New { ty, fields } => {
+                self.emit_new_struct(i.dst, i.ty, *ty, fields)?;
+            }
+            MpirOp::GetField { obj, field } => {
+                self.emit_get_field(i.dst, i.ty, obj, field)?;
+            }
             MpirOp::IAdd { lhs, rhs } | MpirOp::IAddWrap { lhs, rhs } => {
                 self.emit_bin(i.dst, i.ty, "add", lhs, rhs)?
             }
@@ -546,6 +956,12 @@ impl<'a> FnBuilder<'a> {
                     self.set_local(i.dst, i.ty, dst_ty, dst);
                 }
             }
+            MpirOp::CallIndirect { callee, args } => {
+                self.emit_call_indirect(i.dst, i.ty, callee, args, false)?;
+            }
+            MpirOp::CallVoidIndirect { callee, args } => {
+                self.emit_call_indirect(i.dst, i.ty, callee, args, true)?;
+            }
             MpirOp::SuspendCall {
                 callee_sid, args, ..
             } => {
@@ -585,14 +1001,20 @@ impl<'a> FnBuilder<'a> {
                 .map_err(|e| e.to_string())?;
                 writeln!(self.out, "{ready_label}:").map_err(|e| e.to_string())?;
                 if dst_ty == "void" {
-                    writeln!(self.out, "  call void @mp_rt_future_take(ptr {fut}, ptr null)")
-                        .map_err(|e| e.to_string())?;
+                    writeln!(
+                        self.out,
+                        "  call void @mp_rt_future_take(ptr {fut}, ptr null)"
+                    )
+                    .map_err(|e| e.to_string())?;
                     self.set_default(i.dst, i.ty)?;
                 } else {
                     let slot = self.tmp();
                     writeln!(self.out, "  {slot} = alloca {dst_ty}").map_err(|e| e.to_string())?;
-                    writeln!(self.out, "  call void @mp_rt_future_take(ptr {fut}, ptr {slot})")
-                        .map_err(|e| e.to_string())?;
+                    writeln!(
+                        self.out,
+                        "  call void @mp_rt_future_take(ptr {fut}, ptr {slot})"
+                    )
+                    .map_err(|e| e.to_string())?;
                     writeln!(self.out, "  {dst} = load {dst_ty}, ptr {slot}")
                         .map_err(|e| e.to_string())?;
                     self.set_local(i.dst, i.ty, dst_ty, dst);
@@ -607,6 +1029,18 @@ impl<'a> FnBuilder<'a> {
                 writeln!(self.out, "  {dst} = phi {dst_ty} {}", parts.join(", "))
                     .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
+            }
+            MpirOp::EnumNew { variant, args } => {
+                self.emit_enum_new(i.dst, i.ty, variant, args)?;
+            }
+            MpirOp::EnumTag { v } => {
+                self.emit_enum_tag(i.dst, i.ty, v)?;
+            }
+            MpirOp::EnumPayload { variant, v } => {
+                self.emit_enum_payload(i.dst, i.ty, variant, v)?;
+            }
+            MpirOp::EnumIs { variant, v } => {
+                self.emit_enum_is(i.dst, i.ty, variant, v)?;
             }
             MpirOp::ArcRetain { v } => {
                 let p = self.ensure_ptr_value(v)?;
@@ -690,18 +1124,31 @@ impl<'a> FnBuilder<'a> {
                 let val = self.value(val)?;
                 let slot = self.stack_slot(&val)?;
                 let stat = self.tmp();
+                let eq_cb = callback_eq_symbol(val.ty_id);
                 writeln!(
                     self.out,
-                    "  {stat} = call i32 @mp_rt_arr_contains(ptr {arr}, ptr {slot}, i64 {}, ptr null)",
-                    self.cg.size_of_ty(val.ty_id)
+                    "  {stat} = call i32 @mp_rt_arr_contains(ptr {arr}, ptr {slot}, i64 {}, ptr @{eq_cb})",
+                    self.cg.size_of_ty(val.ty_id),
                 )
                 .map_err(|e| e.to_string())?;
                 self.assign_cast_int(i.dst, i.ty, stat, "i32")?;
             }
             MpirOp::ArrSort { arr } => {
                 let arr = self.ensure_ptr_value(arr)?;
-                writeln!(self.out, "  call void @mp_rt_arr_sort(ptr {arr}, ptr null)")
-                    .map_err(|e| e.to_string())?;
+                let cmp_cb = self
+                    .array_elem_ty_for_value(&arr)
+                    .map(callback_cmp_symbol)
+                    .unwrap_or_else(|| "0".to_string());
+                let cmp_ref = if cmp_cb == "0" {
+                    "null".to_string()
+                } else {
+                    format!("@{cmp_cb}")
+                };
+                writeln!(
+                    self.out,
+                    "  call void @mp_rt_arr_sort(ptr {arr}, ptr {cmp_ref})"
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_default(i.dst, i.ty)?;
             }
             MpirOp::ArrMap { arr, func } => {
@@ -804,10 +1251,12 @@ impl<'a> FnBuilder<'a> {
             MpirOp::MapNew { key_ty, val_ty } => {
                 let key_size = self.cg.size_of_ty(*key_ty);
                 let val_size = self.cg.size_of_ty(*val_ty);
+                let hash_cb = callback_hash_symbol(*key_ty);
+                let eq_cb = callback_eq_symbol(*key_ty);
                 writeln!(
                     self.out,
-                    "  {dst} = call ptr @mp_rt_map_new(i32 {}, i32 {}, i64 {}, i64 {}, i64 0, ptr null, ptr null)",
-                    key_ty.0, val_ty.0, key_size, val_size
+                    "  {dst} = call ptr @mp_rt_map_new(i32 {}, i32 {}, i64 {}, i64 {}, i64 0, ptr @{hash_cb}, ptr @{eq_cb})",
+                    key_ty.0, val_ty.0, key_size, val_size,
                 )
                 .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
@@ -844,6 +1293,21 @@ impl<'a> FnBuilder<'a> {
                     self.cg.size_of_ty(key.ty_id)
                 )
                 .map_err(|e| e.to_string())?;
+                let is_missing = self.tmp();
+                let panic_label = self.label("map_get_ref_panic");
+                let ok_label = self.label("map_get_ref_ok");
+                writeln!(self.out, "  {is_missing} = icmp eq ptr {dst}, null")
+                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  br i1 {is_missing}, label %{panic_label}, label %{ok_label}"
+                )
+                .map_err(|e| e.to_string())?;
+                writeln!(self.out, "{panic_label}:").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  call void @mp_rt_panic(ptr null)")
+                    .map_err(|e| e.to_string())?;
+                writeln!(self.out, "  unreachable").map_err(|e| e.to_string())?;
+                writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
             }
             MpirOp::MapSet { map, key, val } => {
@@ -997,6 +1461,46 @@ impl<'a> FnBuilder<'a> {
                 .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
             }
+            MpirOp::GpuThreadId
+            | MpirOp::GpuWorkgroupId
+            | MpirOp::GpuWorkgroupSize
+            | MpirOp::GpuGlobalId => {
+                self.assign_cast_int(i.dst, i.ty, "0".to_string(), "i32")?;
+            }
+            MpirOp::GpuBufferLen { buf } => {
+                let buf = self.ensure_ptr_value(buf)?;
+                let len = self.tmp();
+                writeln!(
+                    self.out,
+                    "  {len} = call i64 @mp_rt_gpu_buffer_len(ptr {buf})"
+                )
+                .map_err(|e| e.to_string())?;
+                self.assign_cast_int(i.dst, i.ty, len, "i64")?;
+            }
+            MpirOp::GpuBufferLoad { buf, idx } => {
+                self.emit_gpu_buffer_load(i.dst, i.ty, buf, idx)?;
+            }
+            MpirOp::GpuShared { ty, size } => {
+                self.emit_gpu_shared(i.dst, i.ty, *ty, size)?;
+            }
+            MpirOp::GpuLaunch {
+                device,
+                kernel,
+                groups,
+                threads,
+                args,
+            } => {
+                self.emit_gpu_launch(i.dst, i.ty, device, kernel, groups, threads, args, false)?;
+            }
+            MpirOp::GpuLaunchAsync {
+                device,
+                kernel,
+                groups,
+                threads,
+                args,
+            } => {
+                self.emit_gpu_launch(i.dst, i.ty, device, kernel, groups, threads, args, true)?;
+            }
             MpirOp::StrBuilderNew => {
                 writeln!(self.out, "  {dst} = call ptr @mp_rt_strbuilder_new()")
                     .map_err(|e| e.to_string())?;
@@ -1063,15 +1567,9 @@ impl<'a> FnBuilder<'a> {
             }
             MpirOp::Panic { msg } => {
                 let msg = self.ensure_ptr_value(msg)?;
-                writeln!(self.out, "  call noreturn void @mp_rt_panic(ptr {msg})")
+                writeln!(self.out, "  call void @mp_rt_panic(ptr {msg})")
                     .map_err(|e| e.to_string())?;
                 self.set_default(i.dst, i.ty)?;
-            }
-            other => {
-                return Err(format!(
-                    "unsupported MPIR op in llvm text lowering for fn '{}': {:?}",
-                    self.f.name, other
-                ));
             }
         }
         Ok(())
@@ -1086,12 +1584,30 @@ impl<'a> FnBuilder<'a> {
                 writeln!(self.out, "  call void @{}({})", mangle_fn(callee_sid), args)
                     .map_err(|e| e.to_string())?;
             }
+            MpirOpVoid::CallVoidIndirect { callee, args } => {
+                self.emit_call_indirect_void(callee, args)?;
+            }
+            MpirOpVoid::SetField { obj, field, value } => {
+                self.emit_set_field(obj, field, value)?;
+            }
             MpirOpVoid::ArrSet { arr, idx, val } => self.emit_arr_set(arr, idx, val)?,
             MpirOpVoid::ArrPush { arr, val } => self.emit_arr_push(arr, val)?,
             MpirOpVoid::ArrSort { arr } => {
                 let arr = self.ensure_ptr_value(arr)?;
-                writeln!(self.out, "  call void @mp_rt_arr_sort(ptr {arr}, ptr null)")
-                    .map_err(|e| e.to_string())?;
+                let cmp_cb = self
+                    .array_elem_ty_for_value(&arr)
+                    .map(callback_cmp_symbol)
+                    .unwrap_or_else(|| "0".to_string());
+                let cmp_ref = if cmp_cb == "0" {
+                    "null".to_string()
+                } else {
+                    format!("@{cmp_cb}")
+                };
+                writeln!(
+                    self.out,
+                    "  call void @mp_rt_arr_sort(ptr {arr}, ptr {cmp_ref})"
+                )
+                .map_err(|e| e.to_string())?;
             }
             MpirOpVoid::ArrForeach { arr, func } => {
                 let arr = self.ensure_ptr_value(arr)?;
@@ -1173,8 +1689,14 @@ impl<'a> FnBuilder<'a> {
             }
             MpirOpVoid::Panic { msg } => {
                 let msg = self.ensure_ptr_value(msg)?;
-                writeln!(self.out, "  call noreturn void @mp_rt_panic(ptr {msg})")
+                writeln!(self.out, "  call void @mp_rt_panic(ptr {msg})")
                     .map_err(|e| e.to_string())?;
+            }
+            MpirOpVoid::GpuBarrier => {
+                // CPU fallback runtime has no explicit barrier primitive.
+            }
+            MpirOpVoid::GpuBufferStore { buf, idx, val } => {
+                self.emit_gpu_buffer_store(buf, idx, val)?;
             }
             MpirOpVoid::ArcRetain { v } => {
                 let p = self.ensure_ptr_value(v)?;
@@ -1195,12 +1717,6 @@ impl<'a> FnBuilder<'a> {
                 let p = self.ensure_ptr_value(v)?;
                 writeln!(self.out, "  call void @mp_rt_release_weak(ptr {p})")
                     .map_err(|e| e.to_string())?;
-            }
-            other => {
-                return Err(format!(
-                    "unsupported MPIR void-op in llvm text lowering for fn '{}': {:?}",
-                    self.f.name, other
-                ));
             }
         }
         Ok(())
@@ -1501,7 +2017,7 @@ impl<'a> FnBuilder<'a> {
         let arr = self.ensure_ptr_value(arr)?;
         match self.cg.kind_of(dst_ty_id) {
             Some(TypeKind::BuiltinOption { inner }) => {
-                let inner_ty = self.cg.llvm_ty(*inner);
+                let inner_ty = self.cg.llvm_storage_ty(*inner);
                 let out = self.tmp();
                 writeln!(self.out, "  {out} = alloca {inner_ty}").map_err(|e| e.to_string())?;
                 let stat = self.tmp();
@@ -1571,6 +2087,1190 @@ impl<'a> FnBuilder<'a> {
         Ok(())
     }
 
+    fn emit_new_struct(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        new_ty: TypeId,
+        fields: &[(String, MpirValue)],
+    ) -> Result<(), String> {
+        match self.cg.kind_of(new_ty) {
+            Some(TypeKind::ValueStruct { sid }) => {
+                self.emit_new_value_struct(dst_id, dst_ty_id, sid, fields)
+            }
+            Some(TypeKind::HeapHandle {
+                base: HeapBase::UserType { type_sid, .. },
+                ..
+            }) => self.emit_new_heap_struct(dst_id, dst_ty_id, new_ty, type_sid, fields),
+            _ => self.set_default(dst_id, dst_ty_id),
+        }
+    }
+
+    fn emit_new_value_struct(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        sid: &Sid,
+        fields: &[(String, MpirValue)],
+    ) -> Result<(), String> {
+        let storage_ty = self.cg.llvm_storage_ty(dst_ty_id);
+        let slot = self.tmp();
+        writeln!(self.out, "  {slot} = alloca {storage_ty}").map_err(|e| e.to_string())?;
+        writeln!(self.out, "  store {storage_ty} zeroinitializer, ptr {slot}")
+            .map_err(|e| e.to_string())?;
+
+        for (name, value) in fields {
+            if let Some((field_ty, offset)) = self.cg.type_ctx.user_struct_field(sid, name) {
+                self.store_value_at_offset(&slot, offset, field_ty, value)?;
+            }
+        }
+
+        let loaded = format!("%l{}", dst_id.0);
+        writeln!(self.out, "  {loaded} = load {storage_ty}, ptr {slot}")
+            .map_err(|e| e.to_string())?;
+        self.set_local(dst_id, dst_ty_id, self.cg.llvm_ty(dst_ty_id), loaded);
+        Ok(())
+    }
+
+    fn emit_new_heap_struct(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        new_ty: TypeId,
+        sid: &Sid,
+        fields: &[(String, MpirValue)],
+    ) -> Result<(), String> {
+        let layout = self
+            .cg
+            .type_ctx
+            .user_struct_layout(sid)
+            .unwrap_or(magpie_types::TypeLayout {
+                size: 0,
+                align: 1,
+                fields: Vec::new(),
+            });
+        let payload_size = layout.size.max(1);
+        let payload_align = layout.align.max(1);
+
+        let obj = format!("%l{}", dst_id.0);
+        writeln!(
+            self.out,
+            "  {obj} = call ptr @mp_rt_alloc(i32 {}, i64 {payload_size}, i64 {payload_align}, i32 1)",
+            new_ty.0
+        )
+        .map_err(|e| e.to_string())?;
+
+        let payload_base = self.tmp();
+        writeln!(
+            self.out,
+            "  {payload_base} = getelementptr i8, ptr {obj}, i64 {}",
+            MP_RT_HEADER_SIZE
+        )
+        .map_err(|e| e.to_string())?;
+
+        for (name, value) in fields {
+            if let Some((field_ty, offset)) = self.cg.type_ctx.user_struct_field(sid, name) {
+                self.store_value_at_offset(&payload_base, offset, field_ty, value)?;
+            }
+        }
+
+        self.set_local(dst_id, dst_ty_id, self.cg.llvm_ty(dst_ty_id), obj);
+        Ok(())
+    }
+
+    fn emit_get_field(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        obj: &MpirValue,
+        field: &str,
+    ) -> Result<(), String> {
+        let obj_op = self.value(obj)?;
+        let Some((field_ty, field_offset, object_payload_offset)) =
+            self.resolve_field_access(obj_op.ty_id, field)
+        else {
+            return self.set_default(dst_id, dst_ty_id);
+        };
+
+        if self.cg.llvm_storage_ty(field_ty) == "i8" && self.cg.llvm_ty(dst_ty_id) == "void" {
+            return self.set_default(dst_id, dst_ty_id);
+        }
+
+        let obj_ptr = self.ensure_ptr(obj_op)?;
+        let base = if object_payload_offset == 0 {
+            obj_ptr
+        } else {
+            let tmp = self.tmp();
+            writeln!(
+                self.out,
+                "  {tmp} = getelementptr i8, ptr {obj_ptr}, i64 {object_payload_offset}"
+            )
+            .map_err(|e| e.to_string())?;
+            tmp
+        };
+
+        let ptr = self.tmp();
+        writeln!(
+            self.out,
+            "  {ptr} = getelementptr i8, ptr {base}, i64 {field_offset}"
+        )
+        .map_err(|e| e.to_string())?;
+
+        let storage_ty = self.cg.llvm_storage_ty(field_ty);
+        let loaded = self.tmp();
+        writeln!(self.out, "  {loaded} = load {storage_ty}, ptr {ptr}")
+            .map_err(|e| e.to_string())?;
+        self.assign_or_copy(
+            dst_id,
+            dst_ty_id,
+            Operand {
+                ty: storage_ty,
+                ty_id: field_ty,
+                repr: loaded,
+            },
+        )
+    }
+
+    fn emit_set_field(
+        &mut self,
+        obj: &MpirValue,
+        field: &str,
+        value: &MpirValue,
+    ) -> Result<(), String> {
+        let obj_op = self.value(obj)?;
+        let Some((field_ty, field_offset, object_payload_offset)) =
+            self.resolve_field_access(obj_op.ty_id, field)
+        else {
+            return Ok(());
+        };
+
+        let obj_ptr = self.ensure_ptr(obj_op)?;
+        let base = if object_payload_offset == 0 {
+            obj_ptr
+        } else {
+            let tmp = self.tmp();
+            writeln!(
+                self.out,
+                "  {tmp} = getelementptr i8, ptr {obj_ptr}, i64 {object_payload_offset}"
+            )
+            .map_err(|e| e.to_string())?;
+            tmp
+        };
+
+        self.store_value_at_offset(&base, field_offset, field_ty, value)
+    }
+
+    fn resolve_field_access(&self, ty: TypeId, field: &str) -> Option<(TypeId, u64, u64)> {
+        match self.cg.kind_of(ty) {
+            Some(TypeKind::ValueStruct { sid }) => self
+                .cg
+                .type_ctx
+                .user_struct_field(sid, field)
+                .map(|(field_ty, field_offset)| (field_ty, field_offset, 0)),
+            Some(TypeKind::HeapHandle {
+                base: HeapBase::UserType { type_sid, .. },
+                ..
+            }) => self
+                .cg
+                .type_ctx
+                .user_struct_field(type_sid, field)
+                .map(|(field_ty, field_offset)| (field_ty, field_offset, MP_RT_HEADER_SIZE)),
+            _ => None,
+        }
+    }
+
+    fn store_value_at_offset(
+        &mut self,
+        base_ptr: &str,
+        byte_offset: u64,
+        field_ty: TypeId,
+        value: &MpirValue,
+    ) -> Result<(), String> {
+        let ptr = self.tmp();
+        writeln!(
+            self.out,
+            "  {ptr} = getelementptr i8, ptr {base_ptr}, i64 {byte_offset}"
+        )
+        .map_err(|e| e.to_string())?;
+
+        let field_storage_ty = self.cg.llvm_storage_ty(field_ty);
+        let value_op = self.value(value)?;
+
+        if field_storage_ty == "i8" && value_op.ty == "void" {
+            writeln!(self.out, "  store i8 0, ptr {ptr}").map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+
+        if value_op.ty == field_storage_ty {
+            writeln!(
+                self.out,
+                "  store {field_storage_ty} {}, ptr {ptr}",
+                value_op.repr
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+
+        writeln!(
+            self.out,
+            "  store {field_storage_ty} {}, ptr {ptr}",
+            self.zero_lit(&field_storage_ty)
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn emit_call_indirect(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        callee: &MpirValue,
+        args: &[MpirValue],
+        force_void: bool,
+    ) -> Result<(), String> {
+        let callee = self.ensure_ptr_value(callee)?;
+        let fn_ptr = self.tmp();
+        writeln!(
+            self.out,
+            "  {fn_ptr} = call ptr @mp_rt_callable_fn_ptr(ptr {callee})"
+        )
+        .map_err(|e| e.to_string())?;
+        let data_ptr = self.tmp();
+        writeln!(
+            self.out,
+            "  {data_ptr} = call ptr @mp_rt_callable_data_ptr(ptr {callee})"
+        )
+        .map_err(|e| e.to_string())?;
+
+        let args = if args.is_empty() {
+            format!("ptr {data_ptr}")
+        } else {
+            format!("ptr {data_ptr}, {}", self.call_args(args)?)
+        };
+        let dst_ty = self.cg.llvm_ty(dst_ty_id);
+        if force_void || dst_ty == "void" {
+            writeln!(self.out, "  call void {fn_ptr}({args})").map_err(|e| e.to_string())?;
+            return self.set_default(dst_id, dst_ty_id);
+        }
+
+        let dst = format!("%l{}", dst_id.0);
+        writeln!(self.out, "  {dst} = call {dst_ty} {fn_ptr}({args})")
+            .map_err(|e| e.to_string())?;
+        self.set_local(dst_id, dst_ty_id, dst_ty, dst);
+        Ok(())
+    }
+
+    fn emit_call_indirect_void(
+        &mut self,
+        callee: &MpirValue,
+        args: &[MpirValue],
+    ) -> Result<(), String> {
+        let callee = self.ensure_ptr_value(callee)?;
+        let fn_ptr = self.tmp();
+        writeln!(
+            self.out,
+            "  {fn_ptr} = call ptr @mp_rt_callable_fn_ptr(ptr {callee})"
+        )
+        .map_err(|e| e.to_string())?;
+        let data_ptr = self.tmp();
+        writeln!(
+            self.out,
+            "  {data_ptr} = call ptr @mp_rt_callable_data_ptr(ptr {callee})"
+        )
+        .map_err(|e| e.to_string())?;
+        let args = if args.is_empty() {
+            format!("ptr {data_ptr}")
+        } else {
+            format!("ptr {data_ptr}, {}", self.call_args(args)?)
+        };
+        writeln!(self.out, "  call void {fn_ptr}({args})").map_err(|e| e.to_string())
+    }
+
+    fn emit_enum_new(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        variant: &str,
+        args: &[(String, MpirValue)],
+    ) -> Result<(), String> {
+        match self.cg.kind_of(dst_ty_id) {
+            Some(TypeKind::BuiltinOption { inner }) => {
+                let agg_ty = self.cg.llvm_ty(dst_ty_id);
+                let payload_ty = self.cg.llvm_storage_ty(*inner);
+                let tag_value = if variant == "Some" { "1" } else { "0" };
+                let payload = args
+                    .iter()
+                    .find(|(name, _)| name == "v")
+                    .and_then(|(_, value)| self.value(value).ok())
+                    .filter(|op| op.ty == payload_ty)
+                    .map(|op| op.repr)
+                    .unwrap_or_else(|| self.zero_lit(&payload_ty));
+
+                let tmp0 = self.tmp();
+                writeln!(
+                    self.out,
+                    "  {tmp0} = insertvalue {agg_ty} undef, {payload_ty} {payload}, 0"
+                )
+                .map_err(|e| e.to_string())?;
+                let dst = format!("%l{}", dst_id.0);
+                writeln!(
+                    self.out,
+                    "  {dst} = insertvalue {agg_ty} {tmp0}, i1 {tag_value}, 1"
+                )
+                .map_err(|e| e.to_string())?;
+                self.set_local(dst_id, dst_ty_id, agg_ty, dst);
+                Ok(())
+            }
+            Some(TypeKind::BuiltinResult { ok, err }) => {
+                let agg_ty = self.cg.llvm_ty(dst_ty_id);
+                let ok_ty = self.cg.llvm_storage_ty(*ok);
+                let err_ty = self.cg.llvm_storage_ty(*err);
+                let is_err = variant == "Err";
+                let ok_payload = args
+                    .iter()
+                    .find(|(name, _)| name == "v")
+                    .and_then(|(_, value)| self.value(value).ok())
+                    .filter(|op| op.ty == ok_ty)
+                    .map(|op| op.repr)
+                    .unwrap_or_else(|| self.zero_lit(&ok_ty));
+                let err_payload = args
+                    .iter()
+                    .find(|(name, _)| name == "e")
+                    .and_then(|(_, value)| self.value(value).ok())
+                    .filter(|op| op.ty == err_ty)
+                    .map(|op| op.repr)
+                    .unwrap_or_else(|| self.zero_lit(&err_ty));
+
+                let tmp0 = self.tmp();
+                writeln!(
+                    self.out,
+                    "  {tmp0} = insertvalue {agg_ty} undef, i1 {}, 0",
+                    if is_err { 1 } else { 0 }
+                )
+                .map_err(|e| e.to_string())?;
+                let tmp1 = self.tmp();
+                writeln!(
+                    self.out,
+                    "  {tmp1} = insertvalue {agg_ty} {tmp0}, {ok_ty} {}, 1",
+                    if is_err {
+                        self.zero_lit(&ok_ty)
+                    } else {
+                        ok_payload
+                    }
+                )
+                .map_err(|e| e.to_string())?;
+                let dst = format!("%l{}", dst_id.0);
+                writeln!(
+                    self.out,
+                    "  {dst} = insertvalue {agg_ty} {tmp1}, {err_ty} {}, 2",
+                    if is_err {
+                        err_payload
+                    } else {
+                        self.zero_lit(&err_ty)
+                    }
+                )
+                .map_err(|e| e.to_string())?;
+                self.set_local(dst_id, dst_ty_id, agg_ty, dst);
+                Ok(())
+            }
+            Some(TypeKind::ValueStruct { sid })
+                if self.cg.type_ctx.user_enum_variants(sid).is_some() =>
+            {
+                self.emit_user_enum_new_value(dst_id, dst_ty_id, sid, variant, args)
+            }
+            Some(TypeKind::HeapHandle {
+                base: HeapBase::UserType { type_sid, .. },
+                ..
+            }) if self.cg.type_ctx.user_enum_variants(type_sid).is_some() => {
+                self.emit_user_enum_new_heap(dst_id, dst_ty_id, type_sid, variant, args)
+            }
+            _ => self.set_default(dst_id, dst_ty_id),
+        }
+    }
+
+    fn emit_enum_tag(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        v: &MpirValue,
+    ) -> Result<(), String> {
+        let op = self.value(v)?;
+        let tag_i32 = match self.cg.kind_of(op.ty_id) {
+            Some(TypeKind::BuiltinOption { .. }) => {
+                let tag = self.tmp();
+                writeln!(self.out, "  {tag} = extractvalue {} {}, 1", op.ty, op.repr)
+                    .map_err(|e| e.to_string())?;
+                let z = self.tmp();
+                writeln!(self.out, "  {z} = zext i1 {tag} to i32").map_err(|e| e.to_string())?;
+                z
+            }
+            Some(TypeKind::BuiltinResult { .. }) => {
+                let tag = self.tmp();
+                writeln!(self.out, "  {tag} = extractvalue {} {}, 0", op.ty, op.repr)
+                    .map_err(|e| e.to_string())?;
+                let z = self.tmp();
+                writeln!(self.out, "  {z} = zext i1 {tag} to i32").map_err(|e| e.to_string())?;
+                z
+            }
+            Some(TypeKind::ValueStruct { sid })
+                if self.cg.type_ctx.user_enum_variants(sid).is_some() =>
+            {
+                self.load_user_enum_tag_from_value(&op)?
+            }
+            Some(TypeKind::HeapHandle {
+                base: HeapBase::UserType { type_sid, .. },
+                ..
+            }) if self.cg.type_ctx.user_enum_variants(type_sid).is_some() => {
+                self.load_user_enum_tag_from_heap(&op)?
+            }
+            _ => "0".to_string(),
+        };
+        self.assign_cast_int(dst_id, dst_ty_id, tag_i32, "i32")
+    }
+
+    fn emit_enum_payload(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        variant: &str,
+        v: &MpirValue,
+    ) -> Result<(), String> {
+        let op = self.value(v)?;
+        match self.cg.kind_of(op.ty_id) {
+            Some(TypeKind::BuiltinOption { inner }) => {
+                if variant != "Some" {
+                    return self.set_default(dst_id, dst_ty_id);
+                }
+                let payload_ty = self.cg.llvm_storage_ty(*inner);
+                let payload = self.tmp();
+                writeln!(
+                    self.out,
+                    "  {payload} = extractvalue {} {}, 0",
+                    op.ty, op.repr
+                )
+                .map_err(|e| e.to_string())?;
+                self.assign_or_copy(
+                    dst_id,
+                    dst_ty_id,
+                    Operand {
+                        ty: payload_ty,
+                        ty_id: *inner,
+                        repr: payload,
+                    },
+                )
+            }
+            Some(TypeKind::BuiltinResult { ok, err }) => {
+                let (idx, payload_ty_id) = if variant == "Err" {
+                    (2, *err)
+                } else {
+                    (1, *ok)
+                };
+                let payload_ty = self.cg.llvm_storage_ty(payload_ty_id);
+                let payload = self.tmp();
+                writeln!(
+                    self.out,
+                    "  {payload} = extractvalue {} {}, {}",
+                    op.ty, op.repr, idx
+                )
+                .map_err(|e| e.to_string())?;
+                self.assign_or_copy(
+                    dst_id,
+                    dst_ty_id,
+                    Operand {
+                        ty: payload_ty,
+                        ty_id: payload_ty_id,
+                        repr: payload,
+                    },
+                )
+            }
+            Some(TypeKind::ValueStruct { sid })
+                if self.cg.type_ctx.user_enum_variants(sid).is_some() =>
+            {
+                self.emit_user_enum_payload_value(dst_id, dst_ty_id, sid, variant, &op)
+            }
+            Some(TypeKind::HeapHandle {
+                base: HeapBase::UserType { type_sid, .. },
+                ..
+            }) if self.cg.type_ctx.user_enum_variants(type_sid).is_some() => {
+                self.emit_user_enum_payload_heap(dst_id, dst_ty_id, type_sid, variant, &op)
+            }
+            _ => self.set_default(dst_id, dst_ty_id),
+        }
+    }
+
+    fn emit_enum_is(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        variant: &str,
+        v: &MpirValue,
+    ) -> Result<(), String> {
+        let op = self.value(v)?;
+        let (tag_idx, expected) = match self.cg.kind_of(op.ty_id) {
+            Some(TypeKind::BuiltinOption { .. }) => (1, if variant == "Some" { 1 } else { 0 }),
+            Some(TypeKind::BuiltinResult { .. }) => (0, if variant == "Err" { 1 } else { 0 }),
+            Some(TypeKind::ValueStruct { sid })
+                if self.cg.type_ctx.user_enum_variants(sid).is_some() =>
+            {
+                let tag_i32 = self.load_user_enum_tag_from_value(&op)?;
+                return self.emit_enum_is_from_tag(
+                    dst_id,
+                    dst_ty_id,
+                    tag_i32,
+                    self.cg
+                        .type_ctx
+                        .user_enum_variant_tag(sid, variant)
+                        .unwrap_or(0),
+                );
+            }
+            Some(TypeKind::HeapHandle {
+                base: HeapBase::UserType { type_sid, .. },
+                ..
+            }) if self.cg.type_ctx.user_enum_variants(type_sid).is_some() => {
+                let tag_i32 = self.load_user_enum_tag_from_heap(&op)?;
+                return self.emit_enum_is_from_tag(
+                    dst_id,
+                    dst_ty_id,
+                    tag_i32,
+                    self.cg
+                        .type_ctx
+                        .user_enum_variant_tag(type_sid, variant)
+                        .unwrap_or(0),
+                );
+            }
+            _ => return self.set_default(dst_id, dst_ty_id),
+        };
+        let tag = self.tmp();
+        writeln!(
+            self.out,
+            "  {tag} = extractvalue {} {}, {}",
+            op.ty, op.repr, tag_idx
+        )
+        .map_err(|e| e.to_string())?;
+        let tag_i32 = self.tmp();
+        writeln!(self.out, "  {tag_i32} = zext i1 {tag} to i32").map_err(|e| e.to_string())?;
+        self.emit_enum_is_from_tag(dst_id, dst_ty_id, tag_i32, expected)
+    }
+
+    fn emit_enum_is_from_tag(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        tag_i32: String,
+        expected: i32,
+    ) -> Result<(), String> {
+        let is_variant = self.tmp();
+        writeln!(
+            self.out,
+            "  {is_variant} = icmp eq i32 {tag_i32}, {expected}"
+        )
+        .map_err(|e| e.to_string())?;
+        self.assign_cast_int(dst_id, dst_ty_id, is_variant, "i1")
+    }
+
+    fn emit_user_enum_new_value(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        sid: &Sid,
+        variant: &str,
+        args: &[(String, MpirValue)],
+    ) -> Result<(), String> {
+        let storage_ty = self.cg.llvm_storage_ty(dst_ty_id);
+        let slot = self.tmp();
+        writeln!(self.out, "  {slot} = alloca {storage_ty}").map_err(|e| e.to_string())?;
+        writeln!(self.out, "  store {storage_ty} zeroinitializer, ptr {slot}")
+            .map_err(|e| e.to_string())?;
+
+        let tag = self
+            .cg
+            .type_ctx
+            .user_enum_variant_tag(sid, variant)
+            .unwrap_or(0);
+        writeln!(self.out, "  store i32 {tag}, ptr {slot}").map_err(|e| e.to_string())?;
+
+        let payload_offset = self.cg.type_ctx.user_enum_payload_offset(sid).unwrap_or(0);
+        if let Some((_, fields)) = self
+            .cg
+            .type_ctx
+            .user_enum_variants(sid)
+            .and_then(|variants| variants.iter().find(|(name, _)| name == variant))
+        {
+            for (idx, (field_name, field_ty)) in fields.iter().enumerate() {
+                let Some(value) = self.enum_variant_arg(args, field_name, idx) else {
+                    continue;
+                };
+                if let Some((_, field_offset)) = self
+                    .cg
+                    .type_ctx
+                    .user_enum_variant_field(sid, variant, field_name)
+                {
+                    self.store_value_at_offset(
+                        &slot,
+                        payload_offset.saturating_add(field_offset),
+                        *field_ty,
+                        value,
+                    )?;
+                }
+            }
+        }
+
+        let dst = format!("%l{}", dst_id.0);
+        writeln!(self.out, "  {dst} = load {storage_ty}, ptr {slot}").map_err(|e| e.to_string())?;
+        self.set_local(dst_id, dst_ty_id, self.cg.llvm_ty(dst_ty_id), dst);
+        Ok(())
+    }
+
+    fn emit_user_enum_new_heap(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        sid: &Sid,
+        variant: &str,
+        args: &[(String, MpirValue)],
+    ) -> Result<(), String> {
+        let layout = self
+            .cg
+            .type_ctx
+            .user_enum_layout(sid)
+            .unwrap_or(magpie_types::TypeLayout {
+                size: 0,
+                align: 1,
+                fields: Vec::new(),
+            });
+        let payload_size = layout.size.max(1);
+        let payload_align = layout.align.max(1);
+        let dst = format!("%l{}", dst_id.0);
+        writeln!(
+            self.out,
+            "  {dst} = call ptr @mp_rt_alloc(i32 {}, i64 {payload_size}, i64 {payload_align}, i32 1)",
+            dst_ty_id.0
+        )
+        .map_err(|e| e.to_string())?;
+
+        let payload_base = self.tmp();
+        writeln!(
+            self.out,
+            "  {payload_base} = getelementptr i8, ptr {dst}, i64 {MP_RT_HEADER_SIZE}"
+        )
+        .map_err(|e| e.to_string())?;
+
+        let tag = self
+            .cg
+            .type_ctx
+            .user_enum_variant_tag(sid, variant)
+            .unwrap_or(0);
+        writeln!(self.out, "  store i32 {tag}, ptr {payload_base}").map_err(|e| e.to_string())?;
+
+        let payload_offset = self.cg.type_ctx.user_enum_payload_offset(sid).unwrap_or(0);
+        if let Some((_, fields)) = self
+            .cg
+            .type_ctx
+            .user_enum_variants(sid)
+            .and_then(|variants| variants.iter().find(|(name, _)| name == variant))
+        {
+            for (idx, (field_name, field_ty)) in fields.iter().enumerate() {
+                let Some(value) = self.enum_variant_arg(args, field_name, idx) else {
+                    continue;
+                };
+                if let Some((_, field_offset)) = self
+                    .cg
+                    .type_ctx
+                    .user_enum_variant_field(sid, variant, field_name)
+                {
+                    self.store_value_at_offset(
+                        &payload_base,
+                        payload_offset.saturating_add(field_offset),
+                        *field_ty,
+                        value,
+                    )?;
+                }
+            }
+        }
+
+        self.set_local(dst_id, dst_ty_id, self.cg.llvm_ty(dst_ty_id), dst);
+        Ok(())
+    }
+
+    fn emit_user_enum_payload_value(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        sid: &Sid,
+        variant: &str,
+        op: &Operand,
+    ) -> Result<(), String> {
+        let Some((field_ty, byte_offset)) = self.first_variant_field_offset(sid, variant) else {
+            return self.set_default(dst_id, dst_ty_id);
+        };
+
+        let slot = self.tmp();
+        writeln!(self.out, "  {slot} = alloca {}", op.ty).map_err(|e| e.to_string())?;
+        writeln!(self.out, "  store {} {}, ptr {slot}", op.ty, op.repr)
+            .map_err(|e| e.to_string())?;
+        self.load_field_from_offset(dst_id, dst_ty_id, field_ty, &slot, byte_offset)
+    }
+
+    fn emit_user_enum_payload_heap(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        sid: &Sid,
+        variant: &str,
+        op: &Operand,
+    ) -> Result<(), String> {
+        let Some((field_ty, payload_rel_offset)) = self.first_variant_field_offset(sid, variant)
+        else {
+            return self.set_default(dst_id, dst_ty_id);
+        };
+        let obj_ptr = self.ensure_ptr(op.clone())?;
+        let payload_base = self.tmp();
+        writeln!(
+            self.out,
+            "  {payload_base} = getelementptr i8, ptr {obj_ptr}, i64 {MP_RT_HEADER_SIZE}"
+        )
+        .map_err(|e| e.to_string())?;
+        self.load_field_from_offset(
+            dst_id,
+            dst_ty_id,
+            field_ty,
+            &payload_base,
+            payload_rel_offset,
+        )
+    }
+
+    fn load_user_enum_tag_from_value(&mut self, op: &Operand) -> Result<String, String> {
+        let slot = self.tmp();
+        writeln!(self.out, "  {slot} = alloca {}", op.ty).map_err(|e| e.to_string())?;
+        writeln!(self.out, "  store {} {}, ptr {slot}", op.ty, op.repr)
+            .map_err(|e| e.to_string())?;
+        let tag = self.tmp();
+        writeln!(self.out, "  {tag} = load i32, ptr {slot}").map_err(|e| e.to_string())?;
+        Ok(tag)
+    }
+
+    fn load_user_enum_tag_from_heap(&mut self, op: &Operand) -> Result<String, String> {
+        let obj_ptr = self.ensure_ptr(op.clone())?;
+        let payload_base = self.tmp();
+        writeln!(
+            self.out,
+            "  {payload_base} = getelementptr i8, ptr {obj_ptr}, i64 {MP_RT_HEADER_SIZE}"
+        )
+        .map_err(|e| e.to_string())?;
+        let tag = self.tmp();
+        writeln!(self.out, "  {tag} = load i32, ptr {payload_base}").map_err(|e| e.to_string())?;
+        Ok(tag)
+    }
+
+    fn first_variant_field_offset(&self, sid: &Sid, variant: &str) -> Option<(TypeId, u64)> {
+        let payload_offset = self.cg.type_ctx.user_enum_payload_offset(sid).unwrap_or(0);
+        let (_, fields) = self
+            .cg
+            .type_ctx
+            .user_enum_variants(sid)?
+            .iter()
+            .find(|(name, _)| name == variant)?;
+        let (field_name, field_ty) = fields.first()?;
+        let (_, field_offset) = self
+            .cg
+            .type_ctx
+            .user_enum_variant_field(sid, variant, field_name)?;
+        Some((*field_ty, payload_offset.saturating_add(field_offset)))
+    }
+
+    fn enum_variant_arg<'b>(
+        &self,
+        args: &'b [(String, MpirValue)],
+        field_name: &str,
+        idx: usize,
+    ) -> Option<&'b MpirValue> {
+        args.iter()
+            .find(|(name, _)| name == field_name)
+            .or_else(|| args.get(idx))
+            .map(|(_, value)| value)
+    }
+
+    fn load_field_from_offset(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        field_ty: TypeId,
+        base_ptr: &str,
+        byte_offset: u64,
+    ) -> Result<(), String> {
+        let field_ptr = self.tmp();
+        writeln!(
+            self.out,
+            "  {field_ptr} = getelementptr i8, ptr {base_ptr}, i64 {byte_offset}"
+        )
+        .map_err(|e| e.to_string())?;
+        let storage_ty = self.cg.llvm_storage_ty(field_ty);
+        let loaded = self.tmp();
+        writeln!(self.out, "  {loaded} = load {storage_ty}, ptr {field_ptr}")
+            .map_err(|e| e.to_string())?;
+        self.assign_or_copy(
+            dst_id,
+            dst_ty_id,
+            Operand {
+                ty: storage_ty,
+                ty_id: field_ty,
+                repr: loaded,
+            },
+        )
+    }
+
+    fn emit_gpu_buffer_load(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        buf: &MpirValue,
+        idx: &MpirValue,
+    ) -> Result<(), String> {
+        let dst_ty = self.cg.llvm_ty(dst_ty_id);
+        if dst_ty == "void" {
+            self.set_default(dst_id, dst_ty_id)?;
+            return Ok(());
+        }
+
+        let buf = self.ensure_ptr_value(buf)?;
+        let idx = self.cast_i64_value(idx)?;
+        let elem_size = self.cg.size_of_ty(dst_ty_id).max(1);
+        let offset = self.tmp();
+        writeln!(self.out, "  {offset} = mul i64 {idx}, {elem_size}").map_err(|e| e.to_string())?;
+
+        let storage_ty = self.cg.llvm_storage_ty(dst_ty_id);
+        let slot = self.tmp();
+        writeln!(self.out, "  {slot} = alloca {storage_ty}").map_err(|e| e.to_string())?;
+        writeln!(
+            self.out,
+            "  call i32 @mp_rt_gpu_buffer_read(ptr {buf}, i64 {offset}, ptr {slot}, i64 {elem_size})"
+        )
+        .map_err(|e| e.to_string())?;
+
+        let loaded = self.tmp();
+        writeln!(self.out, "  {loaded} = load {storage_ty}, ptr {slot}")
+            .map_err(|e| e.to_string())?;
+        self.assign_or_copy(
+            dst_id,
+            dst_ty_id,
+            Operand {
+                ty: storage_ty,
+                ty_id: dst_ty_id,
+                repr: loaded,
+            },
+        )
+    }
+
+    fn emit_gpu_buffer_store(
+        &mut self,
+        buf: &MpirValue,
+        idx: &MpirValue,
+        val: &MpirValue,
+    ) -> Result<(), String> {
+        let buf = self.ensure_ptr_value(buf)?;
+        let idx = self.cast_i64_value(idx)?;
+        let val = self.value(val)?;
+        let elem_size = self.cg.size_of_ty(val.ty_id).max(1);
+        let offset = self.tmp();
+        writeln!(self.out, "  {offset} = mul i64 {idx}, {elem_size}").map_err(|e| e.to_string())?;
+
+        if val.ty == "void" {
+            let slot = self.tmp();
+            writeln!(self.out, "  {slot} = alloca i8").map_err(|e| e.to_string())?;
+            writeln!(self.out, "  store i8 0, ptr {slot}").map_err(|e| e.to_string())?;
+            writeln!(
+                self.out,
+                "  call i32 @mp_rt_gpu_buffer_write(ptr {buf}, i64 {offset}, ptr {slot}, i64 1)"
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+
+        let slot = self.stack_slot(&val)?;
+        writeln!(
+            self.out,
+            "  call i32 @mp_rt_gpu_buffer_write(ptr {buf}, i64 {offset}, ptr {slot}, i64 {elem_size})"
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn emit_gpu_shared(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        elem_ty: TypeId,
+        size: &MpirValue,
+    ) -> Result<(), String> {
+        let dst_ty = self.cg.llvm_ty(dst_ty_id);
+        if dst_ty == "void" {
+            self.set_default(dst_id, dst_ty_id)?;
+            return Ok(());
+        }
+
+        let count = self.cast_i64_value(size)?;
+        let elem_size = self.cg.size_of_ty(elem_ty).max(1);
+        let total = self.tmp();
+        writeln!(self.out, "  {total} = mul i64 {count}, {elem_size}")
+            .map_err(|e| e.to_string())?;
+
+        let alloc = self.tmp();
+        writeln!(self.out, "  {alloc} = alloca i8, i64 {total}").map_err(|e| e.to_string())?;
+
+        if dst_ty == "ptr" {
+            self.set_local(dst_id, dst_ty_id, dst_ty, alloc);
+            return Ok(());
+        }
+        if is_int_ty(&dst_ty) {
+            let casted = self.tmp();
+            writeln!(self.out, "  {casted} = ptrtoint ptr {alloc} to {dst_ty}")
+                .map_err(|e| e.to_string())?;
+            self.set_local(dst_id, dst_ty_id, dst_ty, casted);
+            return Ok(());
+        }
+
+        let casted = self.tmp();
+        writeln!(self.out, "  {casted} = bitcast ptr {alloc} to {dst_ty}")
+            .map_err(|e| e.to_string())?;
+        self.set_local(dst_id, dst_ty_id, dst_ty, casted);
+        Ok(())
+    }
+
+    fn emit_gpu_launch(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        device: &MpirValue,
+        kernel: &Sid,
+        groups: &MpirValue,
+        threads: &MpirValue,
+        args: &[MpirValue],
+        is_async: bool,
+    ) -> Result<(), String> {
+        let device = self.ensure_ptr_value(device)?;
+        let groups = self.cast_i32_value(groups)?;
+        let threads = self.cast_i32_value(threads)?;
+        let (args_blob, args_len) = self.build_gpu_launch_args_blob(kernel, args)?;
+
+        let err_slot = self.tmp();
+        writeln!(self.out, "  {err_slot} = alloca ptr").map_err(|e| e.to_string())?;
+        writeln!(self.out, "  store ptr null, ptr {err_slot}").map_err(|e| e.to_string())?;
+
+        let status = self.tmp();
+        let sid_hash = sid_hash_64(kernel);
+
+        if is_async {
+            let fence_slot = self.tmp();
+            writeln!(self.out, "  {fence_slot} = alloca ptr").map_err(|e| e.to_string())?;
+            writeln!(self.out, "  store ptr null, ptr {fence_slot}").map_err(|e| e.to_string())?;
+            writeln!(
+                self.out,
+                "  {status} = call i32 @mp_rt_gpu_launch_async(ptr {device}, i64 {sid_hash}, i32 {groups}, i32 1, i32 1, i32 {threads}, i32 1, i32 1, ptr {args_blob}, i64 {args_len}, ptr {fence_slot}, ptr {err_slot})"
+            )
+            .map_err(|e| e.to_string())?;
+            let fence = self.tmp();
+            writeln!(self.out, "  {fence} = load ptr, ptr {fence_slot}")
+                .map_err(|e| e.to_string())?;
+            let err = self.tmp();
+            writeln!(self.out, "  {err} = load ptr, ptr {err_slot}").map_err(|e| e.to_string())?;
+            self.assign_gpu_launch_result(dst_id, dst_ty_id, status, Some(fence), err)?;
+        } else {
+            writeln!(
+                self.out,
+                "  {status} = call i32 @mp_rt_gpu_launch_sync(ptr {device}, i64 {sid_hash}, i32 {groups}, i32 1, i32 1, i32 {threads}, i32 1, i32 1, ptr {args_blob}, i64 {args_len}, ptr {err_slot})"
+            )
+            .map_err(|e| e.to_string())?;
+            let err = self.tmp();
+            writeln!(self.out, "  {err} = load ptr, ptr {err_slot}").map_err(|e| e.to_string())?;
+            self.assign_gpu_launch_result(dst_id, dst_ty_id, status, None, err)?;
+        }
+
+        Ok(())
+    }
+
+    fn assign_gpu_launch_result(
+        &mut self,
+        dst_id: magpie_types::LocalId,
+        dst_ty_id: TypeId,
+        status: String,
+        ok_value: Option<String>,
+        err_value: String,
+    ) -> Result<(), String> {
+        if let Some(TypeKind::BuiltinResult { ok, err }) = self.cg.kind_of(dst_ty_id) {
+            let agg_ty = self.cg.llvm_ty(dst_ty_id);
+            let ok_ty = self.cg.llvm_storage_ty(*ok);
+            let err_ty = self.cg.llvm_storage_ty(*err);
+            let ok_payload = ok_value.unwrap_or_else(|| self.zero_lit(&ok_ty));
+            let err_zero = self.zero_lit(&err_ty);
+            let err_payload = if err_ty == "ptr" {
+                err_value
+            } else {
+                err_zero.clone()
+            };
+
+            let is_ok = self.tmp();
+            writeln!(self.out, "  {is_ok} = icmp eq i32 {status}, 0").map_err(|e| e.to_string())?;
+
+            let ok0 = self.tmp();
+            writeln!(self.out, "  {ok0} = insertvalue {agg_ty} undef, i1 1, 0")
+                .map_err(|e| e.to_string())?;
+            let ok1 = self.tmp();
+            writeln!(
+                self.out,
+                "  {ok1} = insertvalue {agg_ty} {ok0}, {ok_ty} {ok_payload}, 1"
+            )
+            .map_err(|e| e.to_string())?;
+            let ok2 = self.tmp();
+            writeln!(
+                self.out,
+                "  {ok2} = insertvalue {agg_ty} {ok1}, {err_ty} {err_zero}, 2"
+            )
+            .map_err(|e| e.to_string())?;
+
+            let err0 = self.tmp();
+            writeln!(self.out, "  {err0} = insertvalue {agg_ty} undef, i1 0, 0")
+                .map_err(|e| e.to_string())?;
+            let err1 = self.tmp();
+            writeln!(
+                self.out,
+                "  {err1} = insertvalue {agg_ty} {err0}, {ok_ty} {}, 1",
+                self.zero_lit(&ok_ty)
+            )
+            .map_err(|e| e.to_string())?;
+            let err2 = self.tmp();
+            writeln!(
+                self.out,
+                "  {err2} = insertvalue {agg_ty} {err1}, {err_ty} {err_payload}, 2"
+            )
+            .map_err(|e| e.to_string())?;
+
+            let dst = format!("%l{}", dst_id.0);
+            writeln!(
+                self.out,
+                "  {dst} = select i1 {is_ok}, {agg_ty} {ok2}, {agg_ty} {err2}"
+            )
+            .map_err(|e| e.to_string())?;
+            self.set_local(dst_id, dst_ty_id, agg_ty, dst);
+            return Ok(());
+        }
+
+        let dst_ty = self.cg.llvm_ty(dst_ty_id);
+        if is_int_ty(&dst_ty) || dst_ty == "i1" {
+            return self.assign_cast_int(dst_id, dst_ty_id, status, "i32");
+        }
+        self.set_default(dst_id, dst_ty_id)
+    }
+
+    fn build_gpu_launch_args_blob(
+        &mut self,
+        kernel: &Sid,
+        args: &[MpirValue],
+    ) -> Result<(String, u64), String> {
+        if args.is_empty() {
+            return Ok(("null".to_string(), 0));
+        }
+
+        let arg_ops = args
+            .iter()
+            .map(|arg| self.value(arg))
+            .collect::<Result<Vec<_>, _>>()?;
+        let kernel_params = self
+            .cg
+            .mpir
+            .functions
+            .iter()
+            .find(|f| &f.sid == kernel)
+            .map(|f| f.params.iter().map(|(_, ty)| *ty).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        #[derive(Clone, Copy)]
+        struct ArgLayout {
+            ty: TypeId,
+            is_buffer: bool,
+            offset: u64,
+        }
+
+        let mut layouts = Vec::with_capacity(arg_ops.len());
+        let mut num_buffers = 0_u64;
+        let mut scalar_offset = 0_u64;
+
+        for (idx, op) in arg_ops.iter().enumerate() {
+            let ty = kernel_params.get(idx).copied().unwrap_or(op.ty_id);
+            if self.cg.is_gpu_buffer_param_ty(ty) {
+                layouts.push(ArgLayout {
+                    ty,
+                    is_buffer: true,
+                    offset: num_buffers.saturating_mul(8),
+                });
+                num_buffers = num_buffers.saturating_add(1);
+                continue;
+            }
+
+            let size = self.cg.size_of_ty(ty).max(1);
+            let align = size.clamp(1, 16);
+            scalar_offset = align_up_u64(scalar_offset, align);
+            layouts.push(ArgLayout {
+                ty,
+                is_buffer: false,
+                offset: scalar_offset,
+            });
+            scalar_offset = scalar_offset.saturating_add(size);
+        }
+
+        let push_const_size = align_up_u64(scalar_offset, 16);
+        let total_len = num_buffers
+            .saturating_mul(8)
+            .saturating_add(push_const_size);
+        if total_len == 0 {
+            return Ok(("null".to_string(), 0));
+        }
+
+        let blob = self.tmp();
+        writeln!(self.out, "  {blob} = alloca i8, i64 {total_len}").map_err(|e| e.to_string())?;
+
+        for (idx, layout) in layouts.iter().enumerate() {
+            let arg = &arg_ops[idx];
+            let offset = if layout.is_buffer {
+                layout.offset
+            } else {
+                num_buffers.saturating_mul(8).saturating_add(layout.offset)
+            };
+            let slot = self.tmp();
+            writeln!(
+                self.out,
+                "  {slot} = getelementptr i8, ptr {blob}, i64 {offset}"
+            )
+            .map_err(|e| e.to_string())?;
+
+            if layout.is_buffer {
+                let arg_ptr = self.ensure_ptr(arg.clone())?;
+                writeln!(self.out, "  store ptr {arg_ptr}, ptr {slot}")
+                    .map_err(|e| e.to_string())?;
+                continue;
+            }
+
+            let storage_ty = self.cg.llvm_storage_ty(layout.ty);
+            if storage_ty == "i8" && arg.ty == "void" {
+                writeln!(self.out, "  store i8 0, ptr {slot}").map_err(|e| e.to_string())?;
+                continue;
+            }
+
+            if arg.ty == storage_ty {
+                writeln!(self.out, "  store {storage_ty} {}, ptr {slot}", arg.repr)
+                    .map_err(|e| e.to_string())?;
+            } else {
+                writeln!(
+                    self.out,
+                    "  store {storage_ty} {}, ptr {slot}",
+                    self.zero_lit(&storage_ty)
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+
+        Ok((blob, total_len))
+    }
+
     fn array_result_elem(&self, ty: TypeId) -> (TypeId, u64) {
         if let Some(TypeKind::HeapHandle {
             base: HeapBase::BuiltinArray { elem },
@@ -1580,6 +3280,26 @@ impl<'a> FnBuilder<'a> {
             return (*elem, self.cg.size_of_ty(*elem));
         }
         (TypeId(0), 0)
+    }
+
+    fn array_elem_ty_for_value(&self, arr_ptr_repr: &str) -> Option<TypeId> {
+        if !arr_ptr_repr.starts_with("%arg") && !arr_ptr_repr.starts_with("%l") {
+            return None;
+        }
+        let digits = arr_ptr_repr
+            .trim_start_matches("%arg")
+            .trim_start_matches("%l");
+        let local_id = digits.parse::<u32>().ok()?;
+        let arr_ty = self.local_tys.get(&local_id).copied()?;
+        if let Some(TypeKind::HeapHandle {
+            base: HeapBase::BuiltinArray { elem },
+            ..
+        }) = self.cg.kind_of(arr_ty)
+        {
+            Some(*elem)
+        } else {
+            None
+        }
     }
 
     fn call_args(&mut self, args: &[MpirValue]) -> Result<String, String> {
@@ -2015,8 +3735,52 @@ fn mangle_init_types(module_sid: &Sid) -> String {
     format!("mp$0$INIT_TYPES${}", sid_suffix(module_sid))
 }
 
+fn callback_hash_symbol(ty: TypeId) -> String {
+    format!("mp_cb_hash_t{}", ty.0)
+}
+
+fn callback_eq_symbol(ty: TypeId) -> String {
+    format!("mp_cb_eq_t{}", ty.0)
+}
+
+fn callback_cmp_symbol(ty: TypeId) -> String {
+    format!("mp_cb_cmp_t{}", ty.0)
+}
+
 fn sid_suffix(sid: &Sid) -> &str {
     sid.0.split_once(':').map(|(_, suf)| suf).unwrap_or(&sid.0)
+}
+
+fn sid_hash_64(sid: &Sid) -> u64 {
+    // Deterministic FNV-1a 64-bit (matches magpie_gpu::sid_hash_64).
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    for b in sid.0.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn align_up_u64(value: u64, align: u64) -> u64 {
+    if align <= 1 {
+        return value;
+    }
+    let rem = value % align;
+    if rem == 0 {
+        value
+    } else {
+        value.saturating_add(align - rem)
+    }
+}
+
+fn llvm_c_string_literal(s: &str) -> (usize, String) {
+    let mut bytes = s.as_bytes().to_vec();
+    bytes.push(0);
+    let encoded = bytes
+        .iter()
+        .map(|b| format!("\\{:02X}", b))
+        .collect::<String>();
+    (bytes.len(), encoded)
 }
 
 fn llvm_quote(s: &str) -> String {
@@ -2269,10 +4033,6 @@ pub fn generate_extern_mp(decls: &[ExternFnDecl], lib_name: &str) -> String {
     let mut out = String::new();
     let module = sanitize_mp_ident(lib_name);
     let _ = writeln!(out, "extern \"c\" module {module} {{");
-    let _ = writeln!(
-        out,
-        "  ; TODO(ffi): review pointer return ownership attrs (owned vs borrowed)"
-    );
 
     for decl in decls {
         let fn_name = normalize_symbol_name(&decl.name);
@@ -2282,10 +4042,17 @@ pub fn generate_extern_mp(decls: &[ExternFnDecl], lib_name: &str) -> String {
             .map(|(ty, name)| format!("%{}: {}", sanitize_mp_ident(name), ty))
             .collect::<Vec<_>>()
             .join(", ");
-        let attrs = if is_pointer_mp_type(&decl.ret_ty) {
-            " attrs { returns=\"TODO: owned|borrowed\" }"
+        let mut attrs = Vec::new();
+        if is_pointer_mp_type(&decl.ret_ty) {
+            attrs.push("returns=\"borrowed\"");
+        }
+        if decl.params.iter().any(|(ty, _)| is_pointer_mp_type(ty)) {
+            attrs.push("params=\"borrowed\"");
+        }
+        let attrs = if attrs.is_empty() {
+            String::new()
         } else {
-            ""
+            format!(" attrs {{ {} }}", attrs.join(" "))
         };
         let _ = writeln!(out, "  fn @{fn_name}({params}) -> {}{}", decl.ret_ty, attrs);
     }
@@ -2546,10 +4313,17 @@ pub fn generate_extern_mp_module(decls: &[ExternFnDecl], lib_name: &str) -> Stri
             .map(|(ty, name)| format!("%{}: {}", sanitize_mp_ident(name), ty))
             .collect::<Vec<_>>()
             .join(", ");
-        let attrs = if is_pointer_mp_type(&decl.ret_ty) {
-            " attrs { returns=\"TODO: owned|borrowed\" }"
+        let mut attrs = Vec::new();
+        if is_pointer_mp_type(&decl.ret_ty) {
+            attrs.push("returns=\"borrowed\"");
+        }
+        if decl.params.iter().any(|(ty, _)| is_pointer_mp_type(ty)) {
+            attrs.push("params=\"borrowed\"");
+        }
+        let attrs = if attrs.is_empty() {
+            String::new()
         } else {
-            ""
+            format!(" attrs {{ {} }}", attrs.join(" "))
         };
         let _ = writeln!(out, "  fn @{fn_name}({params}) -> {}{}", decl.ret_ty, attrs);
     }
@@ -2562,6 +4336,7 @@ pub fn generate_extern_mp_module(decls: &[ExternFnDecl], lib_name: &str) -> Stri
 mod tests {
     use super::*;
     use magpie_mpir::{MpirLocalDecl, MpirTypeTable};
+    use magpie_types::HandleKind;
 
     #[test]
     fn test_codegen_hello_world() {
@@ -2608,11 +4383,953 @@ mod tests {
             "expected function definitions in IR"
         );
         assert!(llvm_ir.contains("ret"), "expected return instruction in IR");
+        assert!(llvm_ir.contains("call void @mp_gpu_register_all_kernels()"));
+    }
+
+    #[test]
+    fn test_codegen_emits_generics_mode_marker() {
+        let type_ctx = TypeCtx::new();
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let module = MpirModule {
+            sid: Sid("M:GENMODE000".to_string()),
+            path: "genmode.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:GENMODE000".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![MpirInstr {
+                        dst: magpie_types::LocalId(0),
+                        ty: i32_ty,
+                        op: MpirOp::Const(HirConst {
+                            ty: i32_ty,
+                            lit: HirConstLit::IntLit(0),
+                        }),
+                    }],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        0,
+                    )))),
+                }],
+                locals: vec![MpirLocalDecl {
+                    id: magpie_types::LocalId(0),
+                    ty: i32_ty,
+                    name: "retv".to_string(),
+                }],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let default_ir = codegen_module(&module, &type_ctx).expect("default codegen should pass");
+        assert!(default_ir.contains("\"mp$0$ABI$generics_mode\""));
+        assert!(default_ir.contains("constant i8 0"));
+
+        let shared_ir = codegen_module_with_options(
+            &module,
+            &type_ctx,
+            CodegenOptions {
+                shared_generics: true,
+            },
+        )
+        .expect("shared-generics codegen should pass");
+        assert!(shared_ir.contains("\"mp$0$ABI$generics_mode\""));
+        assert!(shared_ir.contains("constant i8 1"));
+    }
+
+    #[test]
+    fn test_codegen_without_main_does_not_emit_c_main() {
+        let type_ctx = TypeCtx::new();
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let module = MpirModule {
+            sid: Sid("M:NOMAIN0000".to_string()),
+            path: "no_main.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:HELPER0000".to_string()),
+                name: "helper".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![MpirInstr {
+                        dst: magpie_types::LocalId(0),
+                        ty: i32_ty,
+                        op: MpirOp::Const(HirConst {
+                            ty: i32_ty,
+                            lit: HirConstLit::IntLit(7),
+                        }),
+                    }],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        0,
+                    )))),
+                }],
+                locals: vec![MpirLocalDecl {
+                    id: magpie_types::LocalId(0),
+                    ty: i32_ty,
+                    name: "retv".to_string(),
+                }],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(!llvm_ir.contains("define i32 @main("));
     }
 
     #[test]
     fn test_mangling() {
         let sid = Sid("F:ABCDEFGHIJ".to_string());
         assert_eq!(mangle_fn(&sid), "mp$0$FN$ABCDEFGHIJ");
+    }
+
+    #[test]
+    fn test_codegen_gpu_ops_lowering() {
+        let mut type_ctx = TypeCtx::new();
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let i64_ty = type_ctx.lookup_by_prim(PrimType::I64);
+        let unit_ty = type_ctx.lookup_by_prim(PrimType::Unit);
+        let raw_ptr_ty = type_ctx.intern(TypeKind::RawPtr {
+            to: fixed_type_ids::U8,
+        });
+        let kernel_sid = Sid("F:KERNELGPU0".to_string());
+
+        let kernel_fn = MpirFn {
+            sid: kernel_sid.clone(),
+            name: "kernel".to_string(),
+            params: vec![(magpie_types::LocalId(0), raw_ptr_ty)],
+            ret_ty: unit_ty,
+            blocks: vec![],
+            locals: vec![MpirLocalDecl {
+                id: magpie_types::LocalId(0),
+                ty: raw_ptr_ty,
+                name: "buf".to_string(),
+            }],
+            is_async: false,
+        };
+
+        let main_fn = MpirFn {
+            sid: Sid("F:GPUHOST00".to_string()),
+            name: "main".to_string(),
+            params: vec![],
+            ret_ty: i32_ty,
+            blocks: vec![MpirBlock {
+                id: magpie_types::BlockId(0),
+                instrs: vec![
+                    MpirInstr {
+                        dst: magpie_types::LocalId(0),
+                        ty: raw_ptr_ty,
+                        op: MpirOp::PtrNull { to: raw_ptr_ty },
+                    },
+                    MpirInstr {
+                        dst: magpie_types::LocalId(1),
+                        ty: i64_ty,
+                        op: MpirOp::Const(HirConst {
+                            ty: i64_ty,
+                            lit: HirConstLit::IntLit(0),
+                        }),
+                    },
+                    MpirInstr {
+                        dst: magpie_types::LocalId(2),
+                        ty: i64_ty,
+                        op: MpirOp::GpuBufferLen {
+                            buf: MpirValue::Local(magpie_types::LocalId(0)),
+                        },
+                    },
+                    MpirInstr {
+                        dst: magpie_types::LocalId(3),
+                        ty: i32_ty,
+                        op: MpirOp::GpuBufferLoad {
+                            buf: MpirValue::Local(magpie_types::LocalId(0)),
+                            idx: MpirValue::Local(magpie_types::LocalId(1)),
+                        },
+                    },
+                    MpirInstr {
+                        dst: magpie_types::LocalId(4),
+                        ty: i32_ty,
+                        op: MpirOp::GpuLaunch {
+                            device: MpirValue::Local(magpie_types::LocalId(0)),
+                            kernel: kernel_sid.clone(),
+                            groups: MpirValue::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(1),
+                            }),
+                            threads: MpirValue::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(1),
+                            }),
+                            args: vec![MpirValue::Local(magpie_types::LocalId(0))],
+                        },
+                    },
+                    MpirInstr {
+                        dst: magpie_types::LocalId(5),
+                        ty: i32_ty,
+                        op: MpirOp::GpuLaunchAsync {
+                            device: MpirValue::Local(magpie_types::LocalId(0)),
+                            kernel: kernel_sid,
+                            groups: MpirValue::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(1),
+                            }),
+                            threads: MpirValue::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(1),
+                            }),
+                            args: vec![MpirValue::Local(magpie_types::LocalId(0))],
+                        },
+                    },
+                ],
+                void_ops: vec![
+                    MpirOpVoid::GpuBufferStore {
+                        buf: MpirValue::Local(magpie_types::LocalId(0)),
+                        idx: MpirValue::Local(magpie_types::LocalId(1)),
+                        val: MpirValue::Const(HirConst {
+                            ty: i32_ty,
+                            lit: HirConstLit::IntLit(7),
+                        }),
+                    },
+                    MpirOpVoid::GpuBarrier,
+                ],
+                terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(4)))),
+            }],
+            locals: vec![
+                MpirLocalDecl {
+                    id: magpie_types::LocalId(0),
+                    ty: raw_ptr_ty,
+                    name: "dev".to_string(),
+                },
+                MpirLocalDecl {
+                    id: magpie_types::LocalId(1),
+                    ty: i64_ty,
+                    name: "idx".to_string(),
+                },
+                MpirLocalDecl {
+                    id: magpie_types::LocalId(2),
+                    ty: i64_ty,
+                    name: "len".to_string(),
+                },
+                MpirLocalDecl {
+                    id: magpie_types::LocalId(3),
+                    ty: i32_ty,
+                    name: "loaded".to_string(),
+                },
+                MpirLocalDecl {
+                    id: magpie_types::LocalId(4),
+                    ty: i32_ty,
+                    name: "launch".to_string(),
+                },
+                MpirLocalDecl {
+                    id: magpie_types::LocalId(5),
+                    ty: i32_ty,
+                    name: "launch_async".to_string(),
+                },
+            ],
+            is_async: false,
+        };
+
+        let module = MpirModule {
+            sid: Sid("M:GPULOWER00".to_string()),
+            path: "gpu.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![kernel_fn, main_fn],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("gpu lowering should succeed");
+        assert!(llvm_ir.contains("@mp_rt_gpu_launch_sync"));
+        assert!(llvm_ir.contains("@mp_rt_gpu_launch_async"));
+        assert!(llvm_ir.contains("@mp_rt_gpu_buffer_len"));
+        assert!(llvm_ir.contains("@mp_rt_gpu_buffer_read"));
+        assert!(llvm_ir.contains("@mp_rt_gpu_buffer_write"));
+    }
+
+    #[test]
+    fn test_codegen_builtin_result_unit_uses_storage_type() {
+        let mut type_ctx = TypeCtx::new();
+        let result_ty = type_ctx.intern(TypeKind::BuiltinResult {
+            ok: fixed_type_ids::UNIT,
+            err: fixed_type_ids::STR,
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:RESULTUNIT0".to_string()),
+            path: "result_unit.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:RESULTUNIT0".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: result_ty,
+                blocks: vec![],
+                locals: vec![],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("define { i1, i8, ptr }"));
+    }
+
+    #[test]
+    fn test_codegen_user_struct_new_getfield_setfield() {
+        let mut type_ctx = TypeCtx::new();
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let sid = Sid("T:POINT00000".to_string());
+        type_ctx.register_type_fqn(sid.clone(), "pkg.main.Point");
+        type_ctx.register_value_struct_fields(
+            sid.clone(),
+            vec![("x".to_string(), i32_ty), ("y".to_string(), i32_ty)],
+        );
+        let point_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Unique,
+            base: HeapBase::UserType {
+                type_sid: sid,
+                targs: vec![],
+            },
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:STRUCTOPS0".to_string()),
+            path: "struct_ops.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:STRUCTOPS0".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![
+                        MpirInstr {
+                            dst: magpie_types::LocalId(0),
+                            ty: point_ty,
+                            op: MpirOp::New {
+                                ty: point_ty,
+                                fields: vec![
+                                    (
+                                        "x".to_string(),
+                                        MpirValue::Const(HirConst {
+                                            ty: i32_ty,
+                                            lit: HirConstLit::IntLit(1),
+                                        }),
+                                    ),
+                                    (
+                                        "y".to_string(),
+                                        MpirValue::Const(HirConst {
+                                            ty: i32_ty,
+                                            lit: HirConstLit::IntLit(2),
+                                        }),
+                                    ),
+                                ],
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(1),
+                            ty: i32_ty,
+                            op: MpirOp::GetField {
+                                obj: MpirValue::Local(magpie_types::LocalId(0)),
+                                field: "x".to_string(),
+                            },
+                        },
+                    ],
+                    void_ops: vec![MpirOpVoid::SetField {
+                        obj: MpirValue::Local(magpie_types::LocalId(0)),
+                        field: "y".to_string(),
+                        value: MpirValue::Const(HirConst {
+                            ty: i32_ty,
+                            lit: HirConstLit::IntLit(7),
+                        }),
+                    }],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        1,
+                    )))),
+                }],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: point_ty,
+                        name: "p".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: i32_ty,
+                        name: "x".to_string(),
+                    },
+                ],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("@mp_rt_alloc(i32"));
+        assert!(llvm_ir.contains("getelementptr i8, ptr %l0, i64 32"));
+        assert!(llvm_ir.contains("load i32"));
+    }
+
+    #[test]
+    fn test_codegen_emits_runtime_type_registry_for_user_heap_types() {
+        let mut type_ctx = TypeCtx::new();
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let sid = Sid("T:REGTYPE000".to_string());
+        type_ctx.register_type_fqn(sid.clone(), "pkg.main.RegType");
+        type_ctx.register_value_struct_fields(sid.clone(), vec![("x".to_string(), i32_ty)]);
+        let _heap_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Unique,
+            base: HeapBase::UserType {
+                type_sid: sid,
+                targs: vec![],
+            },
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:TYPEREG00".to_string()),
+            path: "typereg.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:TYPEREG00".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![MpirInstr {
+                        dst: magpie_types::LocalId(0),
+                        ty: i32_ty,
+                        op: MpirOp::Const(HirConst {
+                            ty: i32_ty,
+                            lit: HirConstLit::IntLit(0),
+                        }),
+                    }],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        0,
+                    )))),
+                }],
+                locals: vec![MpirLocalDecl {
+                    id: magpie_types::LocalId(0),
+                    ty: i32_ty,
+                    name: "ret".to_string(),
+                }],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("%MpRtTypeInfo = type"));
+        assert!(llvm_ir.contains("mp_type_registry_"));
+        assert!(llvm_ir.contains("call void @mp_rt_register_types("));
+    }
+
+    #[test]
+    fn test_codegen_indirect_and_enum_user_ops() {
+        let mut type_ctx = TypeCtx::new();
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let callable_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Unique,
+            base: HeapBase::Callable {
+                sig_sid: Sid("S:CALLSIG000".to_string()),
+            },
+        });
+
+        let enum_sid = Sid("T:ENUMUSER00".to_string());
+        type_ctx.register_type_fqn(enum_sid.clone(), "pkg.main.E");
+        type_ctx.register_value_enum_variants(
+            enum_sid.clone(),
+            vec![
+                ("A".to_string(), vec![("v".to_string(), i32_ty)]),
+                ("B".to_string(), vec![("e".to_string(), i32_ty)]),
+            ],
+        );
+        let user_enum_ty = type_ctx.intern(TypeKind::ValueStruct {
+            sid: enum_sid.clone(),
+        });
+        let heap_enum_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Unique,
+            base: HeapBase::UserType {
+                type_sid: enum_sid,
+                targs: vec![],
+            },
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:INDENUM00".to_string()),
+            path: "indirect_enum.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:INDENUM00".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![
+                        MpirInstr {
+                            dst: magpie_types::LocalId(0),
+                            ty: callable_ty,
+                            op: MpirOp::PtrNull { to: callable_ty },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(1),
+                            ty: i32_ty,
+                            op: MpirOp::CallIndirect {
+                                callee: MpirValue::Local(magpie_types::LocalId(0)),
+                                args: vec![],
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(2),
+                            ty: user_enum_ty,
+                            op: MpirOp::EnumNew {
+                                variant: "A".to_string(),
+                                args: vec![(
+                                    "v".to_string(),
+                                    MpirValue::Const(HirConst {
+                                        ty: i32_ty,
+                                        lit: HirConstLit::IntLit(9),
+                                    }),
+                                )],
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(3),
+                            ty: i32_ty,
+                            op: MpirOp::EnumTag {
+                                v: MpirValue::Local(magpie_types::LocalId(2)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(4),
+                            ty: i32_ty,
+                            op: MpirOp::EnumPayload {
+                                variant: "A".to_string(),
+                                v: MpirValue::Local(magpie_types::LocalId(2)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(5),
+                            ty: i32_ty,
+                            op: MpirOp::EnumIs {
+                                variant: "A".to_string(),
+                                v: MpirValue::Local(magpie_types::LocalId(2)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(6),
+                            ty: heap_enum_ty,
+                            op: MpirOp::EnumNew {
+                                variant: "B".to_string(),
+                                args: vec![(
+                                    "e".to_string(),
+                                    MpirValue::Const(HirConst {
+                                        ty: i32_ty,
+                                        lit: HirConstLit::IntLit(3),
+                                    }),
+                                )],
+                            },
+                        },
+                    ],
+                    void_ops: vec![MpirOpVoid::CallVoidIndirect {
+                        callee: MpirValue::Local(magpie_types::LocalId(0)),
+                        args: vec![],
+                    }],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        3,
+                    )))),
+                }],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: callable_ty,
+                        name: "cb".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: i32_ty,
+                        name: "ind".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: user_enum_ty,
+                        name: "e".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(3),
+                        ty: i32_ty,
+                        name: "tag".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(4),
+                        ty: i32_ty,
+                        name: "payload".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(5),
+                        ty: i32_ty,
+                        name: "is_a".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(6),
+                        ty: heap_enum_ty,
+                        name: "he".to_string(),
+                    },
+                ],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("@mp_rt_callable_fn_ptr"));
+        assert!(llvm_ir.contains("@mp_rt_callable_data_ptr"));
+        assert!(llvm_ir.contains("@mp_rt_callable_capture_size"));
+        assert!(llvm_ir.contains("icmp eq i32"));
+        assert!(llvm_ir.contains("@mp_rt_alloc(i32"));
+    }
+
+    #[test]
+    fn test_codegen_map_get_ref_emits_missing_key_panic() {
+        let mut type_ctx = TypeCtx::new();
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let map_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Unique,
+            base: HeapBase::BuiltinMap {
+                key: i32_ty,
+                val: i32_ty,
+            },
+        });
+        let ptr_i32 = type_ctx.intern(TypeKind::RawPtr { to: i32_ty });
+
+        let module = MpirModule {
+            sid: Sid("M:MAPGETRF0".to_string()),
+            path: "map_get_ref.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:MAPGETRF0".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![
+                        MpirInstr {
+                            dst: magpie_types::LocalId(0),
+                            ty: map_ty,
+                            op: MpirOp::MapNew {
+                                key_ty: i32_ty,
+                                val_ty: i32_ty,
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(1),
+                            ty: i32_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(7),
+                            }),
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(2),
+                            ty: ptr_i32,
+                            op: MpirOp::MapGetRef {
+                                map: MpirValue::Local(magpie_types::LocalId(0)),
+                                key: MpirValue::Local(magpie_types::LocalId(1)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(3),
+                            ty: i32_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(0),
+                            }),
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        3,
+                    )))),
+                }],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: map_ty,
+                        name: "m".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: i32_ty,
+                        name: "k".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: ptr_i32,
+                        name: "vref".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(3),
+                        ty: i32_ty,
+                        name: "ret".to_string(),
+                    },
+                ],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("@mp_rt_map_get("));
+        assert!(llvm_ir.contains("icmp eq ptr"));
+        assert!(llvm_ir.contains("call void @mp_rt_panic(ptr null)"));
+    }
+
+    #[test]
+    fn test_codegen_collection_callbacks_use_generated_wrappers() {
+        let mut type_ctx = TypeCtx::new();
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let unit_ty = type_ctx.lookup_by_prim(PrimType::Unit);
+        let arr_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Unique,
+            base: HeapBase::BuiltinArray { elem: i32_ty },
+        });
+        let map_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Unique,
+            base: HeapBase::BuiltinMap {
+                key: i32_ty,
+                val: i32_ty,
+            },
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:CBWRAP0".to_string()),
+            path: "cb_wrap.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:CBWRAP0".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![
+                        MpirInstr {
+                            dst: magpie_types::LocalId(0),
+                            ty: i32_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(0),
+                            }),
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(1),
+                            ty: arr_ty,
+                            op: MpirOp::ArrNew {
+                                elem_ty: i32_ty,
+                                cap: MpirValue::Local(magpie_types::LocalId(0)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(2),
+                            ty: i32_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(7),
+                            }),
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(3),
+                            ty: i32_ty,
+                            op: MpirOp::ArrContains {
+                                arr: MpirValue::Local(magpie_types::LocalId(1)),
+                                val: MpirValue::Local(magpie_types::LocalId(2)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(4),
+                            ty: unit_ty,
+                            op: MpirOp::ArrSort {
+                                arr: MpirValue::Local(magpie_types::LocalId(1)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(5),
+                            ty: map_ty,
+                            op: MpirOp::MapNew {
+                                key_ty: i32_ty,
+                                val_ty: i32_ty,
+                            },
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        3,
+                    )))),
+                }],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: i32_ty,
+                        name: "cap".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: arr_ty,
+                        name: "arr".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: i32_ty,
+                        name: "val".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(3),
+                        ty: i32_ty,
+                        name: "contains".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(4),
+                        ty: unit_ty,
+                        name: "sorted".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(5),
+                        ty: map_ty,
+                        name: "map".to_string(),
+                    },
+                ],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("define weak_odr i64 @mp_cb_hash_t4(ptr %x_bytes)"));
+        assert!(llvm_ir.contains("define weak_odr i32 @mp_cb_eq_t4(ptr %a_bytes, ptr %b_bytes)"));
+        assert!(llvm_ir.contains("define weak_odr i32 @mp_cb_cmp_t4(ptr %a_bytes, ptr %b_bytes)"));
+        assert!(llvm_ir.contains("call i32 @mp_rt_arr_contains(ptr %l1, ptr"));
+        assert!(llvm_ir.contains("ptr @mp_cb_eq_t4)"));
+        assert!(llvm_ir.contains("call void @mp_rt_arr_sort(ptr %l1, ptr @mp_cb_cmp_t4)"));
+        assert!(llvm_ir.contains("@mp_rt_map_new(i32 4, i32 4, i64 4, i64 4, i64 0, ptr @mp_cb_hash_t4, ptr @mp_cb_eq_t4)"));
+    }
+
+    #[test]
+    fn test_codegen_collection_callbacks_for_str_use_string_semantics() {
+        let mut type_ctx = TypeCtx::new();
+        let str_ty = fixed_type_ids::STR;
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let unit_ty = type_ctx.lookup_by_prim(PrimType::Unit);
+        let bool_ty = type_ctx.lookup_by_prim(PrimType::Bool);
+        let arr_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Unique,
+            base: HeapBase::BuiltinArray { elem: str_ty },
+        });
+        let map_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Unique,
+            base: HeapBase::BuiltinMap {
+                key: str_ty,
+                val: bool_ty,
+            },
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:CBSTR00".to_string()),
+            path: "cb_str.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:CBSTR00".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: bool_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![
+                        MpirInstr {
+                            dst: magpie_types::LocalId(0),
+                            ty: arr_ty,
+                            op: MpirOp::ArrNew {
+                                elem_ty: str_ty,
+                                cap: MpirValue::Const(HirConst {
+                                    ty: i32_ty,
+                                    lit: HirConstLit::IntLit(0),
+                                }),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(1),
+                            ty: str_ty,
+                            op: MpirOp::PtrNull { to: str_ty },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(2),
+                            ty: bool_ty,
+                            op: MpirOp::ArrContains {
+                                arr: MpirValue::Local(magpie_types::LocalId(0)),
+                                val: MpirValue::Local(magpie_types::LocalId(1)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(3),
+                            ty: unit_ty,
+                            op: MpirOp::ArrSort {
+                                arr: MpirValue::Local(magpie_types::LocalId(0)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(4),
+                            ty: map_ty,
+                            op: MpirOp::MapNew {
+                                key_ty: str_ty,
+                                val_ty: bool_ty,
+                            },
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        2,
+                    )))),
+                }],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: arr_ty,
+                        name: "arr".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: str_ty,
+                        name: "s".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: bool_ty,
+                        name: "contains".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(3),
+                        ty: unit_ty,
+                        name: "sorted".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(4),
+                        ty: map_ty,
+                        name: "map".to_string(),
+                    },
+                ],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("call i64 @mp_std_hash_str(ptr %x)"));
+        assert!(llvm_ir.contains("call i32 @mp_rt_str_eq(ptr %a, ptr %b)"));
+        assert!(llvm_ir.contains("call i32 @mp_rt_str_cmp(ptr %a, ptr %b)"));
     }
 }

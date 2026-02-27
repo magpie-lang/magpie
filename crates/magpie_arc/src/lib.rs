@@ -1,4 +1,5 @@
 //! ARC insertion and local ARC peephole optimization for MPIR.
+#![allow(clippy::needless_range_loop, clippy::result_unit_err)]
 
 use magpie_diag::{Diagnostic, DiagnosticBag, Severity};
 use magpie_mpir::{
@@ -636,9 +637,10 @@ fn find_option_type_id(
     type_ctx: &TypeCtx,
     module_types: &[(TypeId, TypeKind)],
 ) -> Option<TypeId> {
-    if let Some((id, _)) = module_types.iter().find(|(_, kind)| {
-        matches!(kind, TypeKind::BuiltinOption { inner } if *inner == inner_ty)
-    }) {
+    if let Some((id, _)) = module_types
+        .iter()
+        .find(|(_, kind)| matches!(kind, TypeKind::BuiltinOption { inner } if *inner == inner_ty))
+    {
         return Some(*id);
     }
     type_ctx.types.iter().find_map(|(id, kind)| {
@@ -658,13 +660,7 @@ fn emit_drop_for_value(
     out: &mut Vec<MpirOpVoid>,
 ) {
     let mut needs = DropNeeds::default();
-    collect_drop_needs(
-        ty,
-        type_ctx,
-        module_types,
-        &mut HashSet::new(),
-        &mut needs,
-    );
+    collect_drop_needs(ty, type_ctx, module_types, &mut HashSet::new(), &mut needs);
 
     if needs.strong {
         out.push(MpirOpVoid::ArcRelease { v: v.clone() });
@@ -674,15 +670,13 @@ fn emit_drop_for_value(
     }
 }
 
-fn type_contains_heap_handles(ty: TypeId, type_ctx: &TypeCtx, module_types: &[(TypeId, TypeKind)]) -> bool {
+fn type_contains_heap_handles(
+    ty: TypeId,
+    type_ctx: &TypeCtx,
+    module_types: &[(TypeId, TypeKind)],
+) -> bool {
     let mut needs = DropNeeds::default();
-    collect_drop_needs(
-        ty,
-        type_ctx,
-        module_types,
-        &mut HashSet::new(),
-        &mut needs,
-    );
+    collect_drop_needs(ty, type_ctx, module_types, &mut HashSet::new(), &mut needs);
     needs.strong || needs.weak
 }
 
@@ -706,9 +700,13 @@ fn collect_drop_needs(
     if let Some(kind) = lookup_type_kind(ty, type_ctx, module_types) {
         match kind {
             TypeKind::HeapHandle {
-                hk: HandleKind::Unique | HandleKind::Shared | HandleKind::Borrow | HandleKind::MutBorrow,
+                hk: HandleKind::Unique | HandleKind::Shared,
                 ..
             } => out.strong = true,
+            TypeKind::HeapHandle {
+                hk: HandleKind::Borrow | HandleKind::MutBorrow,
+                ..
+            } => {}
             TypeKind::HeapHandle {
                 hk: HandleKind::Weak,
                 ..
@@ -1328,6 +1326,8 @@ fn emit_error(diag: &mut DiagnosticBag, code: &str, message: &str) {
         explanation_md: None,
         why: None,
         suggested_fixes: vec![],
+        rag_bundle: Vec::new(),
+        related_docs: Vec::new(),
     });
 }
 
@@ -1438,6 +1438,71 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_drop_for_value_skips_borrows_but_releases_shared() {
+        let mut type_ctx = TypeCtx::new();
+        let shared_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Shared,
+            base: HeapBase::BuiltinStr,
+        });
+        let borrow_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::BuiltinStr,
+        });
+        let mut_borrow_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::MutBorrow,
+            base: HeapBase::BuiltinStr,
+        });
+        let module_types: Vec<(TypeId, TypeKind)> = vec![];
+
+        let mut shared_ops = vec![];
+        emit_drop_for_value(
+            MpirValue::Local(LocalId(0)),
+            shared_ty,
+            &type_ctx,
+            &module_types,
+            &mut shared_ops,
+        );
+        assert!(
+            shared_ops.iter().any(|op| matches!(
+                op,
+                MpirOpVoid::ArcRelease {
+                    v: MpirValue::Local(LocalId(0))
+                }
+            )),
+            "expected shared handle to emit ArcRelease, got: {:?}",
+            shared_ops
+        );
+
+        let mut borrow_ops = vec![];
+        emit_drop_for_value(
+            MpirValue::Local(LocalId(1)),
+            borrow_ty,
+            &type_ctx,
+            &module_types,
+            &mut borrow_ops,
+        );
+        assert!(
+            borrow_ops.is_empty(),
+            "borrow handle should not emit release ops, got: {:?}",
+            borrow_ops
+        );
+
+        let mut mut_borrow_ops = vec![];
+        emit_drop_for_value(
+            MpirValue::Local(LocalId(2)),
+            mut_borrow_ty,
+            &type_ctx,
+            &module_types,
+            &mut mut_borrow_ops,
+        );
+        assert!(
+            mut_borrow_ops.is_empty(),
+            "mut borrow handle should not emit release ops, got: {:?}",
+            mut_borrow_ops
+        );
+    }
+
+    #[test]
     fn test_arc_overwrite_inserts_release_before_writes() {
         let mut type_ctx = TypeCtx::new();
         let obj_ty = type_ctx.intern(TypeKind::HeapHandle {
@@ -1472,14 +1537,12 @@ mod tests {
             sid: Sid("M:ARCOVRW000".to_string()),
             path: "test.arc".to_string(),
             type_table: magpie_mpir::MpirTypeTable {
-                types: vec![
-                    (
-                        option_str,
-                        TypeKind::BuiltinOption {
-                            inner: fixed_type_ids::STR,
-                        },
-                    ),
-                ],
+                types: vec![(
+                    option_str,
+                    TypeKind::BuiltinOption {
+                        inner: fixed_type_ids::STR,
+                    },
+                )],
             },
             functions: vec![MpirFn {
                 sid: Sid("F:ARCOVRW000".to_string()),
@@ -1535,7 +1598,9 @@ mod tests {
         let mut old_map_local = None;
         for instr in &block.instrs {
             match &instr.op {
-                MpirOp::GetField { field, .. } if field == "value" => old_field_local = Some(instr.dst),
+                MpirOp::GetField { field, .. } if field == "value" => {
+                    old_field_local = Some(instr.dst)
+                }
                 MpirOp::ArrGet { .. } => old_arr_local = Some(instr.dst),
                 MpirOp::MapDelete { .. } => old_map_local = Some(instr.dst),
                 _ => {}

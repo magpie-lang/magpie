@@ -1254,7 +1254,10 @@ mod tests {
 
         let updated_once = update_digest(source);
         let updated_twice = update_digest(&updated_once);
-        assert_eq!(updated_once, updated_twice, "digest update should be idempotent");
+        assert_eq!(
+            updated_once, updated_twice,
+            "digest update should be idempotent"
+        );
 
         let digest_line = updated_once
             .lines()

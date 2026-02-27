@@ -2,6 +2,7 @@
 
 use magpie_ast::Span;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Diagnostic {
@@ -14,6 +15,10 @@ pub struct Diagnostic {
     pub explanation_md: Option<String>,
     pub why: Option<WhyTrace>,
     pub suggested_fixes: Vec<SuggestedFix>,
+    #[serde(default)]
+    pub rag_bundle: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub related_docs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,6 +73,12 @@ pub struct SuggestedFix {
     pub patch_format: String,
     pub patch: String,
     pub confidence: f64,
+    #[serde(default)]
+    pub requires_fmt: bool,
+    #[serde(default)]
+    pub applies_to: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub produces: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -113,8 +124,14 @@ pub struct OutputEnvelope {
     pub success: bool,
     pub artifacts: Vec<String>,
     pub diagnostics: Vec<Diagnostic>,
+    #[serde(default = "default_graphs")]
+    pub graphs: serde_json::Value,
     pub timing_ms: serde_json::Value,
     pub llm_budget: Option<serde_json::Value>,
+}
+
+fn default_graphs() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 /// Diagnostic code namespaces (§26.3)
@@ -143,7 +160,9 @@ pub mod codes {
     pub const MPA_PREFIX: &str = "MPA";
     // SSA verification
     pub const MPS_PREFIX: &str = "MPS";
-    // Async
+    pub const MPS0024: &str = "MPS0024"; // UNSAFE_PTR_OP_OUTSIDE_UNSAFE_CONTEXT
+    pub const MPS0025: &str = "MPS0025"; // UNSAFE_FN_CALL_OUTSIDE_UNSAFE_CONTEXT
+                                         // Async
     pub const MPAS_PREFIX: &str = "MPAS";
     pub const MPAS0001: &str = "MPAS0001"; // SUSPEND_IN_NON_ASYNC
                                            // FFI
@@ -204,8 +223,65 @@ pub struct BudgetReport {
 }
 
 fn estimated_envelope_tokens(envelope: &OutputEnvelope, tokenizer: &str) -> u32 {
-    let payload = serde_json::to_string(envelope).unwrap_or_default();
+    let payload = canonical_json_encode(envelope).unwrap_or_default();
     estimate_tokens(&payload, tokenizer)
+}
+
+pub fn canonical_json_encode<T: serde::Serialize>(value: &T) -> Result<String, serde_json::Error> {
+    let value = serde_json::to_value(value)?;
+    Ok(canonical_json_string(&value))
+}
+
+pub fn canonical_json_string(value: &Value) -> String {
+    let mut out = String::new();
+    write_canonical_json(value, &mut out);
+    out
+}
+
+fn write_canonical_json(value: &Value, out: &mut String) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(v) => {
+            if *v {
+                out.push_str("true");
+            } else {
+                out.push_str("false");
+            }
+        }
+        Value::Number(v) => out.push_str(&v.to_string()),
+        Value::String(v) => {
+            let escaped = serde_json::to_string(v).expect("string JSON encoding cannot fail");
+            out.push_str(&escaped);
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (idx, key) in keys.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                let encoded_key =
+                    serde_json::to_string(key).expect("object key JSON encoding cannot fail");
+                out.push_str(&encoded_key);
+                out.push(':');
+                if let Some(item) = map.get(key) {
+                    write_canonical_json(item, out);
+                }
+            }
+            out.push('}');
+        }
+    }
 }
 
 fn truncate_chars(input: &str, max_chars: usize) -> String {
@@ -216,11 +292,8 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
 ///
 /// `approx:utf8_4chars` uses zero-dependency approximation:
 /// `ceil(utf8_bytes / 4)`.
-pub fn estimate_tokens(text: &str, tokenizer: &str) -> u32 {
-    match tokenizer {
-        "approx:utf8_4chars" => (text.len() as u32 + 3) / 4,
-        _ => (text.len() as u32 + 3) / 4,
-    }
+pub fn estimate_tokens(text: &str, _tokenizer: &str) -> u32 {
+    (text.len() as u32).div_ceil(4)
 }
 
 /// Enforce token budget with deterministic drop order (§3.3): Tier 4 -> 3 -> 2 -> 1.
@@ -260,6 +333,20 @@ pub fn enforce_budget(envelope: &mut OutputEnvelope, budget: &TokenBudget) {
                         reason: "budget_tier4".to_string(),
                     });
                 }
+            }
+            if !diag.rag_bundle.is_empty() {
+                diag.rag_bundle.clear();
+                dropped.push(BudgetDrop {
+                    field: format!("diagnostics[{i}].rag_bundle"),
+                    reason: "budget_tier4".to_string(),
+                });
+            }
+            if !diag.related_docs.is_empty() {
+                diag.related_docs.clear();
+                dropped.push(BudgetDrop {
+                    field: format!("diagnostics[{i}].related_docs"),
+                    reason: "budget_tier4".to_string(),
+                });
             }
         }
     }
@@ -320,6 +407,13 @@ pub fn enforce_budget(envelope: &mut OutputEnvelope, budget: &TokenBudget) {
 
     if estimated_envelope_tokens(envelope, &tokenizer) > budget.budget {
         // Hard trim: remove artifacts and extra diagnostics before final fallback.
+        if envelope.graphs != default_graphs() {
+            envelope.graphs = default_graphs();
+            dropped.push(BudgetDrop {
+                field: "graphs".to_string(),
+                reason: "budget_hard_trim".to_string(),
+            });
+        }
         if !envelope.artifacts.is_empty() {
             envelope.artifacts.clear();
             dropped.push(BudgetDrop {
@@ -356,12 +450,15 @@ pub fn enforce_budget(envelope: &mut OutputEnvelope, budget: &TokenBudget) {
     if estimated_envelope_tokens(envelope, &tokenizer) > budget.budget {
         // Tier 0 alone still exceeds budget: return MPL0801 minimal envelope.
         let mut tier0_probe = envelope.clone();
+        tier0_probe.graphs = default_graphs();
         tier0_probe.artifacts.clear();
         for diag in &mut tier0_probe.diagnostics {
             diag.secondary_spans.clear();
             diag.explanation_md = None;
             diag.why = None;
             diag.suggested_fixes.clear();
+            diag.rag_bundle.clear();
+            diag.related_docs.clear();
             if diag.message.chars().count() > 200 {
                 diag.message = truncate_chars(&diag.message, 200);
             }
@@ -371,6 +468,7 @@ pub fn enforce_budget(envelope: &mut OutputEnvelope, budget: &TokenBudget) {
             .max(1);
 
         envelope.success = false;
+        envelope.graphs = default_graphs();
         envelope.artifacts.clear();
         envelope.diagnostics = vec![Diagnostic {
             code: codes::MPL0801.to_string(),
@@ -385,6 +483,8 @@ pub fn enforce_budget(envelope: &mut OutputEnvelope, budget: &TokenBudget) {
             explanation_md: None,
             why: None,
             suggested_fixes: Vec::new(),
+            rag_bundle: Vec::new(),
+            related_docs: Vec::new(),
         }];
         dropped.push(BudgetDrop {
             field: "diagnostics".to_string(),
@@ -448,7 +548,7 @@ pub fn explain_code(code: &str) -> Option<String> {
         "MPS0011" => "Instruction typing/evaluation mismatch. Example: op argument type incompatible with expected type. Fix template: insert explicit cast or correct operand types.",
         "MPS0012" => "Call arity mismatch. Example: passed argument count differs from callee signature. Fix template: align call args with signature exactly.",
         "MPS0013" => "Return type mismatch. Example: returned value type differs from function return type. Fix template: return the declared type or adjust function signature.",
-        "MPS0014" => "Return shape mismatch. Example: unit function returns value (or vice versa). Fix template: match `ret` form to declared return type.",
+        "MPS0014" => "ARC stage violation. Example: `arc.*` op appears before ARC insertion stage. Fix template: run ARC insertion before verification or remove pre-ARC `arc.*` ops.",
         "MPS0015" => "Call argument contract mismatch. Example: argument type/ownership differs from parameter contract. Fix template: pass values with matching type and ownership mode.",
         "MPS0016" => "Unknown or invalid callee reference. Example: call target SID/name not found. Fix template: ensure callee exists and reference is fully resolved.",
         "MPS0017" => "Conditional branch predicate type invalid. Example: non-boolean condition in `cbr`. Fix template: produce `bool` condition before branching.",
@@ -456,7 +556,10 @@ pub fn explain_code(code: &str) -> Option<String> {
         "MPS0021" => "No-overloads rule violated in type namespace. Fix template: rename duplicate `T` symbols within module.",
         "MPS0022" => "No-overloads rule violated for globals/functions. Fix template: keep each `@` symbol name unique per module.",
         "MPS0023" => "No-overloads rule violated in signature namespace. Fix template: rename duplicate `sig` declarations.",
+        "MPS0024" => "Unsafe raw-pointer opcode used outside unsafe context. Fix template: move `ptr.*` into `unsafe {}` or mark function `unsafe fn`.",
+        "MPS0025" => "Unsafe function call outside unsafe context. Fix template: wrap call in `unsafe {}` or perform call from `unsafe fn`.",
         "MPL0001" => "Unknown emit kind. Example: unsupported `--emit` value. Fix template: use supported emits (e.g. `exe`, `llvm-ir`, `mpir`, `symgraph`).",
+        "MPL0002" => "Requested artifact missing. Example: build succeeded but expected emit output file is absent. Fix template: inspect linker/codegen diagnostics and ensure all requested emits are producible.",
         "MPL0801" => "Token budget too small for required output. Fix template: increase `--llm-token-budget` or use `minimal` budget policy.",
         "MPL0802" => "Requested tokenizer unavailable; fallback used. Fix template: install/configure requested tokenizer or explicitly use `approx:utf8_4chars`.",
         "MPL2001" => "Function too large lint. Fix template: split function into smaller helpers and keep CFG/local scope compact.",
@@ -468,6 +571,7 @@ pub fn explain_code(code: &str) -> Option<String> {
         "MPL2021" => "Mixed generics mode conflict. Fix template: use a single generics strategy consistently for the build target/profile.",
         "MPLINK01" => "Primary native link path failed; fallback started. Fix template: install/configure `llc` + system linker, or rely on clang IR fallback.",
         "MPLINK02" => "Native linking unavailable after fallback. Fix template: install linker toolchain for target triple; use LLVM IR artifacts until toolchain is fixed.",
+        "MPT2032" => "Impl binding target missing. Example: `impl trait for Type = @fn` references a function that cannot be resolved. Fix template: define/import the function and ensure the fn_ref matches exactly.",
         _ => {
             if normalized.starts_with(codes::MPO_PREFIX) {
                 "Ownership remediation: avoid using values after move, shorten borrow lifetimes, and clone only when sharing is required."
@@ -489,6 +593,27 @@ pub fn explain_code(code: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_json_encode_sorts_object_keys_deterministically() {
+        let value = serde_json::json!({
+            "zeta": 1,
+            "alpha": {
+                "beta": 2,
+                "aardvark": 3
+            },
+            "items": [
+                {"d": 4, "c": 3},
+                {"b": 2, "a": 1}
+            ]
+        });
+
+        let encoded = canonical_json_encode(&value).expect("canonical encoding should succeed");
+        assert_eq!(
+            encoded,
+            r#"{"alpha":{"aardvark":3,"beta":2},"items":[{"c":3,"d":4},{"a":1,"b":2}],"zeta":1}"#
+        );
+    }
 
     #[test]
     fn enforce_budget_truncates_to_fit_budget() {
@@ -527,14 +652,22 @@ mod tests {
                             patch_format: "unified".to_string(),
                             patch: long_text.clone(),
                             confidence: 0.5,
+                            requires_fmt: false,
+                            applies_to: std::collections::BTreeMap::new(),
+                            produces: std::collections::BTreeMap::new(),
                         },
                         SuggestedFix {
                             title: "fix2".to_string(),
                             patch_format: "unified".to_string(),
                             patch: long_text.clone(),
                             confidence: 0.4,
+                            requires_fmt: false,
+                            applies_to: std::collections::BTreeMap::new(),
+                            produces: std::collections::BTreeMap::new(),
                         },
                     ],
+                    rag_bundle: vec![serde_json::json!({ "chunk": long_text.clone() })],
+                    related_docs: vec!["doc://example".to_string()],
                 },
                 Diagnostic {
                     code: "MPL2002".to_string(),
@@ -546,8 +679,16 @@ mod tests {
                     explanation_md: Some(long_text),
                     why: None,
                     suggested_fixes: Vec::new(),
+                    rag_bundle: Vec::new(),
+                    related_docs: Vec::new(),
                 },
             ],
+            graphs: serde_json::json!({
+                "cfg": {
+                    "nodes": [1, 2, 3],
+                    "edges": [[1, 2], [2, 3]]
+                }
+            }),
             timing_ms: serde_json::json!({}),
             llm_budget: None,
         };

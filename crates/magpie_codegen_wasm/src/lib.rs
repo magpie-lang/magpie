@@ -28,10 +28,12 @@ pub fn adjust_module_for_wasm32(module: &mut MpirModule) {
                     pointer_addr_locals.insert(instr.dst);
                 }
 
-                if let MpirOp::PtrFromAddr { addr, .. } = &instr.op {
-                    if let MpirValue::Local(local) = addr {
-                        pointer_addr_locals.insert(*local);
-                    }
+                if let MpirOp::PtrFromAddr {
+                    addr: MpirValue::Local(local),
+                    ..
+                } = &instr.op
+                {
+                    pointer_addr_locals.insert(*local);
                 }
             }
         }
@@ -171,7 +173,11 @@ fn emit_wat_function(
     for local in &func.locals {
         local_types.insert(local.id.0, local.ty);
         if declared.insert(local.id.0) {
-            out.push_str(&format!(" (local {} {})", wat_local(local.id), wasm_ty(local.ty)));
+            out.push_str(&format!(
+                " (local {} {})",
+                wat_local(local.id),
+                wasm_ty(local.ty)
+            ));
         }
     }
 

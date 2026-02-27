@@ -186,14 +186,19 @@ pub mod fixed_type_ids {
     pub const USER_TYPE_START: TypeId = TypeId(1000);
 }
 
+type ValueFieldDef = (String, TypeId);
+type ValueStructFieldDefs = Vec<ValueFieldDef>;
+type ValueEnumVariantDef = (String, ValueStructFieldDefs);
+type ValueEnumVariantDefs = Vec<ValueEnumVariantDef>;
+
 /// Type context for interning and layout computation.
 #[derive(Debug, Default)]
 pub struct TypeCtx {
     pub types: Vec<(TypeId, TypeKind)>,
     next_user_id: u32,
     type_fqns: HashMap<Sid, String>,
-    value_struct_fields: HashMap<Sid, Vec<(String, TypeId)>>,
-    value_enum_variants: HashMap<Sid, Vec<(String, Vec<(String, TypeId)>)>>,
+    value_struct_fields: HashMap<Sid, ValueStructFieldDefs>,
+    value_enum_variants: HashMap<Sid, ValueEnumVariantDefs>,
     layout_cache: RefCell<HashMap<TypeId, TypeLayout>>,
 }
 
@@ -295,18 +300,84 @@ impl TypeCtx {
         self.type_fqns.insert(sid, fqn.into());
     }
 
-    pub fn register_value_struct_fields(&mut self, sid: Sid, fields: Vec<(String, TypeId)>) {
+    pub fn register_value_struct_fields(&mut self, sid: Sid, fields: ValueStructFieldDefs) {
         self.value_struct_fields.insert(sid, fields);
         self.layout_cache.borrow_mut().clear();
     }
 
-    pub fn register_value_enum_variants(
-        &mut self,
-        sid: Sid,
-        variants: Vec<(String, Vec<(String, TypeId)>)>,
-    ) {
+    pub fn register_value_enum_variants(&mut self, sid: Sid, variants: ValueEnumVariantDefs) {
         self.value_enum_variants.insert(sid, variants);
         self.layout_cache.borrow_mut().clear();
+    }
+
+    pub fn user_struct_fields(&self, sid: &Sid) -> Option<&ValueStructFieldDefs> {
+        self.value_struct_fields.get(sid)
+    }
+
+    pub fn user_enum_variants(&self, sid: &Sid) -> Option<&ValueEnumVariantDefs> {
+        self.value_enum_variants.get(sid)
+    }
+
+    pub fn user_struct_layout(&self, sid: &Sid) -> Option<TypeLayout> {
+        let fields = self.value_struct_fields.get(sid)?;
+        Some(self.compute_field_layout(fields))
+    }
+
+    pub fn user_enum_layout(&self, sid: &Sid) -> Option<TypeLayout> {
+        let variants = self.value_enum_variants.get(sid)?;
+        Some(self.compute_enum_layout_public(variants))
+    }
+
+    pub fn user_struct_field(&self, sid: &Sid, field: &str) -> Option<(TypeId, u64)> {
+        let fields = self.value_struct_fields.get(sid)?;
+        let mut offset = 0_u64;
+        for (name, ty) in fields {
+            let ty_layout = self.compute_layout(*ty);
+            let align = ty_layout.align.max(1);
+            offset = align_to(offset, align);
+            if name == field {
+                return Some((*ty, offset));
+            }
+            offset = offset.saturating_add(ty_layout.size);
+        }
+        None
+    }
+
+    pub fn user_enum_variant_tag(&self, sid: &Sid, variant: &str) -> Option<i32> {
+        let variants = self.value_enum_variants.get(sid)?;
+        variants
+            .iter()
+            .position(|(name, _)| name == variant)
+            .map(|idx| idx as i32)
+    }
+
+    pub fn user_enum_variant_field(
+        &self,
+        sid: &Sid,
+        variant: &str,
+        field: &str,
+    ) -> Option<(TypeId, u64)> {
+        let variants = self.value_enum_variants.get(sid)?;
+        let (_, fields) = variants.iter().find(|(name, _)| name == variant)?;
+        let mut offset = 0_u64;
+        for (name, ty) in fields {
+            let ty_layout = self.compute_layout(*ty);
+            let align = ty_layout.align.max(1);
+            offset = align_to(offset, align);
+            if name == field {
+                return Some((*ty, offset));
+            }
+            offset = offset.saturating_add(ty_layout.size);
+        }
+        None
+    }
+
+    pub fn user_enum_payload_offset(&self, sid: &Sid) -> Option<u64> {
+        self.user_enum_layout(sid)?
+            .fields
+            .iter()
+            .find(|(name, _)| name == "payload")
+            .map(|(_, offset)| *offset)
     }
 
     pub fn type_str(&self, type_id: TypeId) -> String {
@@ -324,6 +395,10 @@ impl TypeCtx {
     }
 
     pub fn finalize_type_ids(&mut self) {
+        let _ = self.finalize_type_ids_with_remap();
+    }
+
+    pub fn finalize_type_ids_with_remap(&mut self) -> HashMap<TypeId, TypeId> {
         let mut user_entries = self
             .types
             .iter()
@@ -335,15 +410,20 @@ impl TypeCtx {
         });
 
         let mut remap: HashMap<TypeId, TypeId> = HashMap::with_capacity(user_entries.len());
+        let mut changed_remap: HashMap<TypeId, TypeId> = HashMap::new();
         let mut next = fixed_type_ids::USER_TYPE_START.0;
         for (old_id, _) in user_entries {
-            remap.insert(old_id, TypeId(next));
+            let new_id = TypeId(next);
+            remap.insert(old_id, new_id);
+            if old_id != new_id {
+                changed_remap.insert(old_id, new_id);
+            }
             next += 1;
         }
 
         if remap.is_empty() {
             self.next_user_id = fixed_type_ids::USER_TYPE_START.0;
-            return;
+            return changed_remap;
         }
 
         let mut rewritten = Vec::with_capacity(self.types.len());
@@ -379,6 +459,7 @@ impl TypeCtx {
             .max(fixed_type_ids::USER_TYPE_START.0);
 
         self.layout_cache.borrow_mut().clear();
+        changed_remap
     }
 
     fn compute_layout_inner(&self, type_id: TypeId, visiting: &mut HashSet<TypeId>) -> TypeLayout {
@@ -455,6 +536,57 @@ impl TypeCtx {
             .borrow_mut()
             .insert(type_id, layout.clone());
         layout
+    }
+
+    fn compute_field_layout(&self, fields: &[(String, TypeId)]) -> TypeLayout {
+        let mut align = 1_u64;
+        let mut offset = 0_u64;
+        let mut field_offsets = Vec::with_capacity(fields.len());
+
+        for (name, ty) in fields {
+            let field_layout = self.compute_layout(*ty);
+            let field_align = field_layout.align.max(1);
+            offset = align_to(offset, field_align);
+            field_offsets.push((name.clone(), offset));
+            offset = offset.saturating_add(field_layout.size);
+            align = align.max(field_align);
+        }
+
+        TypeLayout {
+            size: align_to(offset, align),
+            align,
+            fields: field_offsets,
+        }
+    }
+
+    fn compute_enum_layout_public(
+        &self,
+        variants: &[(String, Vec<(String, TypeId)>)],
+    ) -> TypeLayout {
+        let mut payload_size = 0_u64;
+        let mut payload_align = 1_u64;
+
+        for (_, fields) in variants {
+            let payload_layout = self.compute_field_layout(fields);
+            payload_size = payload_size.max(payload_layout.size);
+            payload_align = payload_align.max(payload_layout.align);
+        }
+
+        let tag_size = 4_u64;
+        let tag_align = 4_u64;
+        let payload_offset = align_to(tag_size, payload_align);
+        let align = tag_align.max(payload_align);
+        let size = align_to(payload_offset.saturating_add(payload_size), align);
+        let mut fields = vec![("tag".to_string(), 0)];
+        if payload_size > 0 {
+            fields.push(("payload".to_string(), payload_offset));
+        }
+
+        TypeLayout {
+            size,
+            align,
+            fields,
+        }
     }
 
     fn compute_struct_layout(
@@ -816,6 +948,41 @@ mod tests {
     }
 
     #[test]
+    fn finalize_type_ids_with_remap_reports_changed_ids() {
+        let mut ctx = TypeCtx::new();
+        let sid_z = Sid("T:ZZZZZZZZZZ".to_string());
+        let sid_a = Sid("T:AAAAAAAAAA".to_string());
+        let z = ctx.intern(TypeKind::ValueStruct { sid: sid_z.clone() });
+        let a = ctx.intern(TypeKind::ValueStruct { sid: sid_a.clone() });
+        ctx.register_type_fqn(sid_z.clone(), "pkg.zmod.TZed");
+        ctx.register_type_fqn(sid_a.clone(), "pkg.amod.TAlpha");
+
+        let remap = ctx.finalize_type_ids_with_remap();
+
+        assert_eq!(remap.get(&z), Some(&TypeId(1001)));
+        assert_eq!(remap.get(&a), Some(&TypeId(1000)));
+    }
+
+    #[test]
+    fn finalize_type_ids_with_remap_empty_when_ids_already_canonical() {
+        let mut ctx = TypeCtx::new();
+        let sid_a = Sid("T:AAAAAAAAAA".to_string());
+        let sid_z = Sid("T:ZZZZZZZZZZ".to_string());
+        let _a = ctx.intern(TypeKind::ValueStruct { sid: sid_a.clone() });
+        let _z = ctx.intern(TypeKind::ValueStruct { sid: sid_z.clone() });
+        ctx.register_type_fqn(sid_a.clone(), "pkg.amod.TAlpha");
+        ctx.register_type_fqn(sid_z.clone(), "pkg.zmod.TZed");
+
+        let remap = ctx.finalize_type_ids_with_remap();
+
+        assert!(remap.is_empty());
+        let next = ctx.intern(TypeKind::RawPtr {
+            to: fixed_type_ids::I32,
+        });
+        assert_eq!(next, TypeId(1002));
+    }
+
+    #[test]
     fn canonical_type_str_common_types() {
         let mut ctx = TypeCtx::new();
         let i32_ty = fixed_type_ids::I32;
@@ -855,10 +1022,7 @@ mod tests {
         assert_eq!(ctx.type_str(shared_str), "shared Str");
         assert_eq!(ctx.type_str(borrow_map), "borrow Map<i32,Str>");
         assert_eq!(ctx.type_str(opt_shared), "TOption<shared Str>");
-        assert_eq!(
-            ctx.type_str(result_ty),
-            "TResult<i32,borrow Map<i32,Str>>"
-        );
+        assert_eq!(ctx.type_str(result_ty), "TResult<i32,borrow Map<i32,Str>>");
         assert_eq!(ctx.type_str(raw_i32), "rawptr<i32>");
         assert_eq!(ctx.type_str(callable), "TCallable<E:CALLABLE01>");
         assert_eq!(ctx.type_str(user_type), "pkg.mod.TNode");

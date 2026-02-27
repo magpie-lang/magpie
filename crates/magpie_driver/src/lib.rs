@@ -1,4 +1,5 @@
 //! Magpie compiler driver (§5.2, §22, §26.1).
+#![allow(clippy::field_reassign_with_default)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -12,29 +13,40 @@ use magpie_ast::{
     AstOpVoid, AstType, ExportItem, FileId,
 };
 use magpie_csnf::{format_csnf, update_digest};
-use magpie_diag::{codes, Diagnostic, DiagnosticBag, OutputEnvelope, Severity, SuggestedFix};
+use magpie_diag::{
+    canonical_json_encode, codes, enforce_budget, Diagnostic, DiagnosticBag, OutputEnvelope,
+    Severity, SuggestedFix, TokenBudget,
+};
+use magpie_gpu::{compute_kernel_layout, generate_kernel_registry_ir, generate_spirv_with_layout};
 use magpie_hir::{
     verify_hir, BlockId, HirBlock, HirConst, HirConstLit, HirFunction, HirInstr, HirModule, HirOp,
-    HirOpVoid, HirTerminator, HirValue, LocalId,
+    HirOpVoid, HirTerminator, HirTypeDecl, HirValue, LocalId,
 };
 use magpie_lex::lex;
-use magpie_memory::{build_index, MmsItem};
+use magpie_memory::{build_index_with_sources, MmsItem, MmsSourceFingerprint};
 use magpie_mpir::{
     print_mpir, verify_mpir, MpirBlock, MpirFn, MpirInstr, MpirLocalDecl, MpirModule, MpirOp,
     MpirOpVoid, MpirTerminator, MpirTypeTable, MpirValue,
 };
 use magpie_own::check_ownership;
 use magpie_parse::parse_file;
-use magpie_sema::{generate_sid, lower_to_hir, resolve_modules};
-use magpie_types::{fixed_type_ids, Sid, TypeCtx};
+use magpie_sema::{
+    check_trait_impls, check_v01_restrictions, generate_sid, lower_to_hir, resolve_modules,
+    typecheck_module, ResolvedModule,
+};
+use magpie_types::{fixed_type_ids, Sid, TypeCtx, TypeId};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+#[allow(dead_code)]
 #[path = "../../magpie_codegen_llvm/src/lib.rs"]
 mod magpie_codegen_llvm;
 
 const DEFAULT_MAX_ERRORS: usize = 20;
+pub const DEFAULT_LLM_TOKEN_BUDGET: u32 = 12_000;
+pub const DEFAULT_LLM_TOKENIZER: &str = "approx:utf8_4chars";
+pub const DEFAULT_LLM_BUDGET_POLICY: &str = "balanced";
 
 const STAGE_1: &str = "stage1_read_lex_parse";
 const STAGE_2: &str = "stage2_resolve";
@@ -77,9 +89,15 @@ pub struct DriverConfig {
     pub profile: BuildProfile,
     pub target_triple: String,
     pub emit: Vec<String>,
+    pub cache_dir: Option<String>,
+    pub jobs: Option<u32>,
+    pub offline: bool,
+    pub no_default_features: bool,
     pub max_errors: usize,
     pub llm_mode: bool,
     pub token_budget: Option<u32>,
+    pub llm_tokenizer: Option<String>,
+    pub llm_budget_policy: Option<String>,
     pub shared_generics: bool,
     pub features: Vec<String>,
 }
@@ -91,9 +109,15 @@ impl Default for DriverConfig {
             profile: BuildProfile::Dev,
             target_triple: default_target_triple(),
             emit: vec!["exe".to_string()],
+            cache_dir: None,
+            jobs: None,
+            offline: false,
+            no_default_features: false,
             max_errors: DEFAULT_MAX_ERRORS,
             llm_mode: false,
             token_budget: None,
+            llm_tokenizer: None,
+            llm_budget_policy: None,
             shared_generics: false,
             features: Vec::new(),
         }
@@ -105,7 +129,7 @@ pub struct BuildResult {
     pub success: bool,
     pub diagnostics: Vec<Diagnostic>,
     pub artifacts: Vec<String>,
-    pub timing_ms: HashMap<String, u64>,
+    pub timing_ms: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -114,6 +138,12 @@ pub struct TestResult {
     pub passed: usize,
     pub failed: usize,
     pub test_names: Vec<(String, bool)>,
+}
+
+#[derive(Clone, Debug)]
+struct GpuKernelDecl {
+    sid: Sid,
+    target: String,
 }
 
 /// Build JSON output envelope per §26.1.
@@ -129,9 +159,83 @@ pub fn json_output_envelope(
         success: result.success,
         artifacts: result.artifacts.clone(),
         diagnostics: result.diagnostics.clone(),
+        graphs: output_envelope_graphs(&result.artifacts),
         timing_ms: serde_json::to_value(&result.timing_ms).unwrap_or_else(|_| json!({})),
         llm_budget: llm_budget_value(config),
     }
+}
+
+fn default_output_envelope_graphs() -> serde_json::Value {
+    json!({
+        "symbols": {},
+        "deps": {},
+        "ownership": {},
+        "cfg": {},
+    })
+}
+
+fn output_graph_slot_for_artifact(artifact: &str) -> Option<&'static str> {
+    if artifact.ends_with(".symgraph.json") {
+        Some("symbols")
+    } else if artifact.ends_with(".depsgraph.json") {
+        Some("deps")
+    } else if artifact.ends_with(".ownershipgraph.json") {
+        Some("ownership")
+    } else if artifact.ends_with(".cfggraph.json") {
+        Some("cfg")
+    } else {
+        None
+    }
+}
+
+fn output_envelope_graphs(artifacts: &[String]) -> serde_json::Value {
+    let mut graphs = default_output_envelope_graphs();
+    let Some(graph_map) = graphs.as_object_mut() else {
+        return default_output_envelope_graphs();
+    };
+
+    for artifact in artifacts {
+        let Some(slot) = output_graph_slot_for_artifact(artifact) else {
+            continue;
+        };
+        let Ok(raw) = fs::read_to_string(artifact) else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        graph_map.insert(slot.to_string(), parsed);
+    }
+
+    graphs
+}
+
+pub fn apply_llm_budget(config: &DriverConfig, envelope: &mut OutputEnvelope) {
+    let Some(mut budget) = effective_budget_config(config) else {
+        return;
+    };
+
+    if budget.tokenizer != DEFAULT_LLM_TOKENIZER {
+        envelope.diagnostics.push(Diagnostic {
+            code: codes::MPL0802.to_string(),
+            severity: Severity::Warning,
+            title: "tokenizer fallback used".to_string(),
+            primary_span: None,
+            secondary_spans: Vec::new(),
+            message: format!(
+                "Tokenizer '{}' is unavailable; falling back to '{}'.",
+                budget.tokenizer, DEFAULT_LLM_TOKENIZER
+            ),
+            explanation_md: None,
+            why: None,
+            suggested_fixes: Vec::new(),
+            rag_bundle: Vec::new(),
+            related_docs: Vec::new(),
+        });
+        budget.tokenizer = DEFAULT_LLM_TOKENIZER.to_string();
+    }
+
+    enforce_budget(envelope, &budget);
 }
 
 /// Explain a diagnostic code using shared templates.
@@ -170,7 +274,9 @@ pub fn import_c_header(header_path: &str, out_path: &str) -> BuildResult {
     match write_text_artifact(&out_path, &payload) {
         Ok(()) => {
             result.success = true;
-            result.artifacts.push(out_path.to_string_lossy().to_string());
+            result
+                .artifacts
+                .push(out_path.to_string_lossy().to_string());
             result.diagnostics.push(simple_diag(
                 "MPF1002",
                 Severity::Info,
@@ -195,6 +301,87 @@ pub fn import_c_header(header_path: &str, out_path: &str) -> BuildResult {
     result
 }
 
+fn resolve_dependencies_for_build(
+    entry_path: &str,
+    offline: bool,
+) -> Result<Option<PathBuf>, String> {
+    let Some(manifest_path) = discover_manifest_path(entry_path) else {
+        return Ok(None);
+    };
+    let manifest = magpie_pkg::parse_manifest(&manifest_path)?;
+    let lock = magpie_pkg::resolve_deps(&manifest, offline)?;
+    let lock_path = manifest_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("Magpie.lock");
+    magpie_pkg::write_lockfile(&lock, &lock_path)?;
+    Ok(Some(lock_path))
+}
+
+fn is_default_entry_path(entry_path: &str) -> bool {
+    let path = Path::new(entry_path);
+    let file_name = path.file_name().and_then(|value| value.to_str());
+    let parent_name = path
+        .parent()
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str());
+    file_name == Some("main.mp") && parent_name == Some("src")
+}
+
+fn discover_manifest_from_cwd() -> Option<PathBuf> {
+    let mut current = std::env::current_dir().ok()?;
+    loop {
+        let candidate = current.join("Magpie.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn resolve_manifest_build_entry(entry_path: &str) -> Option<String> {
+    let manifest_path = discover_manifest_path(entry_path).or_else(discover_manifest_from_cwd)?;
+    let manifest = magpie_pkg::parse_manifest(&manifest_path).ok()?;
+    let raw_entry = manifest.build.entry.trim();
+    if raw_entry.is_empty() {
+        return None;
+    }
+
+    let raw_path = Path::new(raw_entry);
+    let resolved = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        manifest_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(raw_path)
+    };
+    Some(resolved.to_string_lossy().to_string())
+}
+
+fn discover_manifest_path(entry_path: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(entry_path);
+    let mut current = if path.is_dir() {
+        path
+    } else {
+        path.parent()?.to_path_buf()
+    };
+
+    loop {
+        let candidate = current.join("Magpie.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
 /// Emit one of the compiler graph payloads (`symbols`, `deps`, `ownership`, `cfg`) as JSON.
 pub fn emit_graph(kind: &str, modules: &[HirModule], type_ctx: &TypeCtx) -> String {
     let normalized = kind.trim().to_ascii_lowercase();
@@ -209,56 +396,56 @@ pub fn emit_graph(kind: &str, modules: &[HirModule], type_ctx: &TypeCtx) -> Stri
             "supported": ["symbols", "deps", "ownership", "cfg"],
         }),
     };
-    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+    canonical_json_encode(&payload).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Full compilation pipeline (§22.1).
 pub fn build(config: &DriverConfig) -> BuildResult {
+    let mut effective_config = config.clone();
+    if is_default_entry_path(&effective_config.entry_path) {
+        if let Some(manifest_entry) = resolve_manifest_build_entry(&effective_config.entry_path) {
+            effective_config.entry_path = manifest_entry;
+        }
+    }
+    let config = &effective_config;
+
     let max_errors = config.max_errors.max(1);
     let mut result = BuildResult::default();
 
-    if config.shared_generics {
-        let mut diag = DiagnosticBag::new(max_errors);
-        emit_driver_diag(
-            &mut diag,
-            codes::MPL2021,
-            Severity::Error,
-            "shared generics unsupported",
-            "shared generics (vtable mode) is not yet implemented in v0.1",
-        );
-        mark_skipped_from(&mut result.timing_ms, 0);
-        let _ = append_stage_diagnostics(&mut result, diag);
-        return finalize_build_result(result, config);
+    {
+        let start = Instant::now();
+        match resolve_dependencies_for_build(&config.entry_path, config.offline) {
+            Ok(Some(lock_path)) => {
+                result
+                    .artifacts
+                    .push(lock_path.to_string_lossy().to_string());
+            }
+            Ok(None) => {}
+            Err(err) => {
+                result
+                    .timing_ms
+                    .insert("stage0_pkg_resolve".to_string(), elapsed_ms(start));
+                result.diagnostics.push(simple_diag(
+                    "MPK0010",
+                    Severity::Error,
+                    "dependency resolution failed",
+                    err,
+                ));
+                mark_skipped_from(&mut result.timing_ms, 0);
+                return finalize_build_result(result, config);
+            }
+        }
+        result
+            .timing_ms
+            .insert("stage0_pkg_resolve".to_string(), elapsed_ms(start));
     }
 
     // Stage 1: read + lex + parse + in-memory CSNF canonicalization.
-    let mut ast_files: Vec<AstFile> = Vec::new();
+    let ast_files: Vec<AstFile>;
     {
         let start = Instant::now();
         let mut diag = DiagnosticBag::new(max_errors);
-        let source = match fs::read_to_string(&config.entry_path) {
-            Ok(source) => Some(source),
-            Err(err) => {
-                emit_driver_diag(
-                    &mut diag,
-                    "MPP0001",
-                    Severity::Error,
-                    "failed to read source file",
-                    format!("Could not read '{}': {}", config.entry_path, err),
-                );
-                None
-            }
-        };
-
-        if let Some(source) = source {
-            let file_id = FileId(0);
-            let tokens = lex(file_id, &source, &mut diag);
-            if let Ok(ast) = parse_file(&tokens, file_id, &mut diag) {
-                let canonical = format_csnf(&ast);
-                let _canonical_with_digest = update_digest(&canonical);
-                ast_files.push(ast);
-            }
-        }
+        ast_files = load_stage1_ast_files(&config.entry_path, &mut diag);
 
         result
             .timing_ms
@@ -300,6 +487,7 @@ pub fn build(config: &DriverConfig) -> BuildResult {
         }
         resolved.unwrap_or_default()
     };
+    let gpu_kernel_decls = collect_gpu_kernel_decls(&resolved_modules);
 
     // Stage 3: typecheck.
     // Per §22.1 stage 3, type checking is performed during AST -> HIR lowering in sema.
@@ -310,7 +498,28 @@ pub fn build(config: &DriverConfig) -> BuildResult {
         let mut diag = DiagnosticBag::new(max_errors);
         for module in &resolved_modules {
             match lower_to_hir(module, &mut type_ctx, &mut diag) {
-                Ok(hir) => hir_modules.push(hir),
+                Ok(hir) => {
+                    let _ = typecheck_module(&hir, &type_ctx, &module.symbol_table, &mut diag);
+                    let impl_decls = module
+                        .ast
+                        .decls
+                        .iter()
+                        .filter_map(|decl| match &decl.node {
+                            AstDecl::Impl(impl_decl) => Some(impl_decl.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let _ = check_trait_impls(
+                        &hir,
+                        &type_ctx,
+                        &module.symbol_table,
+                        &impl_decls,
+                        &module.resolved_imports,
+                        &mut diag,
+                    );
+                    let _ = check_v01_restrictions(&hir, &type_ctx, &mut diag);
+                    hir_modules.push(hir);
+                }
                 Err(()) => {
                     if !diag.has_errors() {
                         emit_driver_diag(
@@ -344,6 +553,11 @@ pub fn build(config: &DriverConfig) -> BuildResult {
         result
             .timing_ms
             .insert(STAGE_35.to_string(), elapsed_ms(start));
+    }
+
+    let type_id_remap = type_ctx.finalize_type_ids_with_remap();
+    if !type_id_remap.is_empty() {
+        remap_hir_modules_type_ids(&mut hir_modules, &type_id_remap);
     }
 
     // Stage 4: verify HIR.
@@ -410,41 +624,6 @@ pub fn build(config: &DriverConfig) -> BuildResult {
                         err,
                     );
                 }
-            }
-        }
-        let stage_failed = append_stage_diagnostics(&mut result, diag);
-        if stage_failed {
-            mark_skipped_from(&mut result.timing_ms, 6);
-            return finalize_build_result(result, config);
-        }
-    }
-
-    // Optional `.mpdbg` debug sidecar (G60 stub).
-    {
-        let mut diag = DiagnosticBag::new(max_errors);
-        if emit_contains(&config.emit, "mpdbg") {
-            // TODO(G60): replace placeholder payload with real per-pass debug trace schema.
-            let mpdbg_path = stage_mpdbg_output_path(config);
-            let payload = serde_json::to_string_pretty(&json!({
-                "format": "mpdbg.v0.stub",
-                "entry_path": config.entry_path,
-                "note": "TODO(G60): wire full debug-event emission.",
-            }))
-            .unwrap_or_else(|_| "{}".to_string());
-            match write_text_artifact(&mpdbg_path, &payload) {
-                Ok(()) => {
-                    let mpdbg_path = mpdbg_path.to_string_lossy().to_string();
-                    if !result.artifacts.contains(&mpdbg_path) {
-                        result.artifacts.push(mpdbg_path);
-                    }
-                }
-                Err(err) => emit_driver_diag(
-                    &mut diag,
-                    "MPP0003",
-                    Severity::Error,
-                    "failed to write mpdbg artifact",
-                    err,
-                ),
             }
         }
         let stage_failed = append_stage_diagnostics(&mut result, diag);
@@ -539,14 +718,22 @@ pub fn build(config: &DriverConfig) -> BuildResult {
             .insert(STAGE_9.to_string(), elapsed_ms(start));
     }
 
-    // Stage 10: LLVM codegen + write .ll.
+    // Stage 10: LLVM codegen + GPU SPIR-V/registry generation.
     let mut llvm_ir_paths: Vec<PathBuf> = Vec::new();
     {
         let start = Instant::now();
         let mut diag = DiagnosticBag::new(max_errors);
         let module_count = mpir_modules.len();
+        let emit_llvm_bc = emit_contains(&config.emit, "llvm-bc");
+        let emit_spv = emit_contains(&config.emit, "spv");
         for (idx, module) in mpir_modules.iter().enumerate() {
-            match magpie_codegen_llvm::codegen_module(module, &type_ctx) {
+            match magpie_codegen_llvm::codegen_module_with_options(
+                module,
+                &type_ctx,
+                magpie_codegen_llvm::CodegenOptions {
+                    shared_generics: config.shared_generics,
+                },
+            ) {
                 Ok(llvm_ir) => {
                     let llvm_path = stage_module_output_path(config, idx, module_count, "ll");
                     if let Err(err) = write_text_artifact(&llvm_path, &llvm_ir) {
@@ -559,6 +746,21 @@ pub fn build(config: &DriverConfig) -> BuildResult {
                         );
                     } else {
                         llvm_ir_paths.push(llvm_path);
+                        if emit_llvm_bc {
+                            let bc_path = stage_module_output_path(config, idx, module_count, "bc");
+                            if let Err(err) = compile_llvm_ir_to_bitcode(
+                                llvm_ir_paths.last().expect("llvm path pushed"),
+                                &bc_path,
+                            ) {
+                                emit_driver_diag(
+                                    &mut diag,
+                                    "MPLLVM02",
+                                    Severity::Warning,
+                                    "failed to emit llvm bitcode",
+                                    err,
+                                );
+                            }
+                        }
                     }
                 }
                 Err(err) => {
@@ -572,6 +774,99 @@ pub fn build(config: &DriverConfig) -> BuildResult {
                 }
             }
         }
+
+        let kernel_by_sid: HashMap<String, &GpuKernelDecl> = gpu_kernel_decls
+            .iter()
+            .map(|decl| (decl.sid.0.clone(), decl))
+            .collect();
+        let mut kernel_entries = Vec::new();
+        let mut seen_kernel_sids: HashSet<String> = HashSet::new();
+
+        for module in &mpir_modules {
+            for func in &module.functions {
+                let Some(kernel_decl) = kernel_by_sid.get(&func.sid.0) else {
+                    continue;
+                };
+                seen_kernel_sids.insert(func.sid.0.clone());
+
+                if !kernel_decl.target.eq_ignore_ascii_case("spv") {
+                    emit_driver_diag(
+                        &mut diag,
+                        "MPG1200",
+                        Severity::Error,
+                        "unsupported gpu target",
+                        format!(
+                            "gpu kernel '{}' declares unsupported target '{}'; only target(spv) is supported in v0.1.",
+                            func.name, kernel_decl.target
+                        ),
+                    );
+                    continue;
+                }
+
+                let _ = magpie_gpu::validate_kernel(func, &type_ctx, &mut diag);
+                let layout = compute_kernel_layout(func, &type_ctx);
+                match generate_spirv_with_layout(func, &layout, &type_ctx) {
+                    Ok(spirv) => {
+                        if emit_spv {
+                            let spv_path = stage_gpu_kernel_spv_output_path(config, &func.sid);
+                            match write_binary_artifact(&spv_path, &spirv) {
+                                Ok(()) => {
+                                    let artifact = spv_path.to_string_lossy().to_string();
+                                    if !result.artifacts.contains(&artifact) {
+                                        result.artifacts.push(artifact);
+                                    }
+                                }
+                                Err(err) => emit_driver_diag(
+                                    &mut diag,
+                                    "MPP0003",
+                                    Severity::Error,
+                                    "failed to write spir-v artifact",
+                                    err,
+                                ),
+                            }
+                        }
+                        kernel_entries.push((func.sid.0.clone(), layout, spirv));
+                    }
+                    Err(err) => emit_driver_diag(
+                        &mut diag,
+                        "MPG1202",
+                        Severity::Error,
+                        "gpu kernel spir-v lowering failed",
+                        err,
+                    ),
+                }
+            }
+        }
+
+        for decl in &gpu_kernel_decls {
+            if !seen_kernel_sids.contains(&decl.sid.0) {
+                emit_driver_diag(
+                    &mut diag,
+                    "MPG1203",
+                    Severity::Warning,
+                    "gpu kernel missing in lowered mpir",
+                    format!(
+                        "gpu kernel sid '{}' was declared but no lowered MPIR function was found; it will not be registered.",
+                        decl.sid.0
+                    ),
+                );
+            }
+        }
+
+        let registry_ir = generate_kernel_registry_ir(&kernel_entries);
+        let registry_path = stage_gpu_registry_output_path(config);
+        if let Err(err) = write_text_artifact(&registry_path, &registry_ir) {
+            emit_driver_diag(
+                &mut diag,
+                "MPP0003",
+                Severity::Error,
+                "failed to write gpu kernel registry artifact",
+                err,
+            );
+        } else {
+            llvm_ir_paths.push(registry_path);
+        }
+
         result
             .timing_ms
             .insert(STAGE_10.to_string(), elapsed_ms(start));
@@ -587,61 +882,71 @@ pub fn build(config: &DriverConfig) -> BuildResult {
         let start = Instant::now();
         let mut diag = DiagnosticBag::new(max_errors);
         if emit_contains_any(&config.emit, &["exe", "shared-lib", "object", "asm"]) {
-            let output_path = stage_link_output_path(config);
-            let link_shared =
-                emit_contains(&config.emit, "shared-lib") && !emit_contains(&config.emit, "exe");
-            match link_via_llc_and_linker(config, &llvm_ir_paths, &output_path, link_shared) {
-                Ok(object_paths) => {
-                    if emit_contains(&config.emit, "object") {
-                        for object in object_paths {
-                            let object = object.to_string_lossy().to_string();
-                            if !result.artifacts.contains(&object) {
-                                result.artifacts.push(object);
+            if let Err(err) = verify_generics_mode_markers(&llvm_ir_paths, config.shared_generics) {
+                emit_driver_diag(
+                    &mut diag,
+                    codes::MPL2021,
+                    Severity::Error,
+                    "mixed generics mode",
+                    err,
+                );
+            } else {
+                let output_path = stage_link_output_path(config);
+                let link_shared = emit_contains(&config.emit, "shared-lib")
+                    && !emit_contains(&config.emit, "exe");
+                match link_via_llc_and_linker(config, &llvm_ir_paths, &output_path, link_shared) {
+                    Ok(object_paths) => {
+                        if emit_contains(&config.emit, "object") {
+                            for object in object_paths {
+                                let object = object.to_string_lossy().to_string();
+                                if !result.artifacts.contains(&object) {
+                                    result.artifacts.push(object);
+                                }
                             }
                         }
-                    }
-                    let output = output_path.to_string_lossy().to_string();
-                    if !result.artifacts.contains(&output) {
-                        result.artifacts.push(output);
-                    }
-                }
-                Err(primary_err) => {
-                    emit_driver_diag(
-                        &mut diag,
-                        "MPLINK01",
-                        Severity::Warning,
-                        "native link fallback",
-                        format!(
-                            "llc + cc/clang link failed; trying clang -x ir fallback. Reason: {primary_err}"
-                        ),
-                    );
-                    match link_via_clang_ir(config, &llvm_ir_paths, &output_path, link_shared) {
-                        Ok(()) => {
-                            let output = output_path.to_string_lossy().to_string();
-                            if !result.artifacts.contains(&output) {
-                                result.artifacts.push(output);
-                            }
+                        let output = output_path.to_string_lossy().to_string();
+                        if !result.artifacts.contains(&output) {
+                            result.artifacts.push(output);
                         }
-                        Err(fallback_err) => {
-                            let outputs = llvm_ir_paths
-                                .iter()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .collect::<Vec<_>>();
-                            emit_driver_diag(
-                                &mut diag,
-                                "MPLINK02",
-                                Severity::Warning,
-                                "native linking unavailable",
-                                format!(
-                                    "Could not produce native output; keeping LLVM IR artifacts [{}]. llc/cc failure: {}. clang -x ir failure: {}.",
-                                    outputs.join(", "),
-                                    primary_err,
-                                    fallback_err
-                                ),
-                            );
-                            for path in outputs {
-                                if !result.artifacts.contains(&path) {
-                                    result.artifacts.push(path);
+                    }
+                    Err(primary_err) => {
+                        emit_driver_diag(
+                            &mut diag,
+                            "MPLINK01",
+                            Severity::Warning,
+                            "native link fallback",
+                            format!(
+                                "llc + cc/clang link failed; trying clang -x ir fallback. Reason: {primary_err}"
+                            ),
+                        );
+                        match link_via_clang_ir(config, &llvm_ir_paths, &output_path, link_shared) {
+                            Ok(()) => {
+                                let output = output_path.to_string_lossy().to_string();
+                                if !result.artifacts.contains(&output) {
+                                    result.artifacts.push(output);
+                                }
+                            }
+                            Err(fallback_err) => {
+                                let outputs = llvm_ir_paths
+                                    .iter()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .collect::<Vec<_>>();
+                                emit_driver_diag(
+                                    &mut diag,
+                                    "MPLINK02",
+                                    Severity::Warning,
+                                    "native linking unavailable",
+                                    format!(
+                                        "Could not produce native output; keeping LLVM IR artifacts [{}]. llc/cc failure: {}. clang -x ir failure: {}.",
+                                        outputs.join(", "),
+                                        primary_err,
+                                        fallback_err
+                                    ),
+                                );
+                                for path in outputs {
+                                    if !result.artifacts.contains(&path) {
+                                        result.artifacts.push(path);
+                                    }
                                 }
                             }
                         }
@@ -665,7 +970,7 @@ pub fn build(config: &DriverConfig) -> BuildResult {
         let mut diag = DiagnosticBag::new(max_errors);
         let mms_artifacts =
             collect_mms_artifact_paths(config, &result.artifacts, &llvm_ir_paths, &mpir_modules);
-        if let Some(index_path) =
+        for index_path in
             update_mms_index(config, &mms_artifacts, &hir_modules, &type_ctx, &mut diag)
         {
             let index_path = index_path.to_string_lossy().to_string();
@@ -680,6 +985,277 @@ pub fn build(config: &DriverConfig) -> BuildResult {
     }
 
     finalize_build_result(result, config)
+}
+
+/// `magpie parse` entry-point: read + lex + parse and emit debug AST artifact.
+pub fn parse_entry(config: &DriverConfig) -> BuildResult {
+    let max_errors = config.max_errors.max(1);
+    let mut result = BuildResult::default();
+
+    let stage_start = Instant::now();
+    let mut diag = DiagnosticBag::new(max_errors);
+
+    let mut parsed: Option<AstFile> = None;
+    match fs::read_to_string(&config.entry_path) {
+        Ok(source) => {
+            let file_id = FileId(0);
+            let tokens = lex(file_id, &source, &mut diag);
+            if let Ok(ast) = parse_file(&tokens, file_id, &mut diag) {
+                parsed = Some(ast);
+            }
+        }
+        Err(err) => emit_driver_diag(
+            &mut diag,
+            "MPP0001",
+            Severity::Error,
+            "failed to read source file",
+            format!("Could not read '{}': {}", config.entry_path, err),
+        ),
+    }
+
+    result.timing_ms.insert(
+        "parse_stage1_read_lex_parse".to_string(),
+        elapsed_ms(stage_start),
+    );
+
+    let stage_failed = append_stage_diagnostics(&mut result, diag);
+    if !stage_failed {
+        if let Some(ast) = parsed {
+            let ast_path = stage_parse_ast_output_path(config);
+            let ast_text = format!("{:#?}\n", ast);
+            match write_text_artifact(&ast_path, &ast_text) {
+                Ok(()) => result
+                    .artifacts
+                    .push(ast_path.to_string_lossy().to_string()),
+                Err(err) => result.diagnostics.push(simple_diag(
+                    "MPP0003",
+                    Severity::Error,
+                    "failed to write ast artifact",
+                    err,
+                )),
+            }
+        } else {
+            result.diagnostics.push(simple_diag(
+                "MPP0002",
+                Severity::Error,
+                "parse failed",
+                format!(
+                    "Could not parse '{}' but no parser diagnostics were emitted.",
+                    config.entry_path
+                ),
+            ));
+        }
+    }
+
+    result.success = !has_errors(&result.diagnostics);
+    result
+}
+
+fn load_stage1_ast_files(entry_path: &str, diag: &mut DiagnosticBag) -> Vec<AstFile> {
+    let source = match fs::read_to_string(entry_path) {
+        Ok(source) => source,
+        Err(err) => {
+            emit_driver_diag(
+                diag,
+                "MPP0001",
+                Severity::Error,
+                "failed to read source file",
+                format!("Could not read '{}': {}", entry_path, err),
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut next_file_id = 0_u32;
+    let entry_file_id = FileId(next_file_id);
+    next_file_id = next_file_id.saturating_add(1);
+    let Some(entry_ast) = parse_stage1_ast(&source, entry_file_id, diag) else {
+        return Vec::new();
+    };
+
+    let mut ast_files = vec![entry_ast];
+    let mut discovered_module_paths: BTreeSet<String> = BTreeSet::new();
+    let mut parsed_module_paths: BTreeSet<String> = BTreeSet::new();
+    let mut pending_module_paths: BTreeSet<String> = BTreeSet::new();
+    let project_root = stage1_project_root(entry_path);
+
+    let entry_module_path = ast_files[0].header.node.module_path.node.to_string();
+    discovered_module_paths.insert(entry_module_path.clone());
+    parsed_module_paths.insert(entry_module_path);
+    queue_stage1_imports(
+        &ast_files[0],
+        &mut discovered_module_paths,
+        &mut pending_module_paths,
+    );
+
+    while let Some(module_path) = pop_first_module_path(&mut pending_module_paths) {
+        let Some(module_file_path) = resolve_stage1_module_file_path(&module_path, &project_root)
+        else {
+            continue;
+        };
+        let source = match fs::read_to_string(&module_file_path) {
+            Ok(source) => source,
+            Err(_) => continue,
+        };
+
+        let file_id = FileId(next_file_id);
+        next_file_id = next_file_id.saturating_add(1);
+        let Some(ast) = parse_stage1_ast(&source, file_id, diag) else {
+            continue;
+        };
+
+        let declared_module_path = ast.header.node.module_path.node.to_string();
+        discovered_module_paths.insert(declared_module_path.clone());
+        if !parsed_module_paths.insert(declared_module_path) {
+            continue;
+        }
+
+        queue_stage1_imports(
+            &ast,
+            &mut discovered_module_paths,
+            &mut pending_module_paths,
+        );
+        ast_files.push(ast);
+    }
+
+    ast_files
+}
+
+fn parse_stage1_ast(source: &str, file_id: FileId, diag: &mut DiagnosticBag) -> Option<AstFile> {
+    let tokens = lex(file_id, source, diag);
+    let ast = parse_file(&tokens, file_id, diag).ok()?;
+    let canonical = format_csnf(&ast);
+    let _canonical_with_digest = update_digest(&canonical);
+    Some(ast)
+}
+
+fn queue_stage1_imports(
+    ast: &AstFile,
+    discovered_module_paths: &mut BTreeSet<String>,
+    pending_module_paths: &mut BTreeSet<String>,
+) {
+    let mut imports = ast
+        .header
+        .node
+        .imports
+        .iter()
+        .map(|group| group.node.module_path.to_string())
+        .collect::<Vec<_>>();
+    imports.sort();
+    imports.dedup();
+    for module_path in imports {
+        if discovered_module_paths.insert(module_path.clone()) {
+            pending_module_paths.insert(module_path);
+        }
+    }
+}
+
+fn pop_first_module_path(module_paths: &mut BTreeSet<String>) -> Option<String> {
+    let module_path = module_paths.iter().next()?.clone();
+    module_paths.remove(&module_path);
+    Some(module_path)
+}
+
+fn module_path_to_stage1_file_path(module_path: &str) -> Option<PathBuf> {
+    let segments = module_path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return None;
+    }
+
+    if segments[0] == "std" {
+        if segments.len() != 2 {
+            return None;
+        }
+        let std_name = segments[1];
+        return Some(
+            PathBuf::from("std")
+                .join(format!("std.{std_name}"))
+                .join(format!("{std_name}.mp")),
+        );
+    }
+
+    let rel_segments = if segments.len() == 1 {
+        &segments[..]
+    } else {
+        &segments[1..]
+    };
+    if rel_segments.is_empty() {
+        return None;
+    }
+
+    let mut path = PathBuf::from("src");
+    for segment in rel_segments {
+        path.push(segment);
+    }
+    path.set_extension("mp");
+    Some(path)
+}
+
+fn stage1_project_root(entry_path: &str) -> PathBuf {
+    let entry = PathBuf::from(entry_path);
+    let entry_abs = if entry.is_absolute() {
+        entry
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(entry)
+    };
+    let parent = entry_abs
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    if parent.file_name().and_then(|name| name.to_str()) == Some("src") {
+        parent.parent().unwrap_or(&parent).to_path_buf()
+    } else {
+        parent
+    }
+}
+
+fn resolve_stage1_module_file_path(module_path: &str, project_root: &Path) -> Option<PathBuf> {
+    let rel = module_path_to_stage1_file_path(module_path)?;
+    if rel.is_absolute() {
+        return rel.is_file().then_some(rel);
+    }
+
+    let primary = project_root.join(&rel);
+    if primary.is_file() {
+        return Some(primary);
+    }
+
+    if rel.starts_with("std") {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        for ancestor in cwd.ancestors() {
+            let candidate = ancestor.join(&rel);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    Path::new(&rel).is_file().then_some(rel)
+}
+
+fn collect_gpu_kernel_decls(resolved_modules: &[ResolvedModule]) -> Vec<GpuKernelDecl> {
+    let mut out = Vec::new();
+    for module in resolved_modules {
+        for decl in &module.ast.decls {
+            let AstDecl::GpuFn(gpu_fn) = &decl.node else {
+                continue;
+            };
+            if let Some(sym) = module.symbol_table.functions.get(&gpu_fn.inner.name) {
+                out.push(GpuKernelDecl {
+                    sid: sym.sid.clone(),
+                    target: gpu_fn.target.clone(),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.sid.0.cmp(&b.sid.0));
+    out.dedup_by(|a, b| a.sid.0 == b.sid.0);
+    out
 }
 
 /// Lint entrypoint (`magpie lint`).
@@ -798,7 +1374,9 @@ pub fn lint(config: &DriverConfig) -> BuildResult {
 
     {
         let start = Instant::now();
-        result.diagnostics.extend(run_lints(&hir_modules, &type_ctx));
+        result
+            .diagnostics
+            .extend(run_lints(&hir_modules, &type_ctx));
         result
             .timing_ms
             .insert("lint_stage4_lints".to_string(), elapsed_ms(start));
@@ -1049,16 +1627,19 @@ fn lint_diag(
     message: impl Into<String>,
     suggested_fixes: Vec<SuggestedFix>,
 ) -> Diagnostic {
+    let code_str = code.to_string();
     Diagnostic {
-        code: code.to_string(),
+        code: code_str.clone(),
         severity: Severity::Warning,
         title: title.into(),
         primary_span: None,
         secondary_spans: Vec::new(),
         message: message.into(),
-        explanation_md: None,
+        explanation_md: magpie_diag::explain_code(&code_str),
         why: None,
         suggested_fixes,
+        rag_bundle: Vec::new(),
+        related_docs: Vec::new(),
     }
 }
 
@@ -1078,6 +1659,55 @@ fn module_source_path(module_path: &str) -> String {
     format!("src/{}.mp", parts[1..].join("/"))
 }
 
+fn normalize_fix_path(path: &str) -> String {
+    let raw = Path::new(path);
+    if raw.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Ok(rel) = raw.strip_prefix(&cwd) {
+                return rel.to_string_lossy().replace('\\', "/");
+            }
+        }
+    }
+    path.trim_start_matches("./").replace('\\', "/")
+}
+
+fn fix_digest_maps(
+    path: &str,
+    patch: &str,
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let mut applies_to = BTreeMap::new();
+    let mut produces = BTreeMap::new();
+    let norm = normalize_fix_path(path);
+    let pre_bytes = fs::read(path).unwrap_or_default();
+    let pre_digest = blake3::hash(&pre_bytes).to_hex().to_string();
+    let post_digest = blake3::hash(format!("{pre_digest}\n{patch}").as_bytes())
+        .to_hex()
+        .to_string();
+    applies_to.insert(norm.clone(), pre_digest);
+    produces.insert(norm, post_digest);
+    (applies_to, produces)
+}
+
+fn suggested_fix_with_digests(
+    title: String,
+    patch_format: &str,
+    patch: String,
+    confidence: f64,
+    requires_fmt: bool,
+    source_path: &str,
+) -> SuggestedFix {
+    let (applies_to, produces) = fix_digest_maps(source_path, &patch);
+    SuggestedFix {
+        title,
+        patch_format: patch_format.to_string(),
+        patch,
+        confidence,
+        requires_fmt,
+        applies_to,
+        produces,
+    }
+}
+
 fn suggested_fix_unused_local(source_path: &str, local_id: u32) -> SuggestedFix {
     let old_local = local_name(local_id);
     let new_local = format!("%_v{}", local_id);
@@ -1085,12 +1715,17 @@ fn suggested_fix_unused_local(source_path: &str, local_id: u32) -> SuggestedFix 
         "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@\n-  {old_local}: <type> = <expr>\n+  {new_local}: <type> = <expr>\n",
         path = source_path,
     );
-    SuggestedFix {
-        title: format!("Prefix '{}' with '_' to mark intentionally unused", old_local),
-        patch_format: "unified-diff".to_string(),
+    suggested_fix_with_digests(
+        format!(
+            "Prefix '{}' with '_' to mark intentionally unused",
+            old_local
+        ),
+        "unified-diff",
         patch,
-        confidence: 0.72,
-    }
+        0.72,
+        false,
+        source_path,
+    )
 }
 
 fn suggested_fix_empty_block(source_path: &str, block_id: u32) -> SuggestedFix {
@@ -1098,12 +1733,14 @@ fn suggested_fix_empty_block(source_path: &str, block_id: u32) -> SuggestedFix {
         "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@\n-bb{block_id}:\n-  ; empty block\n+; removed empty block bb{block_id}\n",
         path = source_path,
     );
-    SuggestedFix {
-        title: format!("Remove empty block bb{}", block_id),
-        patch_format: "unified-diff".to_string(),
+    suggested_fix_with_digests(
+        format!("Remove empty block bb{}", block_id),
+        "unified-diff",
         patch,
-        confidence: 0.62,
-    }
+        0.62,
+        false,
+        source_path,
+    )
 }
 
 fn suggested_fix_unnecessary_borrow(
@@ -1116,11 +1753,181 @@ fn suggested_fix_unnecessary_borrow(
         "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@\n-  {local}: <borrow_ty> = borrow.shared {borrow_source}\n-  %v_next: <type> = getfield {local}, <field>\n+  %v_next: <type> = getfield {borrow_source}, <field>\n",
         path = source_path,
     );
-    SuggestedFix {
-        title: format!("Remove unnecessary borrow '{}'", local),
-        patch_format: "unified-diff".to_string(),
+    suggested_fix_with_digests(
+        format!("Remove unnecessary borrow '{}'", local),
+        "unified-diff",
         patch,
-        confidence: 0.68,
+        0.68,
+        false,
+        source_path,
+    )
+}
+
+fn extract_quoted_segment(message: &str) -> Option<String> {
+    let start = message.find('\'')?;
+    let rest = &message[start + 1..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+fn suggested_fix_add_missing_import(source_path: &str, symbol_hint: &str) -> SuggestedFix {
+    let symbol_hint = if symbol_hint.trim().is_empty() {
+        "MissingSymbol"
+    } else {
+        symbol_hint
+    };
+    let patch = format!(
+        "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@\n imports {{ ... }}\n+imports {{ std::{symbol_hint} }}\n",
+        path = source_path
+    );
+    suggested_fix_with_digests(
+        format!("Add import for '{}'", symbol_hint),
+        "unified-diff",
+        patch,
+        0.58,
+        true,
+        source_path,
+    )
+}
+
+fn suggested_fix_map_get_to_contains_get_ref(source_path: &str) -> SuggestedFix {
+    let patch = format!(
+        "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@\n-  %v: <V> = map.get {{ map=%m, key=%k }}\n+  %has: bool = map.contains_key {{ map=%m, key=%k }}\n+  cbr %has, bb_has, bb_missing\n+bb_has:\n+  %v_ref: ptr <V> = map.get_ref {{ map=%m, key=%k }}\n+  %v: <V> = load %v_ref\n+bb_missing:\n+  panic \"missing key\"\n",
+        path = source_path
+    );
+    suggested_fix_with_digests(
+        "Replace map.get with contains_key + get_ref pattern".to_string(),
+        "unified-diff",
+        patch,
+        0.7,
+        true,
+        source_path,
+    )
+}
+
+fn suggested_fix_insert_share_clone(source_path: &str) -> SuggestedFix {
+    let patch = format!(
+        "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@\n-  %owned: <T> = <expr>\n+  %owned: <T> = <expr>\n+  %shared: shared <T> = share %owned\n+  %shared2: shared <T> = clone.shared %shared\n",
+        path = source_path
+    );
+    suggested_fix_with_digests(
+        "Insert share/clone.shared before shared use".to_string(),
+        "unified-diff",
+        patch,
+        0.64,
+        true,
+        source_path,
+    )
+}
+
+fn suggested_fix_split_borrow_scope(source_path: &str) -> SuggestedFix {
+    let patch = format!(
+        "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@\n-  %b: borrow <T> = borrow.shared %x\n-  br bb_next\n+  br bb_next\n+\n+bb_next:\n+  %b: borrow <T> = borrow.shared %x\n",
+        path = source_path
+    );
+    suggested_fix_with_digests(
+        "Split borrow so it is recreated per basic block".to_string(),
+        "unified-diff",
+        patch,
+        0.66,
+        true,
+        source_path,
+    )
+}
+
+fn suggested_fix_add_trait_impl_stub(
+    source_path: &str,
+    trait_name: &str,
+    ty_name: &str,
+) -> SuggestedFix {
+    let trait_name = if trait_name.trim().is_empty() {
+        "eq"
+    } else {
+        trait_name
+    };
+    let ty_name = if ty_name.trim().is_empty() {
+        "MyType"
+    } else {
+        ty_name
+    };
+    let fn_name = format!("@{}_{}", trait_name, ty_name.replace(['.', ':'], "_"));
+    let patch = format!(
+        "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@\n+fn {fn_name}(%a: borrow {ty_name}, %b: borrow {ty_name}) -> i32 {{\n+bb0:\n+  ret 0\n+}}\n+\n+impl {trait_name} for {ty_name} = {fn_name}\n",
+        path = source_path
+    );
+    suggested_fix_with_digests(
+        format!("Add missing `impl {trait_name} for {ty_name}` stub"),
+        "unified-diff",
+        patch,
+        0.61,
+        true,
+        source_path,
+    )
+}
+
+fn apply_core_fixers(diag: &mut Diagnostic) {
+    if !diag.suggested_fixes.is_empty() {
+        return;
+    }
+
+    let default_path = "src/main.mp";
+    let fixes = match diag.code.as_str() {
+        "MPS0002" | "MPS0003" | "MPS0006" => {
+            let symbol_hint = if let Some(seg) = extract_quoted_segment(&diag.message) {
+                seg.split("::")
+                    .last()
+                    .unwrap_or("MissingSymbol")
+                    .to_string()
+            } else {
+                "MissingSymbol".to_string()
+            };
+            vec![suggested_fix_add_missing_import(default_path, &symbol_hint)]
+        }
+        "MPO0103" => vec![suggested_fix_map_get_to_contains_get_ref(default_path)],
+        "MPO0004" | "MPO0011" => vec![suggested_fix_insert_share_clone(default_path)],
+        "MPO0101" | "MPO0102" => vec![suggested_fix_split_borrow_scope(default_path)],
+        "MPT1023" => {
+            let re = Regex::new(r"`impl\s+([A-Za-z0-9_]+)\s+for\s+([^`]+)`").ok();
+            let (trait_name, ty_name) = if let Some(re) = re {
+                if let Some(caps) = re.captures(&diag.message) {
+                    (
+                        caps.get(1).map(|m| m.as_str()).unwrap_or("eq"),
+                        caps.get(2).map(|m| m.as_str()).unwrap_or("MyType"),
+                    )
+                } else {
+                    ("eq", "MyType")
+                }
+            } else {
+                ("eq", "MyType")
+            };
+            vec![suggested_fix_add_trait_impl_stub(
+                default_path,
+                trait_name,
+                ty_name,
+            )]
+        }
+        "MPT2032" => {
+            let trait_name = Regex::new(r"impl '([^']+)'")
+                .ok()
+                .and_then(|re| re.captures(&diag.message))
+                .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+                .unwrap_or_else(|| "eq".to_string());
+            let ty_name = Regex::new(r"for '([^']+)'")
+                .ok()
+                .and_then(|re| re.captures(&diag.message))
+                .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+                .unwrap_or_else(|| "MyType".to_string());
+            vec![suggested_fix_add_trait_impl_stub(
+                default_path,
+                &trait_name,
+                &ty_name,
+            )]
+        }
+        _ => Vec::new(),
+    };
+
+    if !fixes.is_empty() {
+        diag.suggested_fixes = fixes;
     }
 }
 
@@ -1372,31 +2179,61 @@ fn hir_terminator_values(term: &HirTerminator) -> Vec<HirValue> {
 
 /// Test discovery + execution entrypoint (§5.2.7, §33.1).
 pub fn run_tests(config: &DriverConfig, filter: Option<&str>) -> TestResult {
-    let build_result = build(config);
-    let mut discovered = discover_test_functions_from_hir(config);
+    run_tests_with(
+        config,
+        filter,
+        build,
+        discover_test_functions_from_hir,
+        run_single_test_binary,
+    )
+}
+
+fn run_tests_with<BuildFn, DiscoverFn, RunTestFn>(
+    config: &DriverConfig,
+    filter: Option<&str>,
+    mut build_fn: BuildFn,
+    mut discover_fn: DiscoverFn,
+    mut run_test_fn: RunTestFn,
+) -> TestResult
+where
+    BuildFn: FnMut(&DriverConfig) -> BuildResult,
+    DiscoverFn: FnMut(&DriverConfig) -> Vec<String>,
+    RunTestFn: FnMut(&str, &str) -> bool,
+{
+    let initial_build = build_fn(config);
+    let mut discovered = discover_fn(config);
 
     if let Some(pattern) = filter {
         discovered.retain(|name| name.contains(pattern));
     }
 
-    let executable = if emit_contains(&config.emit, "exe") && build_result.success {
-        find_executable_artifact(&config.target_triple, &build_result.artifacts)
+    let mut executable = if initial_build.success {
+        find_executable_artifact(&config.target_triple, &initial_build.artifacts)
     } else {
         None
     };
+
+    if executable.is_none() && initial_build.success {
+        let fallback_config = fallback_test_driver_config(config);
+        let fallback_build = build_fn(&fallback_config);
+        if fallback_build.success {
+            executable =
+                find_executable_artifact(&fallback_config.target_triple, &fallback_build.artifacts);
+        }
+    }
 
     let mut test_names = Vec::with_capacity(discovered.len());
     match executable {
         Some(path) => {
             for test_name in discovered {
-                let passed = run_single_test_binary(&path, &test_name);
+                let passed = run_test_fn(&path, &test_name);
                 test_names.push((test_name, passed));
             }
         }
+        None if discovered.is_empty() => {}
         None => {
-            let passed = build_result.success;
             for test_name in discovered {
-                test_names.push((test_name, passed));
+                test_names.push((test_name, false));
             }
         }
     }
@@ -1410,6 +2247,14 @@ pub fn run_tests(config: &DriverConfig, filter: Option<&str>) -> TestResult {
         failed,
         test_names,
     }
+}
+
+fn fallback_test_driver_config(config: &DriverConfig) -> DriverConfig {
+    let mut fallback = config.clone();
+    if !emit_contains(&fallback.emit, "exe") {
+        fallback.emit.push("exe".to_string());
+    }
+    fallback
 }
 
 fn discover_test_functions_from_hir(config: &DriverConfig) -> Vec<String> {
@@ -1592,12 +2437,7 @@ fn emit_deps_graph(modules: &[HirModule]) -> serde_json::Value {
                     match &instr.op {
                         HirOp::Call { callee_sid, .. } => {
                             record_dep_edge(
-                                &mut edges,
-                                &fn_owner,
-                                module,
-                                func,
-                                callee_sid,
-                                "call",
+                                &mut edges, &fn_owner, module, func, callee_sid, "call",
                             );
                         }
                         HirOp::SuspendCall { callee_sid, .. } => {
@@ -1633,7 +2473,11 @@ fn emit_deps_graph(modules: &[HirModule]) -> serde_json::Value {
         .iter()
         .map(|module| json!({ "module_path": module.path, "module_sid": module.sid.0 }))
         .collect::<Vec<_>>();
-    modules_json.sort_by(|lhs, rhs| lhs["module_path"].as_str().cmp(&rhs["module_path"].as_str()));
+    modules_json.sort_by(|lhs, rhs| {
+        lhs["module_path"]
+            .as_str()
+            .cmp(&rhs["module_path"].as_str())
+    });
 
     let edges_json = edges
         .into_iter()
@@ -1701,7 +2545,12 @@ fn emit_cfg_graph(modules: &[HirModule]) -> serde_json::Value {
                     edges.push((block.id.0, to, kind));
                 }
             }
-            edges.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0).then(lhs.1.cmp(&rhs.1)).then(lhs.2.cmp(&rhs.2)));
+            edges.sort_by(|lhs, rhs| {
+                lhs.0
+                    .cmp(&rhs.0)
+                    .then(lhs.1.cmp(&rhs.1))
+                    .then(lhs.2.cmp(&rhs.2))
+            });
 
             let edges = edges
                 .into_iter()
@@ -1736,7 +2585,9 @@ fn cfg_successors(term: &HirTerminator) -> Vec<(u32, String)> {
     match term {
         HirTerminator::Ret(_) | HirTerminator::Unreachable => Vec::new(),
         HirTerminator::Br(target) => vec![(target.0, "br".to_string())],
-        HirTerminator::Cbr { then_bb, else_bb, .. } => vec![
+        HirTerminator::Cbr {
+            then_bb, else_bb, ..
+        } => vec![
             (then_bb.0, "cbr_true".to_string()),
             (else_bb.0, "cbr_false".to_string()),
         ],
@@ -1857,10 +2708,11 @@ fn update_mms_index(
     hir_modules: &[HirModule],
     _type_ctx: &TypeCtx,
     diag: &mut DiagnosticBag,
-) -> Option<PathBuf> {
+) -> Vec<PathBuf> {
     let items = build_mms_items(artifacts, hir_modules);
-    let index = build_index(&items);
-    let encoded = match serde_json::to_string_pretty(&index) {
+    let source_fingerprints = build_mms_source_fingerprints(config, hir_modules);
+    let index = build_index_with_sources(&items, &source_fingerprints);
+    let encoded = match canonical_json_encode(&index) {
         Ok(encoded) => encoded,
         Err(err) => {
             emit_driver_diag(
@@ -1870,9 +2722,11 @@ fn update_mms_index(
                 "failed to encode mms index",
                 format!("Could not serialize MMS index: {}", err),
             );
-            return None;
+            return Vec::new();
         }
     };
+
+    let mut written_paths = Vec::new();
 
     let index_path = stage_mms_index_output_path(config);
     if let Err(err) = write_text_artifact(&index_path, &encoded) {
@@ -1883,10 +2737,23 @@ fn update_mms_index(
             "failed to write mms index",
             err,
         );
-        return None;
+        return Vec::new();
+    }
+    written_paths.push(index_path);
+
+    let mirror_index_path = stage_mms_memory_index_output_path(config);
+    match write_text_artifact(&mirror_index_path, &encoded) {
+        Ok(()) => written_paths.push(mirror_index_path),
+        Err(err) => emit_driver_diag(
+            diag,
+            "MPP0003",
+            Severity::Warning,
+            "failed to write mirrored mms index",
+            err,
+        ),
     }
 
-    Some(index_path)
+    written_paths
 }
 
 fn build_mms_items(artifacts: &[PathBuf], hir_modules: &[HirModule]) -> Vec<MmsItem> {
@@ -1927,16 +2794,60 @@ fn build_mms_items(artifacts: &[PathBuf], hir_modules: &[HirModule]) -> Vec<MmsI
                 source_digest: format!("{:016x}", stable_hash_u64(path_text.as_bytes())),
                 body_digest: format!("{:016x}", stable_hash_u64(text.as_bytes())),
                 text,
-                tags: vec![
-                    "artifact".to_string(),
-                    ext,
-                    format!("order:{}", idx),
-                ],
+                tags: vec!["artifact".to_string(), ext, format!("order:{}", idx)],
                 priority: 50,
                 token_cost,
             }
         })
         .collect()
+}
+
+fn build_mms_source_fingerprints(
+    config: &DriverConfig,
+    hir_modules: &[HirModule],
+) -> Vec<MmsSourceFingerprint> {
+    let mut digest_by_path: BTreeMap<String, String> = BTreeMap::new();
+
+    let project_root = project_root_from_entry_path(&config.entry_path);
+
+    for module in hir_modules {
+        let source_rel = module_source_path(&module.path);
+        let source_path = project_root.join(&source_rel);
+        let source_bytes = match fs::read(&source_path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+
+        digest_by_path.insert(
+            source_path.to_string_lossy().to_string(),
+            format!("{:016x}", stable_hash_u64(&source_bytes)),
+        );
+    }
+
+    digest_by_path
+        .into_iter()
+        .map(|(path, digest)| MmsSourceFingerprint { path, digest })
+        .collect()
+}
+
+fn project_root_from_entry_path(entry_path: &str) -> PathBuf {
+    let entry = PathBuf::from(entry_path);
+    if entry.is_absolute() {
+        if let Some(src_dir) = entry.parent() {
+            if src_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "src")
+            {
+                if let Some(parent) = src_dir.parent() {
+                    return parent.to_path_buf();
+                }
+            }
+            return src_dir.to_path_buf();
+        }
+    }
+
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn stable_hash_u64(bytes: &[u8]) -> u64 {
@@ -2029,8 +2940,10 @@ fn lower_async_function(func: &mut HirFunction) -> bool {
 
         let tail_instrs = func.blocks[blk_idx].instrs.split_off(split_at + 1);
         let tail_void_ops = std::mem::take(&mut func.blocks[blk_idx].void_ops);
-        let tail_term =
-            std::mem::replace(&mut func.blocks[blk_idx].terminator, HirTerminator::Br(resume_id));
+        let tail_term = std::mem::replace(
+            &mut func.blocks[blk_idx].terminator,
+            HirTerminator::Br(resume_id),
+        );
         func.blocks.insert(
             blk_idx + 1,
             HirBlock {
@@ -2112,6 +3025,392 @@ fn hir_i32_const(value: i32) -> HirConst {
 
 fn hir_i32_value(value: i32) -> HirValue {
     HirValue::Const(hir_i32_const(value))
+}
+
+fn remap_type_id(id: TypeId, remap: &HashMap<TypeId, TypeId>) -> TypeId {
+    remap.get(&id).copied().unwrap_or(id)
+}
+
+fn remap_hir_modules_type_ids(modules: &mut [HirModule], remap: &HashMap<TypeId, TypeId>) {
+    for module in modules {
+        remap_hir_module_type_ids(module, remap);
+    }
+}
+
+fn remap_hir_module_type_ids(module: &mut HirModule, remap: &HashMap<TypeId, TypeId>) {
+    for func in &mut module.functions {
+        remap_hir_function_type_ids(func, remap);
+    }
+
+    for global in &mut module.globals {
+        global.ty = remap_type_id(global.ty, remap);
+        remap_hir_const_type_ids(&mut global.init, remap);
+    }
+
+    for decl in &mut module.type_decls {
+        remap_hir_type_decl_type_ids(decl, remap);
+    }
+}
+
+fn remap_hir_type_decl_type_ids(decl: &mut HirTypeDecl, remap: &HashMap<TypeId, TypeId>) {
+    match decl {
+        HirTypeDecl::Struct { fields, .. } => {
+            for (_, ty) in fields {
+                *ty = remap_type_id(*ty, remap);
+            }
+        }
+        HirTypeDecl::Enum { variants, .. } => {
+            for variant in variants {
+                for (_, ty) in &mut variant.fields {
+                    *ty = remap_type_id(*ty, remap);
+                }
+            }
+        }
+    }
+}
+
+fn remap_hir_function_type_ids(func: &mut HirFunction, remap: &HashMap<TypeId, TypeId>) {
+    for (_, ty) in &mut func.params {
+        *ty = remap_type_id(*ty, remap);
+    }
+    func.ret_ty = remap_type_id(func.ret_ty, remap);
+
+    for block in &mut func.blocks {
+        remap_hir_block_type_ids(block, remap);
+    }
+}
+
+fn remap_hir_block_type_ids(block: &mut HirBlock, remap: &HashMap<TypeId, TypeId>) {
+    for instr in &mut block.instrs {
+        remap_hir_instr_type_ids(instr, remap);
+    }
+    for op in &mut block.void_ops {
+        remap_hir_void_op_type_ids(op, remap);
+    }
+    remap_hir_terminator_type_ids(&mut block.terminator, remap);
+}
+
+fn remap_hir_instr_type_ids(instr: &mut HirInstr, remap: &HashMap<TypeId, TypeId>) {
+    instr.ty = remap_type_id(instr.ty, remap);
+    remap_hir_op_type_ids(&mut instr.op, remap);
+}
+
+fn remap_hir_op_type_ids(op: &mut HirOp, remap: &HashMap<TypeId, TypeId>) {
+    match op {
+        HirOp::Const(v) => remap_hir_const_type_ids(v, remap),
+        HirOp::Move { v }
+        | HirOp::BorrowShared { v }
+        | HirOp::BorrowMut { v }
+        | HirOp::SuspendAwait { fut: v }
+        | HirOp::Share { v }
+        | HirOp::CloneShared { v }
+        | HirOp::CloneWeak { v }
+        | HirOp::WeakDowngrade { v }
+        | HirOp::WeakUpgrade { v }
+        | HirOp::EnumTag { v }
+        | HirOp::EnumPayload { v, .. }
+        | HirOp::EnumIs { v, .. }
+        | HirOp::ArrLen { arr: v }
+        | HirOp::ArrPop { arr: v }
+        | HirOp::ArrSort { arr: v }
+        | HirOp::MapLen { map: v }
+        | HirOp::MapKeys { map: v }
+        | HirOp::MapValues { map: v }
+        | HirOp::StrLen { s: v }
+        | HirOp::StrBytes { s: v }
+        | HirOp::StrBuilderBuild { b: v }
+        | HirOp::StrParseI64 { s: v }
+        | HirOp::StrParseU64 { s: v }
+        | HirOp::StrParseF64 { s: v }
+        | HirOp::StrParseBool { s: v }
+        | HirOp::GpuBufferLen { buf: v }
+        | HirOp::Panic { msg: v } => remap_hir_value_type_ids(v, remap),
+        HirOp::New { ty, fields } => {
+            *ty = remap_type_id(*ty, remap);
+            for (_, value) in fields {
+                remap_hir_value_type_ids(value, remap);
+            }
+        }
+        HirOp::GetField { obj, .. } => remap_hir_value_type_ids(obj, remap),
+        HirOp::IAdd { lhs, rhs }
+        | HirOp::ISub { lhs, rhs }
+        | HirOp::IMul { lhs, rhs }
+        | HirOp::ISDiv { lhs, rhs }
+        | HirOp::IUDiv { lhs, rhs }
+        | HirOp::ISRem { lhs, rhs }
+        | HirOp::IURem { lhs, rhs }
+        | HirOp::IAddWrap { lhs, rhs }
+        | HirOp::ISubWrap { lhs, rhs }
+        | HirOp::IMulWrap { lhs, rhs }
+        | HirOp::IAddChecked { lhs, rhs }
+        | HirOp::ISubChecked { lhs, rhs }
+        | HirOp::IMulChecked { lhs, rhs }
+        | HirOp::IAnd { lhs, rhs }
+        | HirOp::IOr { lhs, rhs }
+        | HirOp::IXor { lhs, rhs }
+        | HirOp::IShl { lhs, rhs }
+        | HirOp::ILshr { lhs, rhs }
+        | HirOp::IAshr { lhs, rhs }
+        | HirOp::ICmp { lhs, rhs, .. }
+        | HirOp::FCmp { lhs, rhs, .. }
+        | HirOp::FAdd { lhs, rhs }
+        | HirOp::FSub { lhs, rhs }
+        | HirOp::FMul { lhs, rhs }
+        | HirOp::FDiv { lhs, rhs }
+        | HirOp::FRem { lhs, rhs }
+        | HirOp::FAddFast { lhs, rhs }
+        | HirOp::FSubFast { lhs, rhs }
+        | HirOp::FMulFast { lhs, rhs }
+        | HirOp::FDivFast { lhs, rhs }
+        | HirOp::StrConcat { a: lhs, b: rhs }
+        | HirOp::StrEq { a: lhs, b: rhs } => {
+            remap_hir_value_type_ids(lhs, remap);
+            remap_hir_value_type_ids(rhs, remap);
+        }
+        HirOp::Cast { to, v } => {
+            *to = remap_type_id(*to, remap);
+            remap_hir_value_type_ids(v, remap);
+        }
+        HirOp::PtrNull { to } => *to = remap_type_id(*to, remap),
+        HirOp::PtrAddr { p } => remap_hir_value_type_ids(p, remap),
+        HirOp::PtrFromAddr { to, addr } => {
+            *to = remap_type_id(*to, remap);
+            remap_hir_value_type_ids(addr, remap);
+        }
+        HirOp::PtrAdd { p, count } => {
+            remap_hir_value_type_ids(p, remap);
+            remap_hir_value_type_ids(count, remap);
+        }
+        HirOp::PtrLoad { to, p } => {
+            *to = remap_type_id(*to, remap);
+            remap_hir_value_type_ids(p, remap);
+        }
+        HirOp::PtrStore { to, p, v } => {
+            *to = remap_type_id(*to, remap);
+            remap_hir_value_type_ids(p, remap);
+            remap_hir_value_type_ids(v, remap);
+        }
+        HirOp::Call { inst, args, .. } | HirOp::SuspendCall { inst, args, .. } => {
+            for ty in inst {
+                *ty = remap_type_id(*ty, remap);
+            }
+            for value in args {
+                remap_hir_value_type_ids(value, remap);
+            }
+        }
+        HirOp::CallIndirect { callee, args } | HirOp::CallVoidIndirect { callee, args } => {
+            remap_hir_value_type_ids(callee, remap);
+            for value in args {
+                remap_hir_value_type_ids(value, remap);
+            }
+        }
+        HirOp::Phi { ty, incomings } => {
+            *ty = remap_type_id(*ty, remap);
+            for (_, value) in incomings {
+                remap_hir_value_type_ids(value, remap);
+            }
+        }
+        HirOp::EnumNew { args, .. } => {
+            for (_, value) in args {
+                remap_hir_value_type_ids(value, remap);
+            }
+        }
+        HirOp::CallableCapture { captures, .. } => {
+            for (_, value) in captures {
+                remap_hir_value_type_ids(value, remap);
+            }
+        }
+        HirOp::ArrNew { elem_ty, cap } => {
+            *elem_ty = remap_type_id(*elem_ty, remap);
+            remap_hir_value_type_ids(cap, remap);
+        }
+        HirOp::ArrGet { arr, idx }
+        | HirOp::MapGet { map: arr, key: idx }
+        | HirOp::MapGetRef { map: arr, key: idx }
+        | HirOp::MapDelete { map: arr, key: idx }
+        | HirOp::MapContainsKey { map: arr, key: idx }
+        | HirOp::MapDeleteVoid { map: arr, key: idx }
+        | HirOp::GpuBufferLoad { buf: arr, idx } => {
+            remap_hir_value_type_ids(arr, remap);
+            remap_hir_value_type_ids(idx, remap);
+        }
+        HirOp::ArrSet { arr, idx, val }
+        | HirOp::MapSet {
+            map: arr,
+            key: idx,
+            val,
+        } => {
+            remap_hir_value_type_ids(arr, remap);
+            remap_hir_value_type_ids(idx, remap);
+            remap_hir_value_type_ids(val, remap);
+        }
+        HirOp::ArrPush { arr, val } | HirOp::ArrContains { arr, val } => {
+            remap_hir_value_type_ids(arr, remap);
+            remap_hir_value_type_ids(val, remap);
+        }
+        HirOp::ArrSlice { arr, start, end } | HirOp::StrSlice { s: arr, start, end } => {
+            remap_hir_value_type_ids(arr, remap);
+            remap_hir_value_type_ids(start, remap);
+            remap_hir_value_type_ids(end, remap);
+        }
+        HirOp::ArrMap { arr, func }
+        | HirOp::ArrFilter { arr, func }
+        | HirOp::ArrForeach { arr, func } => {
+            remap_hir_value_type_ids(arr, remap);
+            remap_hir_value_type_ids(func, remap);
+        }
+        HirOp::ArrReduce { arr, init, func } => {
+            remap_hir_value_type_ids(arr, remap);
+            remap_hir_value_type_ids(init, remap);
+            remap_hir_value_type_ids(func, remap);
+        }
+        HirOp::MapNew { key_ty, val_ty } => {
+            *key_ty = remap_type_id(*key_ty, remap);
+            *val_ty = remap_type_id(*val_ty, remap);
+        }
+        HirOp::StrBuilderNew
+        | HirOp::GpuThreadId
+        | HirOp::GpuWorkgroupId
+        | HirOp::GpuWorkgroupSize
+        | HirOp::GpuGlobalId => {}
+        HirOp::StrBuilderAppendStr { b, s } => {
+            remap_hir_value_type_ids(b, remap);
+            remap_hir_value_type_ids(s, remap);
+        }
+        HirOp::StrBuilderAppendI64 { b, v }
+        | HirOp::StrBuilderAppendI32 { b, v }
+        | HirOp::StrBuilderAppendF64 { b, v }
+        | HirOp::StrBuilderAppendBool { b, v } => {
+            remap_hir_value_type_ids(b, remap);
+            remap_hir_value_type_ids(v, remap);
+        }
+        HirOp::JsonEncode { ty, v } => {
+            *ty = remap_type_id(*ty, remap);
+            remap_hir_value_type_ids(v, remap);
+        }
+        HirOp::JsonDecode { ty, s } => {
+            *ty = remap_type_id(*ty, remap);
+            remap_hir_value_type_ids(s, remap);
+        }
+        HirOp::GpuShared { ty, size } => {
+            *ty = remap_type_id(*ty, remap);
+            remap_hir_value_type_ids(size, remap);
+        }
+        HirOp::GpuLaunch {
+            device,
+            groups,
+            threads,
+            args,
+            ..
+        }
+        | HirOp::GpuLaunchAsync {
+            device,
+            groups,
+            threads,
+            args,
+            ..
+        } => {
+            remap_hir_value_type_ids(device, remap);
+            remap_hir_value_type_ids(groups, remap);
+            remap_hir_value_type_ids(threads, remap);
+            for value in args {
+                remap_hir_value_type_ids(value, remap);
+            }
+        }
+    }
+}
+
+fn remap_hir_void_op_type_ids(op: &mut HirOpVoid, remap: &HashMap<TypeId, TypeId>) {
+    match op {
+        HirOpVoid::CallVoid { inst, args, .. } => {
+            for ty in inst {
+                *ty = remap_type_id(*ty, remap);
+            }
+            for value in args {
+                remap_hir_value_type_ids(value, remap);
+            }
+        }
+        HirOpVoid::CallVoidIndirect { callee, args } => {
+            remap_hir_value_type_ids(callee, remap);
+            for value in args {
+                remap_hir_value_type_ids(value, remap);
+            }
+        }
+        HirOpVoid::SetField { obj, value, .. } => {
+            remap_hir_value_type_ids(obj, remap);
+            remap_hir_value_type_ids(value, remap);
+        }
+        HirOpVoid::ArrSet { arr, idx, val }
+        | HirOpVoid::MapSet {
+            map: arr,
+            key: idx,
+            val,
+        } => {
+            remap_hir_value_type_ids(arr, remap);
+            remap_hir_value_type_ids(idx, remap);
+            remap_hir_value_type_ids(val, remap);
+        }
+        HirOpVoid::ArrPush { arr, val } => {
+            remap_hir_value_type_ids(arr, remap);
+            remap_hir_value_type_ids(val, remap);
+        }
+        HirOpVoid::ArrSort { arr } => remap_hir_value_type_ids(arr, remap),
+        HirOpVoid::ArrForeach { arr, func } => {
+            remap_hir_value_type_ids(arr, remap);
+            remap_hir_value_type_ids(func, remap);
+        }
+        HirOpVoid::MapDeleteVoid { map, key } => {
+            remap_hir_value_type_ids(map, remap);
+            remap_hir_value_type_ids(key, remap);
+        }
+        HirOpVoid::StrBuilderAppendStr { b, s } => {
+            remap_hir_value_type_ids(b, remap);
+            remap_hir_value_type_ids(s, remap);
+        }
+        HirOpVoid::StrBuilderAppendI64 { b, v }
+        | HirOpVoid::StrBuilderAppendI32 { b, v }
+        | HirOpVoid::StrBuilderAppendF64 { b, v }
+        | HirOpVoid::StrBuilderAppendBool { b, v } => {
+            remap_hir_value_type_ids(b, remap);
+            remap_hir_value_type_ids(v, remap);
+        }
+        HirOpVoid::PtrStore { to, p, v } => {
+            *to = remap_type_id(*to, remap);
+            remap_hir_value_type_ids(p, remap);
+            remap_hir_value_type_ids(v, remap);
+        }
+        HirOpVoid::Panic { msg } => remap_hir_value_type_ids(msg, remap),
+        HirOpVoid::GpuBarrier => {}
+        HirOpVoid::GpuBufferStore { buf, idx, val } => {
+            remap_hir_value_type_ids(buf, remap);
+            remap_hir_value_type_ids(idx, remap);
+            remap_hir_value_type_ids(val, remap);
+        }
+    }
+}
+
+fn remap_hir_terminator_type_ids(term: &mut HirTerminator, remap: &HashMap<TypeId, TypeId>) {
+    match term {
+        HirTerminator::Ret(Some(value)) => remap_hir_value_type_ids(value, remap),
+        HirTerminator::Ret(None) | HirTerminator::Br(_) | HirTerminator::Unreachable => {}
+        HirTerminator::Cbr { cond, .. } => remap_hir_value_type_ids(cond, remap),
+        HirTerminator::Switch { val, arms, .. } => {
+            remap_hir_value_type_ids(val, remap);
+            for (const_val, _) in arms {
+                remap_hir_const_type_ids(const_val, remap);
+            }
+        }
+    }
+}
+
+fn remap_hir_value_type_ids(value: &mut HirValue, remap: &HashMap<TypeId, TypeId>) {
+    if let HirValue::Const(c) = value {
+        remap_hir_const_type_ids(c, remap);
+    }
+}
+
+fn remap_hir_const_type_ids(value: &mut HirConst, remap: &HashMap<TypeId, TypeId>) {
+    value.ty = remap_type_id(value.ty, remap);
 }
 
 pub fn lower_hir_module_to_mpir(module: &HirModule, type_ctx: &TypeCtx) -> MpirModule {
@@ -2757,6 +4056,14 @@ fn emit_contains_any(emit: &[String], needles: &[&str]) -> bool {
         .any(|kind| needles.iter().any(|needle| kind == needle))
 }
 
+fn build_output_root(config: &DriverConfig) -> PathBuf {
+    config
+        .cache_dir
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target"))
+}
+
 fn stage_module_output_path(
     config: &DriverConfig,
     module_idx: usize,
@@ -2772,10 +4079,58 @@ fn stage_module_output_path(
     } else {
         format!("{stem}.{module_idx}")
     };
-    PathBuf::from("target")
+    build_output_root(config)
         .join(&config.target_triple)
         .join(config.profile.as_str())
         .join(format!("{module_stem}.{extension}"))
+}
+
+fn stage_gpu_registry_output_path(config: &DriverConfig) -> PathBuf {
+    let stem = Path::new(&config.entry_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("main");
+    build_output_root(config)
+        .join(&config.target_triple)
+        .join(config.profile.as_str())
+        .join(format!("{stem}.gpu_registry.ll"))
+}
+
+fn stage_gpu_kernel_spv_output_path(config: &DriverConfig, sid: &Sid) -> PathBuf {
+    build_output_root(config)
+        .join(&config.target_triple)
+        .join(config.profile.as_str())
+        .join("gpu")
+        .join(format!("{}.spv", sid_artifact_component(&sid.0)))
+}
+
+fn sid_artifact_component(raw: &str) -> String {
+    let out = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if out.is_empty() {
+        "kernel".to_string()
+    } else {
+        out
+    }
+}
+
+fn stage_parse_ast_output_path(config: &DriverConfig) -> PathBuf {
+    let stem = Path::new(&config.entry_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("main");
+    build_output_root(config)
+        .join(&config.target_triple)
+        .join(config.profile.as_str())
+        .join(format!("{stem}.ast.txt"))
 }
 
 fn stage_graph_output_path(config: &DriverConfig, suffix: &str) -> PathBuf {
@@ -2783,7 +4138,7 @@ fn stage_graph_output_path(config: &DriverConfig, suffix: &str) -> PathBuf {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("main");
-    PathBuf::from("target")
+    build_output_root(config)
         .join(&config.target_triple)
         .join(config.profile.as_str())
         .join(format!("{stem}.{suffix}.json"))
@@ -2794,7 +4149,7 @@ fn stage_mpdbg_output_path(config: &DriverConfig) -> PathBuf {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("main");
-    PathBuf::from("target")
+    build_output_root(config)
         .join(&config.target_triple)
         .join(config.profile.as_str())
         .join(format!("{stem}.mpdbg"))
@@ -2805,9 +4160,19 @@ fn stage_mms_index_output_path(config: &DriverConfig) -> PathBuf {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("main");
-    PathBuf::from("target")
+    build_output_root(config)
         .join(&config.target_triple)
         .join(config.profile.as_str())
+        .join(format!("{stem}.mms_index.json"))
+}
+
+fn stage_mms_memory_index_output_path(config: &DriverConfig) -> PathBuf {
+    let stem = Path::new(&config.entry_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("main");
+    PathBuf::from(".magpie")
+        .join("memory")
         .join(format!("{stem}.mms_index.json"))
 }
 
@@ -2817,6 +4182,14 @@ fn write_text_artifact(path: &Path, text: &str) -> Result<(), String> {
             .map_err(|err| format!("Could not create '{}': {}", parent.display(), err))?;
     }
     fs::write(path, text).map_err(|err| format!("Could not write '{}': {}", path.display(), err))
+}
+
+fn write_binary_artifact(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Could not create '{}': {}", parent.display(), err))?;
+    }
+    fs::write(path, bytes).map_err(|err| format!("Could not write '{}': {}", path.display(), err))
 }
 
 #[derive(Clone, Debug)]
@@ -2832,9 +4205,10 @@ fn parse_c_header_functions(header: &str) -> Vec<CExternItem> {
     let cleaned = block_comments.replace_all(header, "");
     let cleaned = line_comments.replace_all(&cleaned, "");
 
-    let declaration =
-        Regex::new(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_\s\*\t]*?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^;{}]*)\)\s*;")
-            .expect("valid regex");
+    let declaration = Regex::new(
+        r"(?m)^\s*([A-Za-z_][A-Za-z0-9_\s\*\t]*?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^;{}]*)\)\s*;",
+    )
+    .expect("valid regex");
     let mut out = Vec::new();
     for captures in declaration.captures_iter(&cleaned) {
         let ret_raw = captures.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -2963,7 +4337,7 @@ fn map_c_type_to_magpie(raw_ty: &str) -> String {
         "unsigned long long" | "unsigned long long int" => "u64".to_string(),
         "float" => "f32".to_string(),
         "double" | "long double" => "f64".to_string(),
-        _ => "i32".to_string(),
+        _ => "rawptr<u8>".to_string(),
     }
 }
 
@@ -2981,9 +4355,19 @@ fn render_extern_module(module_name: &str, items: &[CExternItem]) -> String {
             .map(|(name, ty)| format!("%{name}: {ty}"))
             .collect::<Vec<_>>()
             .join(", ");
+        let has_rawptr_param = item.params.iter().any(|(_, ty)| ty.starts_with("rawptr<"));
+        let returns_rawptr = item.ret_ty.starts_with("rawptr<");
+        let mut attrs = vec![format!("link_name=\"{}\"", item.name)];
+        if returns_rawptr {
+            attrs.push("returns=\"borrowed\"".to_string());
+        }
+        if has_rawptr_param {
+            attrs.push("params=\"borrowed\"".to_string());
+        }
+        let attrs_text = attrs.join(" ");
         out.push_str(&format!(
-            "  fn @{}({}) -> {} attrs {{ link_name=\"{}\" }}\n",
-            item.name, params, item.ret_ty, item.name
+            "  fn @{}({}) -> {} attrs {{ {} }}\n",
+            item.name, params, item.ret_ty, attrs_text
         ));
     }
     out.push_str("}\n");
@@ -2995,7 +4379,7 @@ fn stage_link_output_path(config: &DriverConfig) -> PathBuf {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("main");
-    let base = PathBuf::from("target")
+    let base = build_output_root(config)
         .join(&config.target_triple)
         .join(config.profile.as_str());
     let is_windows = is_windows_target(&config.target_triple);
@@ -3013,6 +4397,38 @@ fn stage_link_output_path(config: &DriverConfig) -> PathBuf {
     }
 }
 
+fn compile_llvm_ir_to_bitcode(llvm_ir_path: &Path, bitcode_path: &Path) -> Result<(), String> {
+    ensure_parent_dir(bitcode_path)?;
+
+    if command_available("llvm-as") {
+        return run_command(
+            "llvm-as",
+            &[
+                llvm_ir_path.to_string_lossy().to_string(),
+                "-o".to_string(),
+                bitcode_path.to_string_lossy().to_string(),
+            ],
+        );
+    }
+
+    if command_available("clang") {
+        return run_command(
+            "clang",
+            &[
+                "-x".to_string(),
+                "ir".to_string(),
+                "-emit-llvm".to_string(),
+                "-c".to_string(),
+                "-o".to_string(),
+                bitcode_path.to_string_lossy().to_string(),
+                llvm_ir_path.to_string_lossy().to_string(),
+            ],
+        );
+    }
+
+    Err("neither llvm-as nor clang is available in PATH".to_string())
+}
+
 fn link_via_llc_and_linker(
     config: &DriverConfig,
     llvm_ir_paths: &[PathBuf],
@@ -3025,13 +4441,20 @@ fn link_via_llc_and_linker(
     if !command_available("llc") {
         return Err("llc is not available in PATH".to_string());
     }
-    let linker = if command_available("cc") {
-        "cc"
-    } else if command_available("clang") {
-        "clang"
-    } else {
+    let mut linkers: Vec<(&str, bool)> = Vec::new();
+    if command_available("clang") {
+        // Prefer lld via clang first for deterministic, fast linking.
+        linkers.push(("clang", true));
+        linkers.push(("clang", false));
+    }
+    if command_available("cc") {
+        // Fallback to cc; try lld first when supported.
+        linkers.push(("cc", true));
+        linkers.push(("cc", false));
+    }
+    if linkers.is_empty() {
         return Err("neither cc nor clang is available in PATH".to_string());
-    };
+    }
     ensure_parent_dir(output_path)?;
 
     let obj_ext = if is_windows_target(&config.target_triple) {
@@ -3056,24 +4479,34 @@ fn link_via_llc_and_linker(
         objects.push(obj_path);
     }
 
-    let mut args = Vec::new();
-    if linker == "clang" {
-        args.push(format!("--target={}", config.target_triple));
+    let mut last_err = String::new();
+    for (linker, use_lld) in linkers {
+        let mut args = Vec::new();
+        if linker == "clang" {
+            args.push(format!("--target={}", config.target_triple));
+        }
+        if use_lld {
+            args.push("-fuse-ld=lld".to_string());
+        }
+        if link_shared {
+            args.push("-shared".to_string());
+        }
+        args.push("-o".to_string());
+        args.push(output_path.to_string_lossy().to_string());
+        args.extend(
+            objects
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+        );
+        args.extend(runtime_linker_args(config));
+        match run_command(linker, &args) {
+            Ok(()) => return Ok(objects),
+            Err(err) => last_err = err,
+        }
     }
-    if link_shared {
-        args.push("-shared".to_string());
-    }
-    args.push("-o".to_string());
-    args.push(output_path.to_string_lossy().to_string());
-    args.extend(
-        objects
-            .iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect::<Vec<_>>(),
-    );
-    args.extend(runtime_linker_args(config));
-    run_command(linker, &args)?;
-    Ok(objects)
+
+    Err(last_err)
 }
 
 fn link_via_clang_ir(
@@ -3090,35 +4523,112 @@ fn link_via_clang_ir(
     }
     ensure_parent_dir(output_path)?;
 
-    let mut args = Vec::new();
-    args.push(format!("--target={}", config.target_triple));
-    if link_shared {
-        args.push("-shared".to_string());
+    let mut last_err = String::new();
+    for use_lld in [true, false] {
+        let mut args = Vec::new();
+        args.push(format!("--target={}", config.target_triple));
+        if use_lld {
+            args.push("-fuse-ld=lld".to_string());
+        }
+        if link_shared {
+            args.push("-shared".to_string());
+        }
+        args.push("-x".to_string());
+        args.push("ir".to_string());
+        args.push("-o".to_string());
+        args.push(output_path.to_string_lossy().to_string());
+        args.extend(
+            llvm_ir_paths
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+        );
+        args.extend(runtime_linker_args(config));
+        match run_command("clang", &args) {
+            Ok(()) => return Ok(()),
+            Err(err) => last_err = err,
+        }
     }
-    args.push("-x".to_string());
-    args.push("ir".to_string());
-    args.push("-o".to_string());
-    args.push(output_path.to_string_lossy().to_string());
-    args.extend(
-        llvm_ir_paths
-            .iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect::<Vec<_>>(),
-    );
-    args.extend(runtime_linker_args(config));
-    run_command("clang", &args)
+    Err(last_err)
+}
+
+fn verify_generics_mode_markers(
+    llvm_ir_paths: &[PathBuf],
+    shared_generics: bool,
+) -> Result<(), String> {
+    let expected = if shared_generics { 1_u8 } else { 0_u8 };
+    let mut found = Vec::new();
+    for path in llvm_ir_paths {
+        let text = fs::read_to_string(path).map_err(|err| {
+            format!(
+                "Could not read LLVM IR artifact '{}' while validating generics mode: {}",
+                path.display(),
+                err
+            )
+        })?;
+        if let Some(mode) = parse_generics_mode_marker(&text) {
+            found.push((path.clone(), mode));
+        }
+    }
+
+    if found.is_empty() {
+        return Err(
+            "No `mp$0$ABI$generics_mode` marker found in generated LLVM IR artifacts.".to_string(),
+        );
+    }
+
+    let bad = found
+        .iter()
+        .filter(|(_, mode)| *mode != expected)
+        .map(|(path, mode)| format!("{} => {}", path.display(), mode))
+        .collect::<Vec<_>>();
+    if !bad.is_empty() {
+        return Err(format!(
+            "MIXED_GENERICS_MODE: expected mode {} but found mismatched markers [{}].",
+            expected,
+            bad.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
+fn parse_generics_mode_marker(llvm_ir: &str) -> Option<u8> {
+    for line in llvm_ir.lines() {
+        if !line.contains("mp$0$ABI$generics_mode") {
+            continue;
+        }
+        let Some(idx) = line.find("constant i8") else {
+            continue;
+        };
+        let tail = &line[idx + "constant i8".len()..];
+        let digits = tail
+            .trim_start()
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if let Ok(value) = digits.parse::<u8>() {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn runtime_linker_args(config: &DriverConfig) -> Vec<String> {
     let runtime_dir = find_runtime_lib_dir(config).unwrap_or_else(|| {
-        PathBuf::from("target")
+        build_output_root(config)
             .join(&config.target_triple)
             .join(config.profile.as_str())
     });
-    let mut args = vec![
-        format!("-L{}", runtime_dir.to_string_lossy()),
-        "-lmagpie_rt".to_string(),
-    ];
+    let mut args = Vec::new();
+
+    if let Some(static_lib) = find_static_runtime_library(config) {
+        args.push(static_lib.to_string_lossy().to_string());
+    } else {
+        args.push(format!("-L{}", runtime_dir.to_string_lossy()));
+        args.push("-lmagpie_rt".to_string());
+    }
+
     if !is_windows_target(&config.target_triple) {
         args.push("-lpthread".to_string());
         if is_darwin_target(&config.target_triple) {
@@ -3142,9 +4652,29 @@ fn find_runtime_lib_dir(config: &DriverConfig) -> Option<PathBuf> {
         .find(|dir| names.iter().any(|name| dir.join(name).is_file()))
 }
 
+fn find_static_runtime_library(config: &DriverConfig) -> Option<PathBuf> {
+    let names = if is_windows_target(&config.target_triple) {
+        vec!["magpie_rt.lib", "libmagpie_rt.lib"]
+    } else {
+        vec!["libmagpie_rt.a"]
+    };
+
+    runtime_library_search_paths(config)
+        .into_iter()
+        .find_map(|dir| {
+            names
+                .iter()
+                .map(|name| dir.join(name))
+                .find(|path| path.is_file())
+        })
+}
+
 fn runtime_library_search_paths(config: &DriverConfig) -> Vec<PathBuf> {
-    let target_root = std::env::var_os("CARGO_TARGET_DIR")
+    let target_root = config
+        .cache_dir
+        .as_deref()
         .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("target"));
     let mut out = Vec::new();
     let mut push_unique = |path: PathBuf| {
@@ -3446,7 +4976,9 @@ fn collect_calls_from_instr(instr: &AstInstr, out: &mut BTreeSet<String>) {
 
 fn collect_calls_from_op(op: &AstOp, out: &mut BTreeSet<String>) {
     match op {
-        AstOp::Call { callee, .. } | AstOp::Try { callee, .. } | AstOp::SuspendCall { callee, .. } => {
+        AstOp::Call { callee, .. }
+        | AstOp::Try { callee, .. }
+        | AstOp::SuspendCall { callee, .. } => {
             if !callee.is_empty() {
                 out.insert(callee.clone());
             }
@@ -3485,9 +5017,23 @@ fn ast_fn_decl_mut(decl: &mut AstDecl) -> Option<&mut AstFnDecl> {
 }
 
 fn render_mpd(ast: &AstFile) -> String {
+    let module_path = ast.header.node.module_path.node.to_string();
+    let module_sid = generate_sid('M', &module_path);
+    let source_digest = ast.header.node.digest.node.as_str();
+
     let mut out = String::new();
     out.push_str("module ");
-    out.push_str(&ast.header.node.module_path.node.to_string());
+    out.push_str(&module_path);
+    out.push('\n');
+    out.push_str("module_path: ");
+    out.push_str(&module_path);
+    out.push('\n');
+    out.push_str("module_sid: ");
+    out.push_str(&module_sid.0);
+    out.push('\n');
+    out.push_str("source_digest: ");
+    out.push_str(source_digest);
+    out.push('\n');
     out.push('\n');
 
     out.push_str("exports { ");
@@ -3513,6 +5059,10 @@ fn render_mpd(ast: &AstFile) -> String {
                 out.push_str("  heap struct ");
                 out.push_str(&s.name);
                 out.push('\n');
+                let fqn = symbol_fqn(&module_path, &s.name);
+                out.push_str("    sid: ");
+                out.push_str(&generate_sid('T', &fqn).0);
+                out.push('\n');
                 out.push_str("    signature: ");
                 out.push_str(&render_struct_signature("heap struct", s));
                 out.push('\n');
@@ -3522,6 +5072,10 @@ fn render_mpd(ast: &AstFile) -> String {
                 wrote_type = true;
                 out.push_str("  value struct ");
                 out.push_str(&s.name);
+                out.push('\n');
+                let fqn = symbol_fqn(&module_path, &s.name);
+                out.push_str("    sid: ");
+                out.push_str(&generate_sid('T', &fqn).0);
                 out.push('\n');
                 out.push_str("    signature: ");
                 out.push_str(&render_struct_signature("value struct", s));
@@ -3533,6 +5087,10 @@ fn render_mpd(ast: &AstFile) -> String {
                 out.push_str("  heap enum ");
                 out.push_str(&e.name);
                 out.push('\n');
+                let fqn = symbol_fqn(&module_path, &e.name);
+                out.push_str("    sid: ");
+                out.push_str(&generate_sid('T', &fqn).0);
+                out.push('\n');
                 out.push_str("    signature: ");
                 out.push_str(&render_enum_signature("heap enum", e));
                 out.push('\n');
@@ -3542,6 +5100,10 @@ fn render_mpd(ast: &AstFile) -> String {
                 wrote_type = true;
                 out.push_str("  value enum ");
                 out.push_str(&e.name);
+                out.push('\n');
+                let fqn = symbol_fqn(&module_path, &e.name);
+                out.push_str("    sid: ");
+                out.push_str(&generate_sid('T', &fqn).0);
                 out.push('\n');
                 out.push_str("    signature: ");
                 out.push_str(&render_enum_signature("value enum", e));
@@ -3565,12 +5127,20 @@ fn render_mpd(ast: &AstFile) -> String {
                 out.push_str("  ");
                 out.push_str(&render_fn_signature("fn", f, None));
                 out.push('\n');
+                let fqn = symbol_fqn(&module_path, &f.name);
+                out.push_str("    sid: ");
+                out.push_str(&generate_sid('F', &fqn).0);
+                out.push('\n');
                 push_doc_lines(&mut out, "    ", f.doc.as_deref());
             }
             AstDecl::AsyncFn(f) => {
                 wrote_fn = true;
                 out.push_str("  ");
                 out.push_str(&render_fn_signature("async fn", f, None));
+                out.push('\n');
+                let fqn = symbol_fqn(&module_path, &f.name);
+                out.push_str("    sid: ");
+                out.push_str(&generate_sid('F', &fqn).0);
                 out.push('\n');
                 push_doc_lines(&mut out, "    ", f.doc.as_deref());
             }
@@ -3579,12 +5149,24 @@ fn render_mpd(ast: &AstFile) -> String {
                 out.push_str("  ");
                 out.push_str(&render_fn_signature("unsafe fn", f, None));
                 out.push('\n');
+                let fqn = symbol_fqn(&module_path, &f.name);
+                out.push_str("    sid: ");
+                out.push_str(&generate_sid('F', &fqn).0);
+                out.push('\n');
                 push_doc_lines(&mut out, "    ", f.doc.as_deref());
             }
             AstDecl::GpuFn(gpu) => {
                 wrote_fn = true;
                 out.push_str("  ");
-                out.push_str(&render_fn_signature("gpu fn", &gpu.inner, Some(&gpu.target)));
+                out.push_str(&render_fn_signature(
+                    "gpu fn",
+                    &gpu.inner,
+                    Some(&gpu.target),
+                ));
+                out.push('\n');
+                let fqn = symbol_fqn(&module_path, &gpu.inner.name);
+                out.push_str("    sid: ");
+                out.push_str(&generate_sid('F', &fqn).0);
                 out.push('\n');
                 push_doc_lines(&mut out, "    ", gpu.inner.doc.as_deref());
             }
@@ -3596,6 +5178,14 @@ fn render_mpd(ast: &AstFile) -> String {
     }
 
     out
+}
+
+fn symbol_fqn(module_path: &str, local_name: &str) -> String {
+    if module_path.is_empty() {
+        local_name.to_string()
+    } else {
+        format!("{}.{}", module_path, local_name)
+    }
 }
 
 fn render_fn_signature(prefix: &str, func: &AstFnDecl, target: Option<&str>) -> String {
@@ -3674,7 +5264,7 @@ fn render_ast_base_type(base: &AstBaseType) -> String {
                 if path.segments.is_empty() {
                     name.clone()
                 } else {
-                    format!("{}.{}", path.to_string(), name)
+                    format!("{}.{}", path, name)
                 }
             } else {
                 name.clone()
@@ -3803,29 +5393,142 @@ bb0:
 }
 
 fn finalize_build_result(mut result: BuildResult, config: &DriverConfig) -> BuildResult {
+    let mut planned = Vec::new();
     result.success = !has_errors(&result.diagnostics);
     if result.success {
-        let planned = planned_artifacts(config, &mut result.diagnostics);
-        if result.artifacts.is_empty() {
-            result.artifacts = planned;
-        } else {
-            for artifact in planned {
-                if Path::new(&artifact).exists() && !result.artifacts.contains(&artifact) {
-                    result.artifacts.push(artifact);
-                }
+        planned = planned_artifacts(config, &mut result.diagnostics);
+        for artifact in &planned {
+            if Path::new(artifact).exists() && !result.artifacts.contains(artifact) {
+                result.artifacts.push(artifact.clone());
             }
         }
     }
+
+    if emit_contains(&config.emit, "mpdbg") {
+        let mpdbg_path = stage_mpdbg_output_path(config);
+        let payload = canonical_json_encode(&build_mpdbg_payload(config, &result))
+            .unwrap_or_else(|_| "{}".to_string());
+        match write_text_artifact(&mpdbg_path, &payload) {
+            Ok(()) => {
+                let artifact = mpdbg_path.to_string_lossy().to_string();
+                if !result.artifacts.contains(&artifact) {
+                    result.artifacts.push(artifact);
+                }
+            }
+            Err(err) => result.diagnostics.push(simple_diag(
+                "MPP0003",
+                Severity::Error,
+                "failed to write mpdbg artifact",
+                err,
+            )),
+        }
+    }
+
+    if !has_errors(&result.diagnostics) {
+        validate_requested_artifacts(&mut result, config, &planned);
+    }
+
+    result.success = !has_errors(&result.diagnostics);
     result
 }
 
-fn append_stage_diagnostics(result: &mut BuildResult, bag: DiagnosticBag) -> bool {
+fn validate_requested_artifacts(
+    result: &mut BuildResult,
+    config: &DriverConfig,
+    planned: &[String],
+) {
+    let mut missing = planned
+        .iter()
+        .filter(|path| !Path::new(path.as_str()).exists())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if emit_contains(&config.emit, "object") {
+        let has_object = result.artifacts.iter().any(|artifact| {
+            (artifact.ends_with(".o") || artifact.ends_with(".obj")) && Path::new(artifact).exists()
+        });
+        if !has_object {
+            missing.push("<object>".to_string());
+        }
+    }
+
+    if missing.is_empty() {
+        return;
+    }
+
+    missing.sort();
+    missing.dedup();
+    result.diagnostics.push(simple_diag(
+        "MPL0002",
+        Severity::Error,
+        "requested artifact(s) missing",
+        format!(
+            "Requested emit artifact(s) were not produced: {}.",
+            missing.join(", ")
+        ),
+    ));
+}
+
+fn build_mpdbg_payload(config: &DriverConfig, result: &BuildResult) -> serde_json::Value {
+    let mut by_severity = BTreeMap::from([
+        ("error".to_string(), 0_u64),
+        ("warning".to_string(), 0_u64),
+        ("info".to_string(), 0_u64),
+        ("hint".to_string(), 0_u64),
+    ]);
+    let mut by_code: BTreeMap<String, u64> = BTreeMap::new();
+    for diagnostic in &result.diagnostics {
+        let severity_key = match diagnostic.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Info => "info",
+            Severity::Hint => "hint",
+        };
+        *by_severity.entry(severity_key.to_string()).or_insert(0) += 1;
+        *by_code.entry(diagnostic.code.clone()).or_insert(0) += 1;
+    }
+
+    let mut stage_timing = Vec::new();
+    for stage in PIPELINE_STAGES {
+        stage_timing.push(json!({
+            "stage": stage,
+            "ms": result.timing_ms.get(stage).copied().unwrap_or(0),
+        }));
+    }
+
+    json!({
+        "format": "mpdbg.v0",
+        "entry_path": config.entry_path,
+        "target_triple": config.target_triple,
+        "profile": config.profile.as_str(),
+        "emit": config.emit,
+        "success": result.success,
+        "diagnostics": {
+            "count": result.diagnostics.len(),
+            "by_severity": by_severity,
+            "by_code": by_code,
+        },
+        "timing_ms": {
+            "stages": stage_timing,
+            "raw": result.timing_ms,
+        },
+        "artifacts": result.artifacts,
+    })
+}
+
+fn append_stage_diagnostics(result: &mut BuildResult, mut bag: DiagnosticBag) -> bool {
     let failed = bag.has_errors();
+    for diag in &mut bag.diagnostics {
+        if diag.explanation_md.is_none() {
+            diag.explanation_md = magpie_diag::explain_code(&diag.code);
+        }
+        apply_core_fixers(diag);
+    }
     result.diagnostics.extend(bag.diagnostics);
     failed
 }
 
-fn mark_skipped_from(timing: &mut HashMap<String, u64>, from_stage_idx: usize) {
+fn mark_skipped_from(timing: &mut BTreeMap<String, u64>, from_stage_idx: usize) {
     for stage in PIPELINE_STAGES.iter().skip(from_stage_idx) {
         timing.entry((*stage).to_string()).or_insert(0);
     }
@@ -3845,16 +5548,19 @@ fn simple_diag(
     title: impl Into<String>,
     message: impl Into<String>,
 ) -> Diagnostic {
+    let code_str = code.to_string();
     Diagnostic {
-        code: code.to_string(),
+        code: code_str.clone(),
         severity,
         title: title.into(),
         primary_span: None,
         secondary_spans: Vec::new(),
         message: message.into(),
-        explanation_md: None,
+        explanation_md: magpie_diag::explain_code(&code_str),
         why: None,
         suggested_fixes: Vec::new(),
+        rag_bundle: Vec::new(),
+        related_docs: Vec::new(),
     }
 }
 
@@ -3874,7 +5580,7 @@ fn planned_artifacts(config: &DriverConfig, diagnostics: &mut Vec<Diagnostic>) -
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("main");
-    let base = PathBuf::from("target")
+    let base = build_output_root(config)
         .join(&config.target_triple)
         .join(config.profile.as_str());
     let is_windows = is_windows_target(&config.target_triple);
@@ -3884,11 +5590,12 @@ fn planned_artifacts(config: &DriverConfig, diagnostics: &mut Vec<Diagnostic>) -
         let path = match emit.as_str() {
             "llvm-ir" => Some(base.join(format!("{stem}.ll"))),
             "llvm-bc" => Some(base.join(format!("{stem}.bc"))),
-            "object" => {
-                Some(base.join(format!("{stem}{}", if is_windows { ".obj" } else { ".o" })))
-            }
+            // Object outputs are emitted per-LLVM-input unit and discovered dynamically.
+            "object" => None,
             "asm" => Some(base.join(format!("{stem}.s"))),
-            "spv" => Some(base.join(format!("{stem}.spv"))),
+            // SPIR-V outputs are emitted per-kernel under `<target>/<triple>/<profile>/gpu/`.
+            // They are discovered dynamically during stage10, so no single planned file applies.
+            "spv" => None,
             "exe" => Some(base.join(format!("{stem}{}", if is_windows { ".exe" } else { "" }))),
             "shared-lib" => {
                 let ext = if is_windows {
@@ -3944,13 +5651,41 @@ fn llm_budget_value(config: &DriverConfig) -> Option<serde_json::Value> {
         return None;
     }
 
+    let token_budget = config.token_budget.unwrap_or(DEFAULT_LLM_TOKEN_BUDGET);
+    let tokenizer = config
+        .llm_tokenizer
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LLM_TOKENIZER.to_string());
+    let policy = config
+        .llm_budget_policy
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LLM_BUDGET_POLICY.to_string());
+
     Some(json!({
-        "token_budget": config.token_budget.unwrap_or(12000),
-        "tokenizer": "approx:utf8_4chars",
+        "token_budget": token_budget,
+        "tokenizer": tokenizer,
         "estimated_tokens": serde_json::Value::Null,
-        "policy": "balanced",
+        "policy": policy,
         "dropped": [],
     }))
+}
+
+fn effective_budget_config(config: &DriverConfig) -> Option<TokenBudget> {
+    if !config.llm_mode && config.token_budget.is_none() {
+        return None;
+    }
+
+    Some(TokenBudget {
+        budget: config.token_budget.unwrap_or(DEFAULT_LLM_TOKEN_BUDGET),
+        tokenizer: config
+            .llm_tokenizer
+            .clone()
+            .unwrap_or_else(|| DEFAULT_LLM_TOKENIZER.to_string()),
+        policy: config
+            .llm_budget_policy
+            .clone()
+            .unwrap_or_else(|| DEFAULT_LLM_BUDGET_POLICY.to_string()),
+    })
 }
 
 fn default_target_triple() -> String {
@@ -3995,24 +5730,1183 @@ mod tests {
     }
 
     #[test]
+    fn resolve_dependencies_for_build_writes_lockfile_for_version_dep() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "magpie_driver_pkg_preflight_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("failed to create temp source dir");
+        std::fs::write(
+            root.join("Magpie.toml"),
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2026"
+
+[build]
+entry = "src/main.mp"
+profile_default = "dev"
+
+[dependencies]
+std = { version = "^0.1" }
+"#,
+        )
+        .expect("failed to write temp manifest");
+        std::fs::write(
+            root.join("src/main.mp"),
+            r#"module demo.main
+exports { @main }
+imports { }
+digest "0000000000000000"
+
+fn @main() -> i32 {
+bb0:
+  ret const.i32 0
+}
+"#,
+        )
+        .expect("failed to write temp entry");
+
+        let entry = root.join("src/main.mp");
+        let lock_path = resolve_dependencies_for_build(entry.to_string_lossy().as_ref(), false)
+            .expect("dependency resolution should succeed")
+            .expect("manifest should be discovered");
+        assert!(lock_path.is_file(), "lockfile should be written");
+
+        let lock = magpie_pkg::read_lockfile(&lock_path).expect("lockfile should parse");
+        assert!(lock.packages.iter().any(|pkg| pkg.name == "std"));
+
+        std::fs::remove_dir_all(&root).expect("failed to cleanup temp project");
+    }
+
+    #[test]
+    fn build_uses_manifest_build_entry_when_default_entry_path_is_requested() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "magpie_driver_manifest_entry_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("failed to create temp source dir");
+        std::fs::write(
+            root.join("Magpie.toml"),
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2026"
+
+[build]
+entry = "src/app.mp"
+profile_default = "dev"
+"#,
+        )
+        .expect("failed to write temp manifest");
+        std::fs::write(
+            root.join("src/app.mp"),
+            r#"module demo.app
+exports { @main }
+imports { }
+digest "0000000000000000"
+
+fn @main() -> i32 {
+bb0:
+  ret const.i32 0
+}
+"#,
+        )
+        .expect("failed to write temp entry");
+
+        let mut config = DriverConfig::default();
+        config.entry_path = root.join("src/main.mp").to_string_lossy().to_string();
+        config.target_triple = format!("manifest-entry-test-{}-{}", std::process::id(), nonce);
+        config.emit = vec!["mpir".to_string()];
+
+        let result = build(&config);
+        assert!(
+            result.success,
+            "build should succeed with manifest entry override: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.ends_with("app.mpir")),
+            "expected app.mpir artifact, got {:?}",
+            result.artifacts
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(PathBuf::from("target").join(&config.target_triple));
+    }
+
+    #[test]
     fn test_parse_c_header_functions_and_render_extern_module() {
         let header = r#"
             int add(int a, int b);
             const char* version(void);
             void write_bytes(unsigned char* data, unsigned long len);
+            MyType open_handle(void);
+            void mutate_handle(MyType* handle);
         "#;
 
         let funcs = parse_c_header_functions(header);
-        assert_eq!(funcs.len(), 3);
+        assert_eq!(funcs.len(), 5);
         assert_eq!(funcs[0].name, "add");
         assert_eq!(funcs[0].ret_ty, "i32");
-        assert_eq!(funcs[0].params, vec![("a".to_string(), "i32".to_string()), ("b".to_string(), "i32".to_string())]);
+        assert_eq!(
+            funcs[0].params,
+            vec![
+                ("a".to_string(), "i32".to_string()),
+                ("b".to_string(), "i32".to_string())
+            ]
+        );
         assert_eq!(funcs[1].ret_ty, "Str");
         assert_eq!(funcs[2].params[0].1, "Str");
+        assert_eq!(funcs[3].ret_ty, "rawptr<u8>");
+        assert_eq!(funcs[4].params[0].1, "rawptr<u8>");
 
         let rendered = render_extern_module("ffi_import", &funcs);
         assert!(rendered.contains("extern \"C\" module ffi_import"));
         assert!(rendered.contains("fn @add(%a: i32, %b: i32) -> i32"));
         assert!(rendered.contains("fn @version() -> Str"));
+        assert!(rendered.contains("returns=\"borrowed\""));
+        assert!(rendered.contains("params=\"borrowed\""));
+    }
+
+    #[test]
+    fn test_output_envelope_graphs_default_shape() {
+        assert_eq!(
+            output_envelope_graphs(&[]),
+            serde_json::json!({
+                "symbols": {},
+                "deps": {},
+                "ownership": {},
+                "cfg": {},
+            })
+        );
+    }
+
+    #[test]
+    fn test_output_envelope_graphs_pickup_from_artifacts() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "magpie_driver_graph_pickup_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("failed to create graph pickup temp dir");
+
+        let sym_path = temp_dir.join("main.symgraph.json");
+        let deps_path = temp_dir.join("main.depsgraph.json");
+        let ownership_path = temp_dir.join("main.ownershipgraph.json");
+        let cfg_path = temp_dir.join("main.cfggraph.json");
+
+        std::fs::write(&sym_path, r#"{"symbols":["S"]}"#).expect("write symgraph");
+        std::fs::write(&deps_path, r#"{"deps":["#).expect("write malformed depsgraph");
+        std::fs::write(&ownership_path, r#"{"owners":["O"]}"#).expect("write ownershipgraph");
+        std::fs::write(&cfg_path, r#"{"blocks":["B0"]}"#).expect("write cfggraph");
+
+        let graphs = output_envelope_graphs(&[
+            sym_path.to_string_lossy().to_string(),
+            deps_path.to_string_lossy().to_string(),
+            ownership_path.to_string_lossy().to_string(),
+            cfg_path.to_string_lossy().to_string(),
+        ]);
+
+        assert_eq!(graphs["symbols"], serde_json::json!({"symbols": ["S"]}));
+        assert_eq!(graphs["deps"], serde_json::json!({}));
+        assert_eq!(graphs["ownership"], serde_json::json!({"owners": ["O"]}));
+        assert_eq!(graphs["cfg"], serde_json::json!({"blocks": ["B0"]}));
+
+        std::fs::remove_dir_all(&temp_dir).expect("failed to clean up graph pickup temp dir");
+    }
+
+    #[test]
+    fn test_module_path_to_stage1_file_path_conventions() {
+        assert_eq!(
+            module_path_to_stage1_file_path("demo.main"),
+            Some(PathBuf::from("src/main.mp"))
+        );
+        assert_eq!(
+            module_path_to_stage1_file_path("demo.net.http"),
+            Some(PathBuf::from("src/net/http.mp"))
+        );
+        assert_eq!(
+            module_path_to_stage1_file_path("std.io"),
+            Some(PathBuf::from("std/std.io/io.mp"))
+        );
+        assert_eq!(module_path_to_stage1_file_path("std.io.extra"), None);
+    }
+
+    #[test]
+    fn test_pop_first_module_path_is_lexicographic() {
+        let mut pending = BTreeSet::from([
+            "pkg.z".to_string(),
+            "pkg.a".to_string(),
+            "pkg.m".to_string(),
+        ]);
+
+        assert_eq!(
+            pop_first_module_path(&mut pending),
+            Some("pkg.a".to_string())
+        );
+        assert_eq!(
+            pop_first_module_path(&mut pending),
+            Some("pkg.m".to_string())
+        );
+        assert_eq!(
+            pop_first_module_path(&mut pending),
+            Some("pkg.z".to_string())
+        );
+        assert_eq!(pop_first_module_path(&mut pending), None);
+    }
+
+    #[test]
+    fn test_stage_parse_ast_output_path_is_deterministic() {
+        let config = DriverConfig {
+            entry_path: "src/hello.mp".to_string(),
+            profile: BuildProfile::Release,
+            target_triple: "x86_64-unknown-linux-gnu".to_string(),
+            ..DriverConfig::default()
+        };
+
+        let expected = PathBuf::from("target")
+            .join("x86_64-unknown-linux-gnu")
+            .join("release")
+            .join("hello.ast.txt");
+
+        assert_eq!(stage_parse_ast_output_path(&config), expected);
+        assert_eq!(stage_parse_ast_output_path(&config), expected);
+    }
+
+    #[test]
+    fn test_stage_mms_memory_index_output_path_is_deterministic() {
+        let config = DriverConfig {
+            entry_path: "src/hello.mp".to_string(),
+            profile: BuildProfile::Release,
+            target_triple: "x86_64-unknown-linux-gnu".to_string(),
+            ..DriverConfig::default()
+        };
+
+        let expected = PathBuf::from(".magpie")
+            .join("memory")
+            .join("hello.mms_index.json");
+
+        assert_eq!(stage_mms_memory_index_output_path(&config), expected);
+        assert_eq!(stage_mms_memory_index_output_path(&config), expected);
+    }
+
+    #[test]
+    fn test_parse_generics_mode_marker_extracts_value() {
+        let ir0 = "@\"mp$0$ABI$generics_mode\" = weak_odr constant i8 0";
+        let ir1 = "@\"mp$0$ABI$generics_mode\" = weak_odr constant i8 1";
+        assert_eq!(parse_generics_mode_marker(ir0), Some(0));
+        assert_eq!(parse_generics_mode_marker(ir1), Some(1));
+        assert_eq!(parse_generics_mode_marker("; no marker"), None);
+    }
+
+    #[test]
+    fn test_verify_generics_mode_markers_detects_mismatch() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "magpie_driver_generics_mode_check_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&root).expect("failed to create temp dir");
+
+        let a = root.join("a.ll");
+        let b = root.join("b.ll");
+        std::fs::write(&a, "@\"mp$0$ABI$generics_mode\" = weak_odr constant i8 0\n")
+            .expect("write a.ll");
+        std::fs::write(&b, "@\"mp$0$ABI$generics_mode\" = weak_odr constant i8 1\n")
+            .expect("write b.ll");
+
+        let err =
+            verify_generics_mode_markers(&[a, b], false).expect_err("mismatch should be rejected");
+        assert!(err.contains("MIXED_GENERICS_MODE"));
+
+        std::fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn test_finalize_build_result_writes_structured_mpdbg_sidecar() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let target_triple = format!("mpdbg-test-{}-{nonce}", std::process::id());
+        let config = DriverConfig {
+            entry_path: "src/hello.mp".to_string(),
+            target_triple: target_triple.clone(),
+            emit: vec!["mpdbg".to_string()],
+            ..DriverConfig::default()
+        };
+        let mut result = BuildResult::default();
+        result.timing_ms.insert(STAGE_1.to_string(), 7);
+        result.diagnostics.push(simple_diag(
+            "MPL2001",
+            Severity::Warning,
+            "lint",
+            "example warning",
+        ));
+
+        let finalized = finalize_build_result(result, &config);
+        let mpdbg_path = stage_mpdbg_output_path(&config);
+        assert!(
+            mpdbg_path.is_file(),
+            "expected mpdbg sidecar at {}",
+            mpdbg_path.display()
+        );
+        assert!(
+            finalized
+                .artifacts
+                .contains(&mpdbg_path.to_string_lossy().to_string()),
+            "finalized artifacts should include mpdbg path"
+        );
+
+        let payload = std::fs::read_to_string(&mpdbg_path).expect("read mpdbg payload");
+        assert!(!payload.contains("mpdbg.v0.stub"));
+        let value: serde_json::Value =
+            serde_json::from_str(&payload).expect("mpdbg payload should be valid json");
+        assert_eq!(value["format"], "mpdbg.v0");
+        assert_eq!(value["diagnostics"]["by_severity"]["warning"], 1);
+        assert_eq!(value["timing_ms"]["stages"][0]["stage"], STAGE_1);
+
+        let _ = std::fs::remove_dir_all(PathBuf::from("target").join(target_triple));
+    }
+
+    #[test]
+    fn test_finalize_build_result_reports_missing_requested_artifacts() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let target_triple = format!("missing-artifact-test-{}-{nonce}", std::process::id());
+        let config = DriverConfig {
+            entry_path: "src/hello.mp".to_string(),
+            target_triple: target_triple.clone(),
+            emit: vec!["mpd".to_string()],
+            ..DriverConfig::default()
+        };
+
+        let result = BuildResult {
+            success: true,
+            diagnostics: Vec::new(),
+            artifacts: Vec::new(),
+            timing_ms: BTreeMap::new(),
+        };
+        let finalized = finalize_build_result(result, &config);
+        assert!(
+            !finalized.success,
+            "missing requested artifacts must fail finalization"
+        );
+        assert!(
+            finalized
+                .diagnostics
+                .iter()
+                .any(|diag| diag.code == "MPL0002"),
+            "expected MPL0002 diagnostic, got {:?}",
+            finalized
+                .diagnostics
+                .iter()
+                .map(|diag| diag.code.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(PathBuf::from("target").join(target_triple));
+    }
+
+    #[test]
+    fn test_append_stage_diagnostics_injects_core_fix_and_patch_digests() {
+        let mut result = BuildResult::default();
+        let mut bag = DiagnosticBag::new(8);
+        bag.emit(simple_diag(
+            "MPT1023",
+            Severity::Error,
+            "missing trait impl",
+            "missing required trait impl: `impl eq for demo.Key`.",
+        ));
+
+        let failed = append_stage_diagnostics(&mut result, bag);
+        assert!(failed, "error diagnostics should mark stage as failed");
+        assert_eq!(result.diagnostics.len(), 1);
+
+        let diag = &result.diagnostics[0];
+        assert!(
+            diag.explanation_md.is_some(),
+            "driver should hydrate explanation templates"
+        );
+        assert_eq!(diag.suggested_fixes.len(), 1);
+
+        let fix = &diag.suggested_fixes[0];
+        assert_eq!(fix.patch_format, "unified-diff");
+        assert!(fix.patch.contains("impl eq for demo.Key"));
+        assert!(
+            !fix.applies_to.is_empty(),
+            "applies_to digest map is required"
+        );
+        assert!(!fix.produces.is_empty(), "produces digest map is required");
+    }
+
+    #[test]
+    fn test_lint_fixer_includes_patch_digest_envelopes() {
+        let fix = suggested_fix_unused_local("src/main.mp", 7);
+        assert_eq!(fix.patch_format, "unified-diff");
+        assert!(!fix.applies_to.is_empty());
+        assert!(!fix.produces.is_empty());
+        assert!(fix.applies_to.contains_key("src/main.mp"));
+        assert!(fix.produces.contains_key("src/main.mp"));
+    }
+
+    #[test]
+    fn test_core_fixers_cover_required_templates() {
+        let cases = vec![
+            (
+                "MPS0002",
+                "Cannot resolve import 'dep.math::sum'.",
+                "imports { std::sum }",
+            ),
+            (
+                "MPO0103",
+                "map.get requires Dupable value type",
+                "map.contains_key",
+            ),
+            ("MPO0004", "shared mutation forbidden", "clone.shared"),
+            ("MPO0101", "borrow crosses block boundary", "borrow.shared"),
+            (
+                "MPT2032",
+                "impl 'eq' for 'demo.Key' references unknown local function '@eq_key'.",
+                "impl eq for demo.Key",
+            ),
+        ];
+
+        for (code, message, patch_snippet) in cases {
+            let mut result = BuildResult::default();
+            let mut bag = DiagnosticBag::new(8);
+            bag.emit(simple_diag(code, Severity::Error, "case", message));
+            let _ = append_stage_diagnostics(&mut result, bag);
+
+            let diag = result
+                .diagnostics
+                .first()
+                .expect("diagnostic should be present");
+            assert!(
+                !diag.suggested_fixes.is_empty(),
+                "expected fixer for code {code}"
+            );
+            let fix = &diag.suggested_fixes[0];
+            assert_eq!(fix.patch_format, "unified-diff");
+            assert!(
+                fix.patch.contains(patch_snippet),
+                "expected patch for {code} to contain '{patch_snippet}', got: {}",
+                fix.patch
+            );
+            assert!(
+                !fix.applies_to.is_empty() && !fix.produces.is_empty(),
+                "expected digest maps for {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_entry_success_writes_ast_artifact() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "magpie_driver_parse_entry_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("failed to create parse test temp dir");
+
+        let entry_path = temp_dir.join("parse_success.mp");
+        std::fs::write(
+            &entry_path,
+            r#"module parse_success.main
+exports { @main }
+imports { }
+digest "0000000000000000"
+
+fn @main() -> i32 {
+bb0:
+  ret const.i32 0
+}
+"#,
+        )
+        .expect("failed to write parse test source");
+
+        let mut config = DriverConfig::default();
+        config.entry_path = entry_path.to_string_lossy().to_string();
+        config.target_triple = format!("parse-entry-test-{}-{}", std::process::id(), nonce);
+
+        let ast_path = stage_parse_ast_output_path(&config);
+        if ast_path.exists() {
+            std::fs::remove_file(&ast_path).expect("failed to remove stale ast artifact");
+        }
+
+        let result = parse_entry(&config);
+        assert!(
+            result.success,
+            "parse_entry should succeed, diagnostics: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result
+                .artifacts
+                .contains(&ast_path.to_string_lossy().to_string()),
+            "artifact list should include {}",
+            ast_path.display()
+        );
+        let ast_dump =
+            std::fs::read_to_string(&ast_path).expect("ast artifact should be written on success");
+        assert!(ast_dump.contains("AstFile"));
+        assert!(result
+            .diagnostics
+            .iter()
+            .all(|diag| !matches!(diag.severity, Severity::Error)));
+
+        std::fs::remove_dir_all(&temp_dir).expect("failed to cleanup parse test temp dir");
+        let _ = std::fs::remove_dir_all(PathBuf::from("target").join(&config.target_triple));
+    }
+
+    #[test]
+    fn test_build_emits_gpu_spv_and_kernel_registry_module() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "magpie_driver_gpu_emit_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("failed to create gpu temp dir");
+
+        let entry_path = temp_dir.join("gpu_emit.mp");
+        std::fs::write(
+            &entry_path,
+            r#"module gpumod.emit
+exports { @main }
+imports { }
+digest "0000000000000000"
+
+gpu fn @k() -> unit target(spv) {
+bb0:
+  ret
+}
+
+fn @main() -> i32 {
+bb0:
+  ret const.i32 0
+}
+"#,
+        )
+        .expect("failed to write gpu test source");
+
+        let mut config = DriverConfig::default();
+        config.entry_path = entry_path.to_string_lossy().to_string();
+        config.target_triple = format!("gpu-emit-test-{}-{}", std::process::id(), nonce);
+        config.emit = vec!["spv".to_string()];
+
+        let kernel_sid = generate_sid('F', "gpumod.emit.@k");
+        let expected_spv_path = stage_gpu_kernel_spv_output_path(&config, &kernel_sid);
+        let registry_path = stage_gpu_registry_output_path(&config);
+
+        let result = build(&config);
+        assert!(
+            result.success,
+            "gpu build should succeed, diagnostics: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            expected_spv_path.is_file(),
+            "expected spir-v artifact at {}",
+            expected_spv_path.display()
+        );
+        assert!(
+            result
+                .artifacts
+                .contains(&expected_spv_path.to_string_lossy().to_string()),
+            "result artifacts should include spir-v output"
+        );
+        assert!(
+            registry_path.is_file(),
+            "expected gpu kernel registry ll at {}",
+            registry_path.display()
+        );
+        let registry_ir = std::fs::read_to_string(&registry_path).expect("read registry ir");
+        assert!(registry_ir.contains("@mp_gpu_register_all_kernels"));
+        assert!(registry_ir.contains("@mp_rt_gpu_register_kernels"));
+
+        std::fs::remove_dir_all(&temp_dir).expect("failed to cleanup gpu temp dir");
+        let _ = std::fs::remove_dir_all(PathBuf::from("target").join(&config.target_triple));
+    }
+
+    #[test]
+    fn test_build_with_shared_generics_flag_emits_mode_marker() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "magpie_driver_shared_generics_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+        let entry_path = temp_dir.join("shared_generics.mp");
+        std::fs::write(
+            &entry_path,
+            r#"module sgmod.generics
+exports { @main }
+imports { }
+digest "0000000000000000"
+
+fn @main() -> i32 {
+bb0:
+  ret const.i32 0
+}
+"#,
+        )
+        .expect("failed to write test source");
+
+        let mut config = DriverConfig::default();
+        config.entry_path = entry_path.to_string_lossy().to_string();
+        config.target_triple = format!("shared-generics-test-{}-{}", std::process::id(), nonce);
+        config.emit = vec!["llvm-ir".to_string()];
+        config.shared_generics = true;
+
+        let result = build(&config);
+        assert!(
+            result.success,
+            "shared-generics build should succeed, diagnostics: {:?}",
+            result.diagnostics
+        );
+
+        let llvm_path = stage_module_output_path(&config, 0, 1, "ll");
+        let llvm_ir = std::fs::read_to_string(&llvm_path).expect("read generated llvm ir");
+        assert!(llvm_ir.contains("\"mp$0$ABI$generics_mode\""));
+        assert!(llvm_ir.contains("constant i8 1"));
+
+        std::fs::remove_dir_all(&temp_dir).expect("failed to cleanup temp dir");
+        let _ = std::fs::remove_dir_all(PathBuf::from("target").join(&config.target_triple));
+    }
+
+    #[test]
+    fn test_render_mpd_includes_sid_and_digest_metadata() {
+        let source = r#"module docs.docmeta
+exports { TDocType, @main }
+imports { }
+digest "deadbeefcafebabe"
+
+heap struct TDocType {
+  field v: i32
+}
+
+fn @main() -> i32 {
+bb0:
+  ret const.i32 0
+}
+"#;
+
+        let mut diag = DiagnosticBag::new(DEFAULT_MAX_ERRORS);
+        let file_id = FileId(0);
+        let tokens = lex(file_id, source, &mut diag);
+        let ast = parse_file(&tokens, file_id, &mut diag).expect("source should parse");
+        assert!(
+            diag.diagnostics
+                .iter()
+                .all(|d| !matches!(d.severity, Severity::Error)),
+            "unexpected parse diagnostics: {:?}",
+            diag.diagnostics
+        );
+
+        let mpd = render_mpd(&ast);
+        assert!(mpd.contains("module docs.docmeta"));
+        assert!(mpd.contains("module_path: docs.docmeta"));
+        assert!(mpd.contains("source_digest: deadbeefcafebabe"));
+        assert!(mpd.contains(&format!(
+            "module_sid: {}",
+            generate_sid('M', "docs.docmeta").0
+        )));
+        assert!(mpd.contains(&format!(
+            "    sid: {}",
+            generate_sid('T', "docs.docmeta.TDocType").0
+        )));
+        assert!(mpd.contains(&format!(
+            "    sid: {}",
+            generate_sid('F', "docs.docmeta.@main").0
+        )));
+    }
+
+    #[test]
+    fn test_remap_hir_modules_type_ids_updates_type_payloads() {
+        let old = |n: u32| TypeId(1000 + n);
+        let new = |n: u32| TypeId(2000 + n);
+        let mut remap = HashMap::new();
+        for n in 0..=41 {
+            remap.insert(old(n), new(n));
+        }
+
+        let mut module = HirModule {
+            module_id: magpie_types::ModuleId(0),
+            sid: Sid("M:TESTMODULE0".to_string()),
+            path: "test.mod".to_string(),
+            functions: vec![HirFunction {
+                fn_id: magpie_types::FnId(0),
+                sid: Sid("F:TESTFUNC00".to_string()),
+                name: "f".to_string(),
+                params: vec![(LocalId(0), old(0))],
+                ret_ty: old(1),
+                blocks: vec![HirBlock {
+                    id: BlockId(0),
+                    instrs: vec![
+                        HirInstr {
+                            dst: LocalId(1),
+                            ty: old(2),
+                            op: HirOp::Const(HirConst {
+                                ty: old(3),
+                                lit: HirConstLit::IntLit(1),
+                            }),
+                        },
+                        HirInstr {
+                            dst: LocalId(2),
+                            ty: old(4),
+                            op: HirOp::New {
+                                ty: old(5),
+                                fields: vec![(
+                                    "x".to_string(),
+                                    HirValue::Const(HirConst {
+                                        ty: old(6),
+                                        lit: HirConstLit::IntLit(2),
+                                    }),
+                                )],
+                            },
+                        },
+                        HirInstr {
+                            dst: LocalId(3),
+                            ty: old(7),
+                            op: HirOp::Cast {
+                                to: old(8),
+                                v: HirValue::Const(HirConst {
+                                    ty: old(9),
+                                    lit: HirConstLit::IntLit(3),
+                                }),
+                            },
+                        },
+                        HirInstr {
+                            dst: LocalId(4),
+                            ty: old(10),
+                            op: HirOp::PtrLoad {
+                                to: old(11),
+                                p: HirValue::Const(HirConst {
+                                    ty: old(12),
+                                    lit: HirConstLit::IntLit(4),
+                                }),
+                            },
+                        },
+                        HirInstr {
+                            dst: LocalId(5),
+                            ty: old(13),
+                            op: HirOp::Call {
+                                callee_sid: Sid("F:CALLEE0001".to_string()),
+                                inst: vec![old(14)],
+                                args: vec![HirValue::Const(HirConst {
+                                    ty: old(15),
+                                    lit: HirConstLit::IntLit(5),
+                                })],
+                            },
+                        },
+                        HirInstr {
+                            dst: LocalId(6),
+                            ty: old(16),
+                            op: HirOp::Phi {
+                                ty: old(17),
+                                incomings: vec![(
+                                    BlockId(0),
+                                    HirValue::Const(HirConst {
+                                        ty: old(18),
+                                        lit: HirConstLit::IntLit(6),
+                                    }),
+                                )],
+                            },
+                        },
+                        HirInstr {
+                            dst: LocalId(7),
+                            ty: old(19),
+                            op: HirOp::ArrNew {
+                                elem_ty: old(20),
+                                cap: HirValue::Const(HirConst {
+                                    ty: old(21),
+                                    lit: HirConstLit::IntLit(7),
+                                }),
+                            },
+                        },
+                        HirInstr {
+                            dst: LocalId(8),
+                            ty: old(22),
+                            op: HirOp::MapNew {
+                                key_ty: old(23),
+                                val_ty: old(24),
+                            },
+                        },
+                        HirInstr {
+                            dst: LocalId(9),
+                            ty: old(25),
+                            op: HirOp::JsonEncode {
+                                ty: old(26),
+                                v: HirValue::Const(HirConst {
+                                    ty: old(27),
+                                    lit: HirConstLit::IntLit(8),
+                                }),
+                            },
+                        },
+                        HirInstr {
+                            dst: LocalId(10),
+                            ty: old(28),
+                            op: HirOp::GpuShared {
+                                ty: old(29),
+                                size: HirValue::Const(HirConst {
+                                    ty: old(30),
+                                    lit: HirConstLit::IntLit(9),
+                                }),
+                            },
+                        },
+                    ],
+                    void_ops: vec![
+                        HirOpVoid::CallVoid {
+                            callee_sid: Sid("F:VOIDCAL001".to_string()),
+                            inst: vec![old(31)],
+                            args: vec![HirValue::Const(HirConst {
+                                ty: old(32),
+                                lit: HirConstLit::IntLit(10),
+                            })],
+                        },
+                        HirOpVoid::PtrStore {
+                            to: old(33),
+                            p: HirValue::Const(HirConst {
+                                ty: old(34),
+                                lit: HirConstLit::IntLit(11),
+                            }),
+                            v: HirValue::Const(HirConst {
+                                ty: old(35),
+                                lit: HirConstLit::IntLit(12),
+                            }),
+                        },
+                    ],
+                    terminator: HirTerminator::Switch {
+                        val: HirValue::Const(HirConst {
+                            ty: old(36),
+                            lit: HirConstLit::IntLit(0),
+                        }),
+                        arms: vec![(
+                            HirConst {
+                                ty: old(37),
+                                lit: HirConstLit::IntLit(1),
+                            },
+                            BlockId(1),
+                        )],
+                        default: BlockId(2),
+                    },
+                }],
+                is_async: false,
+                is_unsafe: false,
+            }],
+            globals: vec![magpie_hir::HirGlobal {
+                id: magpie_types::GlobalId(0),
+                name: "g".to_string(),
+                ty: old(38),
+                init: HirConst {
+                    ty: old(39),
+                    lit: HirConstLit::IntLit(13),
+                },
+            }],
+            type_decls: vec![
+                HirTypeDecl::Struct {
+                    sid: Sid("T:STRUCTTEST".to_string()),
+                    name: "S".to_string(),
+                    fields: vec![("f".to_string(), old(40))],
+                },
+                HirTypeDecl::Enum {
+                    sid: Sid("T:ENUMTEST00".to_string()),
+                    name: "E".to_string(),
+                    variants: vec![magpie_hir::HirEnumVariant {
+                        name: "V".to_string(),
+                        tag: 0,
+                        fields: vec![("e".to_string(), old(41))],
+                    }],
+                },
+            ],
+        };
+
+        remap_hir_modules_type_ids(std::slice::from_mut(&mut module), &remap);
+
+        let func = &module.functions[0];
+        assert_eq!(func.params[0].1, new(0));
+        assert_eq!(func.ret_ty, new(1));
+
+        assert_eq!(module.globals[0].ty, new(38));
+        assert_eq!(module.globals[0].init.ty, new(39));
+        match &module.type_decls[0] {
+            HirTypeDecl::Struct { fields, .. } => assert_eq!(fields[0].1, new(40)),
+            _ => panic!("expected struct decl"),
+        }
+        match &module.type_decls[1] {
+            HirTypeDecl::Enum { variants, .. } => assert_eq!(variants[0].fields[0].1, new(41)),
+            _ => panic!("expected enum decl"),
+        }
+
+        let block = &func.blocks[0];
+        assert_eq!(block.instrs[0].ty, new(2));
+        match &block.instrs[0].op {
+            HirOp::Const(value) => assert_eq!(value.ty, new(3)),
+            _ => panic!("expected const op"),
+        }
+        match &block.instrs[1].op {
+            HirOp::New { ty, fields } => {
+                assert_eq!(*ty, new(5));
+                match &fields[0].1 {
+                    HirValue::Const(value) => assert_eq!(value.ty, new(6)),
+                    _ => panic!("expected const field"),
+                }
+            }
+            _ => panic!("expected new op"),
+        }
+        match &block.instrs[2].op {
+            HirOp::Cast { to, v } => {
+                assert_eq!(*to, new(8));
+                match v {
+                    HirValue::Const(value) => assert_eq!(value.ty, new(9)),
+                    _ => panic!("expected const cast arg"),
+                }
+            }
+            _ => panic!("expected cast op"),
+        }
+        match &block.instrs[3].op {
+            HirOp::PtrLoad { to, .. } => assert_eq!(*to, new(11)),
+            _ => panic!("expected ptrload op"),
+        }
+        match &block.instrs[4].op {
+            HirOp::Call { inst, args, .. } => {
+                assert_eq!(inst[0], new(14));
+                match &args[0] {
+                    HirValue::Const(value) => assert_eq!(value.ty, new(15)),
+                    _ => panic!("expected const call arg"),
+                }
+            }
+            _ => panic!("expected call op"),
+        }
+        match &block.instrs[5].op {
+            HirOp::Phi { ty, incomings } => {
+                assert_eq!(*ty, new(17));
+                match &incomings[0].1 {
+                    HirValue::Const(value) => assert_eq!(value.ty, new(18)),
+                    _ => panic!("expected const phi incoming"),
+                }
+            }
+            _ => panic!("expected phi op"),
+        }
+        match &block.instrs[6].op {
+            HirOp::ArrNew { elem_ty, .. } => assert_eq!(*elem_ty, new(20)),
+            _ => panic!("expected arrnew op"),
+        }
+        match &block.instrs[7].op {
+            HirOp::MapNew { key_ty, val_ty } => {
+                assert_eq!(*key_ty, new(23));
+                assert_eq!(*val_ty, new(24));
+            }
+            _ => panic!("expected mapnew op"),
+        }
+        match &block.instrs[8].op {
+            HirOp::JsonEncode { ty, .. } => assert_eq!(*ty, new(26)),
+            _ => panic!("expected json encode op"),
+        }
+        match &block.instrs[9].op {
+            HirOp::GpuShared { ty, .. } => assert_eq!(*ty, new(29)),
+            _ => panic!("expected gpu shared op"),
+        }
+
+        match &block.void_ops[0] {
+            HirOpVoid::CallVoid { inst, args, .. } => {
+                assert_eq!(inst[0], new(31));
+                match &args[0] {
+                    HirValue::Const(value) => assert_eq!(value.ty, new(32)),
+                    _ => panic!("expected const callvoid arg"),
+                }
+            }
+            _ => panic!("expected callvoid op"),
+        }
+        match &block.void_ops[1] {
+            HirOpVoid::PtrStore { to, .. } => assert_eq!(*to, new(33)),
+            _ => panic!("expected ptrstore op"),
+        }
+        match &block.terminator {
+            HirTerminator::Switch { val, arms, .. } => {
+                match val {
+                    HirValue::Const(value) => assert_eq!(value.ty, new(36)),
+                    _ => panic!("expected const switch value"),
+                }
+                assert_eq!(arms[0].0.ty, new(37));
+            }
+            _ => panic!("expected switch terminator"),
+        }
+    }
+
+    #[test]
+    fn run_tests_uses_fallback_executable_build() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "magpie_driver_run_tests_fallback_exec_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("fallback temp dir should be created");
+
+        let mut config = DriverConfig::default();
+        config.target_triple = default_target_triple();
+        config.emit = vec!["mpir".to_string()];
+
+        let fallback_exe = if is_windows_target(&config.target_triple) {
+            temp_dir.join("fallback_test.exe")
+        } else {
+            temp_dir.join("fallback_test")
+        };
+        std::fs::write(&fallback_exe, b"test-binary").expect("fallback executable marker");
+
+        let mut build_calls = 0usize;
+        let mut seen_emits = Vec::new();
+        let mut seen_runs = Vec::new();
+        let fallback_exe_str = fallback_exe.to_string_lossy().to_string();
+        let result = run_tests_with(
+            &config,
+            None,
+            |build_config| {
+                build_calls += 1;
+                seen_emits.push(build_config.emit.clone());
+                if build_calls == 1 {
+                    BuildResult {
+                        success: true,
+                        artifacts: vec!["target/fallback_test.ll".to_string()],
+                        ..BuildResult::default()
+                    }
+                } else {
+                    BuildResult {
+                        success: true,
+                        artifacts: vec![fallback_exe_str.clone()],
+                        ..BuildResult::default()
+                    }
+                }
+            },
+            |_| vec!["@test_alpha".to_string(), "@test_beta".to_string()],
+            |path, test_name| {
+                seen_runs.push((path.to_string(), test_name.to_string()));
+                test_name == "@test_alpha"
+            },
+        );
+
+        assert_eq!(build_calls, 2, "fallback build should run once");
+        assert_eq!(seen_emits[0], vec!["mpir".to_string()]);
+        assert!(
+            seen_emits[1].iter().any(|emit| emit == "exe"),
+            "fallback build should request executable output"
+        );
+        assert_eq!(result.total, 2);
+        assert_eq!(result.passed, 1);
+        assert_eq!(result.failed, 1);
+        assert_eq!(
+            seen_runs,
+            vec![
+                (fallback_exe_str.clone(), "@test_alpha".to_string()),
+                (fallback_exe_str.clone(), "@test_beta".to_string()),
+            ]
+        );
+
+        std::fs::remove_dir_all(&temp_dir).expect("fallback temp dir should be removed");
+    }
+
+    #[test]
+    fn run_tests_marks_discovered_tests_failed_without_executable() {
+        let mut config = DriverConfig::default();
+        config.emit = vec!["mpir".to_string()];
+
+        let mut build_calls = 0usize;
+        let result = run_tests_with(
+            &config,
+            None,
+            |build_config| {
+                build_calls += 1;
+                if build_calls == 1 {
+                    assert_eq!(build_config.emit, vec!["mpir".to_string()]);
+                } else {
+                    assert!(build_config.emit.iter().any(|emit| emit == "exe"));
+                }
+                BuildResult {
+                    success: true,
+                    artifacts: vec!["target/tests.mpir".to_string()],
+                    ..BuildResult::default()
+                }
+            },
+            |_| vec!["@test_missing_exec".to_string()],
+            |_, _| panic!("test binaries should not run without executable"),
+        );
+
+        assert_eq!(build_calls, 2, "fallback build should run once");
+        assert_eq!(result.total, 1);
+        assert_eq!(result.passed, 0);
+        assert_eq!(result.failed, 1);
+        assert_eq!(
+            result.test_names,
+            vec![("@test_missing_exec".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn run_tests_keeps_zero_tests_as_pass_without_executable() {
+        let mut config = DriverConfig::default();
+        config.emit = vec!["mpir".to_string()];
+
+        let mut build_calls = 0usize;
+        let result = run_tests_with(
+            &config,
+            None,
+            |_| {
+                build_calls += 1;
+                BuildResult {
+                    success: true,
+                    artifacts: vec!["target/no-tests.mpir".to_string()],
+                    ..BuildResult::default()
+                }
+            },
+            |_| Vec::new(),
+            |_, _| panic!("no tests should execute"),
+        );
+
+        assert_eq!(build_calls, 2, "fallback build should run once");
+        assert_eq!(result.total, 0);
+        assert_eq!(result.passed, 0);
+        assert_eq!(result.failed, 0);
+        assert!(result.test_names.is_empty());
     }
 }

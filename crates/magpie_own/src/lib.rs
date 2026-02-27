@@ -28,6 +28,7 @@ struct MovedAnalysis {
     edge_phi_consumes: HashMap<(usize, usize), HashSet<LocalId>>,
 }
 
+#[allow(clippy::result_unit_err)]
 pub fn check_ownership(
     module: &HirModule,
     type_ctx: &TypeCtx,
@@ -323,14 +324,7 @@ fn check_function(
 
             check_store_constraints_void(vop, &local_types, type_ctx, diag);
             check_collection_constraints_void(vop, &local_types, type_ctx, diag);
-            check_call_argument_modes_void(
-                func,
-                vop,
-                &local_types,
-                type_ctx,
-                fn_param_types,
-                diag,
-            );
+            check_call_argument_modes_void(func, vop, &local_types, type_ctx, fn_param_types, diag);
             check_spawn_send_constraints_void(
                 func,
                 vop,
@@ -453,6 +447,7 @@ fn check_use_after_move(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn consume_locals(
     func: &HirFunction,
     block: &HirBlock,
@@ -722,7 +717,8 @@ fn collect_callable_capture_types(
     for block in &func.blocks {
         for instr in &block.instrs {
             if let HirOp::CallableCapture {
-                captures: cap_values, ..
+                captures: cap_values,
+                ..
             } = &instr.op
             {
                 let captured_types = cap_values
@@ -938,13 +934,7 @@ fn check_projection_constraints_instr(
                 return;
             };
             check_projection_result_type(
-                func,
-                "getfield",
-                instr.ty,
-                field_ty,
-                owner_mode,
-                type_ctx,
-                diag,
+                func, "getfield", instr.ty, field_ty, owner_mode, type_ctx, diag,
             );
         }
         HirOp::ArrGet { arr, .. } => {
@@ -963,13 +953,7 @@ fn check_projection_constraints_instr(
                 return;
             };
             check_projection_result_type(
-                func,
-                "arr.get",
-                instr.ty,
-                elem_ty,
-                owner_mode,
-                type_ctx,
-                diag,
+                func, "arr.get", instr.ty, elem_ty, owner_mode, type_ctx, diag,
             );
         }
         HirOp::MapGetRef { map, .. } => {
@@ -1359,13 +1343,13 @@ fn check_call_argument_modes(
                 handle_kind(arg_ty, type_ctx),
                 Some(HandleKind::Borrow | HandleKind::MutBorrow)
             ),
-            ParamMode::MutBorrow => matches!(handle_kind(arg_ty, type_ctx), Some(HandleKind::MutBorrow)),
-            ParamMode::ByValueCopy | ParamMode::ByValueMove => {
-                !matches!(
-                    handle_kind(arg_ty, type_ctx),
-                    Some(HandleKind::Borrow | HandleKind::MutBorrow)
-                )
+            ParamMode::MutBorrow => {
+                matches!(handle_kind(arg_ty, type_ctx), Some(HandleKind::MutBorrow))
             }
+            ParamMode::ByValueCopy | ParamMode::ByValueMove => !matches!(
+                handle_kind(arg_ty, type_ctx),
+                Some(HandleKind::Borrow | HandleKind::MutBorrow)
+            ),
         };
 
         if !ok {
@@ -1461,8 +1445,7 @@ fn analyze_moved_sets(
 
             let mut cur = new_in.clone();
             for instr in &block.instrs {
-                for local in op_consumed_locals(&instr.op, local_types, type_ctx, fn_param_types)
-                {
+                for local in op_consumed_locals(&instr.op, local_types, type_ctx, fn_param_types) {
                     if move_only_locals.contains(&local) {
                         cur.insert(local);
                     }
@@ -1850,9 +1833,9 @@ fn op_consumed_locals(
             local_types,
             type_ctx,
         )),
-        HirOp::CallIndirect { args, .. } | HirOp::CallVoidIndirect { args, .. } => out.extend(
-            consumed_call_args(args, None, local_types, type_ctx),
-        ),
+        HirOp::CallIndirect { args, .. } | HirOp::CallVoidIndirect { args, .. } => {
+            out.extend(consumed_call_args(args, None, local_types, type_ctx))
+        }
         HirOp::Share { v } => push(v, &mut out),
         HirOp::EnumNew { args, .. } => {
             for (_, v) in args {
@@ -1901,12 +1884,9 @@ fn op_void_consumed_locals(
             local_types,
             type_ctx,
         )),
-        HirOpVoid::CallVoidIndirect { args, .. } => out.extend(consumed_call_args(
-            args,
-            None,
-            local_types,
-            type_ctx,
-        )),
+        HirOpVoid::CallVoidIndirect { args, .. } => {
+            out.extend(consumed_call_args(args, None, local_types, type_ctx))
+        }
         _ => out.extend(op_void_non_call_consumed_locals(op)),
     }
 
@@ -2230,16 +2210,22 @@ fn for_each_value_in_terminator(term: &HirTerminator, mut f: impl FnMut(&HirValu
 fn ownership_why_trace(code: &str, message: &str) -> Option<WhyTrace> {
     match code {
         codes::MPO0003 => Some(WhyTrace::ownership(vec![
-            WhyEvent::new("Definition site: borrow value is introduced (borrow op or borrowed parameter)."),
+            WhyEvent::new(
+                "Definition site: borrow value is introduced (borrow op or borrowed parameter).",
+            ),
             WhyEvent::new(format!("Conflicting use site: {message}")),
         ])),
         codes::MPO0004 => Some(WhyTrace::ownership(vec![
-            WhyEvent::new("Definition site: reference ownership mode is established for the receiver value."),
+            WhyEvent::new(
+                "Definition site: reference ownership mode is established for the receiver value.",
+            ),
             WhyEvent::new(format!("Conflicting use site: {message}")),
         ])),
         codes::MPO0011 => Some(WhyTrace::ownership(vec![
             WhyEvent::new("Definition site: move-only value is defined and later borrowed."),
-            WhyEvent::new("Borrow chain: an active shared/mut borrow is still live when move is attempted."),
+            WhyEvent::new(
+                "Borrow chain: an active shared/mut borrow is still live when move is attempted.",
+            ),
             WhyEvent::new(format!("Conflicting use site: {message}")),
         ])),
         codes::MPO0101 => Some(WhyTrace::ownership(vec![
@@ -2249,7 +2235,9 @@ fn ownership_why_trace(code: &str, message: &str) -> Option<WhyTrace> {
         ])),
         codes::MPO0102 => Some(WhyTrace::ownership(vec![
             WhyEvent::new("Definition site: borrow appears in phi result or phi incoming value."),
-            WhyEvent::new("Merge-point conflict: borrows are not allowed to flow through phi nodes."),
+            WhyEvent::new(
+                "Merge-point conflict: borrows are not allowed to flow through phi nodes.",
+            ),
             WhyEvent::new(format!("Conflicting use site: {message}")),
         ])),
         _ => None,
@@ -2267,6 +2255,8 @@ fn emit_error(diag: &mut DiagnosticBag, code: &str, message: &str) {
         explanation_md: None,
         why: ownership_why_trace(code, message),
         suggested_fixes: vec![],
+        rag_bundle: Vec::new(),
+        related_docs: Vec::new(),
     });
 }
 

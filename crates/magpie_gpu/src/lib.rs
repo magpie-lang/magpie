@@ -1,4 +1,10 @@
 //! GPU kernel validation/layout helpers for Magpie GPU v0.1 (§31).
+#![allow(
+    clippy::field_reassign_with_default,
+    clippy::manual_is_multiple_of,
+    clippy::result_unit_err,
+    clippy::too_many_arguments
+)]
 
 use magpie_diag::{Diagnostic, DiagnosticBag, Severity};
 use magpie_mpir::{HirConstLit, MpirFn, MpirOp, MpirOpVoid, MpirTerminator, MpirValue};
@@ -418,6 +424,8 @@ fn emit_kernel_error(diag: &mut DiagnosticBag, code: &str, message: &str) {
         explanation_md: None,
         why: None,
         suggested_fixes: vec![],
+        rag_bundle: Vec::new(),
+        related_docs: Vec::new(),
     });
 }
 
@@ -564,8 +572,10 @@ impl SpirvBuilder {
         self.emit_capability(Self::CAPABILITY_SHADER);
         self.emit_memory_model(Self::ADDRESSING_MODEL_LOGICAL, Self::MEMORY_MODEL_GLSL450);
 
-        let mut state = SpirvKernelState::default();
-        state.local_types = Self::collect_local_types(func);
+        let mut state = SpirvKernelState {
+            local_types: Self::collect_local_types(func),
+            ..Default::default()
+        };
         let buffer_param_locals = Self::collect_buffer_param_locals(func);
         let ids = self.emit_kernel_decls(func, &buffer_param_locals, &mut state);
 
@@ -638,17 +648,21 @@ impl SpirvBuilder {
         let mut used_as_buffer = HashSet::new();
         for block in &func.blocks {
             for instr in &block.instrs {
-                if let MpirOp::GpuBufferLoad { buf, .. } = &instr.op {
-                    if let MpirValue::Local(local) = buf {
-                        used_as_buffer.insert(local.0);
-                    }
+                if let MpirOp::GpuBufferLoad {
+                    buf: MpirValue::Local(local),
+                    ..
+                } = &instr.op
+                {
+                    used_as_buffer.insert(local.0);
                 }
             }
             for op in &block.void_ops {
-                if let MpirOpVoid::GpuBufferStore { buf, .. } = op {
-                    if let MpirValue::Local(local) = buf {
-                        used_as_buffer.insert(local.0);
-                    }
+                if let MpirOpVoid::GpuBufferStore {
+                    buf: MpirValue::Local(local),
+                    ..
+                } = op
+                {
+                    used_as_buffer.insert(local.0);
                 }
             }
         }
@@ -1660,11 +1674,7 @@ pub fn generate_kernel_registry_ir(kernels: &[(String, KernelLayout, Vec<u8>)]) 
     writeln!(out, "declare void @mp_rt_gpu_register_kernels(ptr, i32)").unwrap();
     writeln!(out).unwrap();
 
-    writeln!(
-        out,
-        "define internal void @mp_gpu_register_all_kernels() {{"
-    )
-    .unwrap();
+    writeln!(out, "define void @mp_gpu_register_all_kernels() {{").unwrap();
     writeln!(out, "entry:").unwrap();
     if !kernels.is_empty() {
         writeln!(

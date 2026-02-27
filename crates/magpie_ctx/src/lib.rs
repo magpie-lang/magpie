@@ -14,19 +14,14 @@ pub struct Chunk {
     pub score: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetPolicy {
+    #[default]
     Balanced,
     DiagnosticsFirst,
     SlicesFirst,
     Minimal,
-}
-
-impl Default for BudgetPolicy {
-    fn default() -> Self {
-        Self::Balanced
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -317,7 +312,7 @@ fn select_from_pool(
     used
 }
 
-fn pick_variant<'a>(candidate: &'a Candidate, remaining_budget: u32) -> Option<&'a Variant> {
+fn pick_variant(candidate: &Candidate, remaining_budget: u32) -> Option<&Variant> {
     // v3 -> v2 -> v1 -> v0: pick highest fidelity variant that fits.
     candidate
         .variants
@@ -619,9 +614,16 @@ mod tests {
 
     #[test]
     fn build_context_pack_selects_compressed_variant_when_budget_is_tight() {
-        let original_body = "module demo\nfn heavy_compute() -> i64\nline one\nline two\nline three";
+        let original_body =
+            "module demo\nfn heavy_compute() -> i64\nline one\nline two\nline three";
         let pack = build_context_pack(
-            vec![chunk("struct-compact", "module_header", original_body, 80, 0.0)],
+            vec![chunk(
+                "struct-compact",
+                "module_header",
+                original_body,
+                80,
+                0.0,
+            )],
             25,
             BudgetPolicy::Balanced,
         );

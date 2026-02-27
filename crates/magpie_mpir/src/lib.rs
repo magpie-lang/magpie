@@ -750,6 +750,7 @@ pub fn print_mpir(module: &MpirModule, type_ctx: &TypeCtx) -> String {
 }
 
 /// Verify MPIR well-formedness (§15.8, §17.2).
+#[allow(clippy::result_unit_err)]
 pub fn verify_mpir(
     module: &MpirModule,
     type_ctx: &TypeCtx,
@@ -763,6 +764,11 @@ pub fn verify_mpir(
         .types
         .iter()
         .map(|(id, kind)| (id.0, kind.clone()))
+        .collect();
+    let fn_param_arity: HashMap<String, usize> = module
+        .functions
+        .iter()
+        .map(|func| (func.sid.0.clone(), func.params.len()))
         .collect();
 
     check_sid_format(&module.sid, "module sid", diag);
@@ -788,7 +794,14 @@ pub fn verify_mpir(
     }
 
     for func in &module.functions {
-        verify_function(func, &type_id_set, &type_map, type_ctx, diag);
+        verify_function(
+            func,
+            &type_id_set,
+            &type_map,
+            &fn_param_arity,
+            type_ctx,
+            diag,
+        );
     }
 
     if diag.error_count() > before {
@@ -802,6 +815,7 @@ fn verify_function(
     func: &MpirFn,
     type_id_set: &HashSet<u32>,
     type_map: &HashMap<u32, TypeKind>,
+    fn_param_arity: &HashMap<String, usize>,
     type_ctx: &TypeCtx,
     diag: &mut DiagnosticBag,
 ) {
@@ -1007,6 +1021,17 @@ fn verify_function(
 
     for (blk_idx, block) in func.blocks.iter().enumerate() {
         for instr in &block.instrs {
+            if has_arc_op(&instr.op) {
+                emit_error(
+                    diag,
+                    "MPS0014",
+                    &format!(
+                        "ARC stage violation: arc.* op '{}' is not allowed before ARC insertion in fn '{}'",
+                        format_op(&instr.op),
+                        func.name
+                    ),
+                );
+            }
             for ty in mpir_op_type_refs(&instr.op) {
                 check_type_exists(
                     ty,
@@ -1017,6 +1042,20 @@ fn verify_function(
             }
             for sid in mpir_op_sids(&instr.op) {
                 check_sid_format(sid, &format!("fn '{}' op sid", func.name), diag);
+            }
+            if let Some((callee_sid, arg_count)) = call_arity_site(&instr.op) {
+                if let Some(expected) = fn_param_arity.get(callee_sid) {
+                    if *expected != arg_count {
+                        emit_error(
+                            diag,
+                            "MPS0012",
+                            &format!(
+                                "Call arity mismatch: callee sid '{}' expects {} argument(s), got {} in fn '{}'",
+                                callee_sid, expected, arg_count, func.name
+                            ),
+                        );
+                    }
+                }
             }
             if let MpirOp::Phi { ty, .. } = &instr.op {
                 if !phi_type_allowed(*ty, type_map, type_ctx) {
@@ -1036,6 +1075,31 @@ fn verify_function(
         }
 
         for op in &block.void_ops {
+            if has_arc_void_op(op) {
+                emit_error(
+                    diag,
+                    "MPS0014",
+                    &format!(
+                        "ARC stage violation: arc.* op '{}' is not allowed before ARC insertion in fn '{}'",
+                        format_void_op(op),
+                        func.name
+                    ),
+                );
+            }
+            if let Some((callee_sid, arg_count)) = call_arity_void_site(op) {
+                if let Some(expected) = fn_param_arity.get(callee_sid) {
+                    if *expected != arg_count {
+                        emit_error(
+                            diag,
+                            "MPS0012",
+                            &format!(
+                                "Call arity mismatch: callee sid '{}' expects {} argument(s), got {} in fn '{}'",
+                                callee_sid, expected, arg_count, func.name
+                            ),
+                        );
+                    }
+                }
+            }
             for ty in mpir_op_void_type_refs(op) {
                 check_type_exists(
                     ty,
@@ -1070,6 +1134,47 @@ fn verify_function(
     let _ = local_ty;
 }
 
+fn call_arity_site(op: &MpirOp) -> Option<(&str, usize)> {
+    match op {
+        MpirOp::Call {
+            callee_sid, args, ..
+        }
+        | MpirOp::SuspendCall {
+            callee_sid, args, ..
+        } => Some((callee_sid.0.as_str(), args.len())),
+        _ => None,
+    }
+}
+
+fn has_arc_op(op: &MpirOp) -> bool {
+    matches!(
+        op,
+        MpirOp::ArcRetain { .. }
+            | MpirOp::ArcRelease { .. }
+            | MpirOp::ArcRetainWeak { .. }
+            | MpirOp::ArcReleaseWeak { .. }
+    )
+}
+
+fn has_arc_void_op(op: &MpirOpVoid) -> bool {
+    matches!(
+        op,
+        MpirOpVoid::ArcRetain { .. }
+            | MpirOpVoid::ArcRelease { .. }
+            | MpirOpVoid::ArcRetainWeak { .. }
+            | MpirOpVoid::ArcReleaseWeak { .. }
+    )
+}
+
+fn call_arity_void_site(op: &MpirOpVoid) -> Option<(&str, usize)> {
+    match op {
+        MpirOpVoid::CallVoid {
+            callee_sid, args, ..
+        } => Some((callee_sid.0.as_str(), args.len())),
+        _ => None,
+    }
+}
+
 fn emit_error(diag: &mut DiagnosticBag, code: &str, msg: &str) {
     diag.emit(Diagnostic {
         code: code.to_string(),
@@ -1081,6 +1186,8 @@ fn emit_error(diag: &mut DiagnosticBag, code: &str, msg: &str) {
         explanation_md: None,
         why: None,
         suggested_fixes: vec![],
+        rag_bundle: Vec::new(),
+        related_docs: Vec::new(),
     });
 }
 
@@ -2101,5 +2208,192 @@ mod tests {
         assert!(printed.contains("externs { }"));
         assert!(printed.contains("globals { }"));
         assert!(printed.contains("fns { }"));
+    }
+
+    #[test]
+    fn verify_mpir_reports_direct_call_arity_mismatch() {
+        let type_ctx = TypeCtx::new();
+        let module = MpirModule {
+            sid: Sid("M:MODULE0003".to_string()),
+            path: "pkg.verify".to_string(),
+            type_table: MpirTypeTable {
+                types: vec![
+                    (TypeId(0), TypeKind::Prim(PrimType::Unit)),
+                    (TypeId(4), TypeKind::Prim(PrimType::I32)),
+                ],
+            },
+            functions: vec![
+                MpirFn {
+                    sid: Sid("F:CALLEE0001".to_string()),
+                    name: "callee".to_string(),
+                    params: vec![(LocalId(0), TypeId(4))],
+                    ret_ty: TypeId(4),
+                    blocks: vec![MpirBlock {
+                        id: BlockId(0),
+                        instrs: vec![],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Ret(Some(MpirValue::Const(HirConst {
+                            ty: TypeId(4),
+                            lit: HirConstLit::IntLit(1),
+                        }))),
+                    }],
+                    locals: vec![],
+                    is_async: false,
+                },
+                MpirFn {
+                    sid: Sid("F:CALLER0001".to_string()),
+                    name: "caller".to_string(),
+                    params: vec![],
+                    ret_ty: TypeId(4),
+                    blocks: vec![MpirBlock {
+                        id: BlockId(0),
+                        instrs: vec![MpirInstr {
+                            dst: LocalId(0),
+                            ty: TypeId(4),
+                            op: MpirOp::Call {
+                                callee_sid: Sid("F:CALLEE0001".to_string()),
+                                inst: vec![],
+                                args: vec![],
+                            },
+                        }],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Ret(Some(MpirValue::Local(LocalId(0)))),
+                    }],
+                    locals: vec![MpirLocalDecl {
+                        id: LocalId(0),
+                        ty: TypeId(4),
+                        name: "ret".to_string(),
+                    }],
+                    is_async: false,
+                },
+            ],
+            globals: vec![],
+        };
+
+        let mut diag = DiagnosticBag::new(16);
+        let verify = verify_mpir(&module, &type_ctx, &mut diag);
+        assert!(verify.is_err(), "verify_mpir should fail on arity mismatch");
+        assert!(
+            diag.diagnostics.iter().any(|item| item.code == "MPS0012"),
+            "expected MPS0012 diagnostic, got {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|item| item.code.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn verify_mpir_rejects_arc_ops_before_arc_stage() {
+        let type_ctx = TypeCtx::new();
+        let module = MpirModule {
+            sid: Sid("M:MODULE0004".to_string()),
+            path: "pkg.verify.arc".to_string(),
+            type_table: MpirTypeTable {
+                types: vec![
+                    (TypeId(0), TypeKind::Prim(PrimType::Unit)),
+                    (TypeId(4), TypeKind::Prim(PrimType::I32)),
+                ],
+            },
+            functions: vec![MpirFn {
+                sid: Sid("F:ARCCHK0001".to_string()),
+                name: "arc_check".to_string(),
+                params: vec![(LocalId(0), TypeId(4))],
+                ret_ty: TypeId(4),
+                blocks: vec![MpirBlock {
+                    id: BlockId(0),
+                    instrs: vec![MpirInstr {
+                        dst: LocalId(1),
+                        ty: TypeId(4),
+                        op: MpirOp::ArcRetain {
+                            v: MpirValue::Local(LocalId(0)),
+                        },
+                    }],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(LocalId(1)))),
+                }],
+                locals: vec![MpirLocalDecl {
+                    id: LocalId(1),
+                    ty: TypeId(4),
+                    name: "tmp".to_string(),
+                }],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let mut diag = DiagnosticBag::new(16);
+        let verify = verify_mpir(&module, &type_ctx, &mut diag);
+        assert!(verify.is_err(), "verify_mpir should fail on arc.* ops");
+        assert!(
+            diag.diagnostics.iter().any(|item| item.code == "MPS0014"),
+            "expected MPS0014 diagnostic, got {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|item| item.code.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn verify_mpir_reports_void_call_arity_mismatch() {
+        let type_ctx = TypeCtx::new();
+        let module = MpirModule {
+            sid: Sid("M:MODULE0005".to_string()),
+            path: "pkg.verify.void".to_string(),
+            type_table: MpirTypeTable {
+                types: vec![(TypeId(0), TypeKind::Prim(PrimType::Unit))],
+            },
+            functions: vec![
+                MpirFn {
+                    sid: Sid("F:VCALLEE001".to_string()),
+                    name: "callee_void".to_string(),
+                    params: vec![(LocalId(0), TypeId(0))],
+                    ret_ty: TypeId(0),
+                    blocks: vec![MpirBlock {
+                        id: BlockId(0),
+                        instrs: vec![],
+                        void_ops: vec![],
+                        terminator: MpirTerminator::Ret(None),
+                    }],
+                    locals: vec![],
+                    is_async: false,
+                },
+                MpirFn {
+                    sid: Sid("F:VCLER00100".to_string()),
+                    name: "caller_void".to_string(),
+                    params: vec![],
+                    ret_ty: TypeId(0),
+                    blocks: vec![MpirBlock {
+                        id: BlockId(0),
+                        instrs: vec![],
+                        void_ops: vec![MpirOpVoid::CallVoid {
+                            callee_sid: Sid("F:VCALLEE001".to_string()),
+                            inst: vec![],
+                            args: vec![],
+                        }],
+                        terminator: MpirTerminator::Ret(None),
+                    }],
+                    locals: vec![],
+                    is_async: false,
+                },
+            ],
+            globals: vec![],
+        };
+
+        let mut diag = DiagnosticBag::new(16);
+        let verify = verify_mpir(&module, &type_ctx, &mut diag);
+        assert!(
+            verify.is_err(),
+            "verify_mpir should fail on void call arity mismatch"
+        );
+        assert!(
+            diag.diagnostics.iter().any(|item| item.code == "MPS0012"),
+            "expected MPS0012 diagnostic, got {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|item| item.code.clone())
+                .collect::<Vec<_>>()
+        );
     }
 }

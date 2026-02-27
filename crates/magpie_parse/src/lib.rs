@@ -4,6 +4,7 @@ use magpie_ast::*;
 use magpie_diag::{Diagnostic, DiagnosticBag, Severity};
 use magpie_lex::{Token, TokenKind};
 
+#[allow(clippy::result_unit_err)]
 pub fn parse_file(
     tokens: &[Token],
     file_id: FileId,
@@ -114,7 +115,7 @@ impl<'a, 'd> Parser<'a, 'd> {
                 }
             }
 
-            if !self.eat(TokenKind::Comma).is_some() {
+            if self.eat(TokenKind::Comma).is_none() {
                 break;
             }
         }
@@ -154,7 +155,7 @@ impl<'a, 'd> Parser<'a, 'd> {
                 }
 
                 let _ = item_start;
-                if !self.eat(TokenKind::Comma).is_some() {
+                if self.eat(TokenKind::Comma).is_none() {
                     break;
                 }
             }
@@ -165,7 +166,7 @@ impl<'a, 'd> Parser<'a, 'd> {
                 self.span_from(start),
             ));
 
-            if !self.eat(TokenKind::Comma).is_some() {
+            if self.eat(TokenKind::Comma).is_none() {
                 break;
             }
         }
@@ -315,7 +316,7 @@ impl<'a, 'd> Parser<'a, 'd> {
                     } else {
                         self.advance();
                     }
-                    if !self.eat(TokenKind::Comma).is_some() {
+                    if self.eat(TokenKind::Comma).is_none() {
                         break;
                     }
                 }
@@ -332,7 +333,7 @@ impl<'a, 'd> Parser<'a, 'd> {
                     } else {
                         self.advance();
                     }
-                    if !self.eat(TokenKind::Comma).is_some() {
+                    if self.eat(TokenKind::Comma).is_none() {
                         break;
                     }
                 }
@@ -348,7 +349,7 @@ impl<'a, 'd> Parser<'a, 'd> {
                     self.expect(TokenKind::Eq);
                     let value = self.parse_i64_lit().unwrap_or_default();
                     cost.push((key, value));
-                    if !self.eat(TokenKind::Comma).is_some() {
+                    if self.eat(TokenKind::Comma).is_none() {
                         break;
                     }
                 }
@@ -619,7 +620,7 @@ impl<'a, 'd> Parser<'a, 'd> {
         let mut param_types = Vec::new();
         while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
             param_types.push(self.parse_type().node);
-            if !self.eat(TokenKind::Comma).is_some() {
+            if self.eat(TokenKind::Comma).is_none() {
                 break;
             }
         }
@@ -1012,7 +1013,7 @@ impl<'a, 'd> Parser<'a, 'd> {
                     let val = self.parse_value_ref(None)?;
                     self.expect(TokenKind::RBracket);
                     incomings.push((bb, val));
-                    if !self.eat(TokenKind::Comma).is_some() {
+                    if self.eat(TokenKind::Comma).is_none() {
                         break;
                     }
                 }
@@ -1850,7 +1851,7 @@ impl<'a, 'd> Parser<'a, 'd> {
                         let (path, sig_name) = self.parse_type_ref()?;
                         self.expect(TokenKind::RAngle);
                         let sig_ref = if let Some(p) = path {
-                            format!("{}.{}", p.to_string(), sig_name)
+                            format!("{}.{}", p, sig_name)
                         } else {
                             sig_name
                         };
@@ -1879,7 +1880,7 @@ impl<'a, 'd> Parser<'a, 'd> {
         let mut segments = vec![self.parse_ident()?];
 
         loop {
-            if !self.eat(TokenKind::Dot).is_some() {
+            if self.eat(TokenKind::Dot).is_none() {
                 self.error_here("Expected `.` followed by type name.");
                 return None;
             }
@@ -1931,14 +1932,14 @@ impl<'a, 'd> Parser<'a, 'd> {
     }
 
     fn parse_type_args_opt(&mut self) -> Vec<AstType> {
-        if !self.eat(TokenKind::LAngle).is_some() {
+        if self.eat(TokenKind::LAngle).is_none() {
             return Vec::new();
         }
 
         let mut targs = Vec::new();
         while !self.at(TokenKind::RAngle) && !self.at(TokenKind::Eof) {
             targs.push(self.parse_type().node);
-            if !self.eat(TokenKind::Comma).is_some() {
+            if self.eat(TokenKind::Comma).is_none() {
                 break;
             }
         }
@@ -1948,7 +1949,7 @@ impl<'a, 'd> Parser<'a, 'd> {
     }
 
     fn parse_type_params_opt(&mut self) -> Vec<AstTypeParam> {
-        if !self.eat(TokenKind::LAngle).is_some() {
+        if self.eat(TokenKind::LAngle).is_none() {
             return Vec::new();
         }
 
@@ -1958,7 +1959,7 @@ impl<'a, 'd> Parser<'a, 'd> {
             self.expect(TokenKind::Colon);
             let constraint = self.parse_ident().unwrap_or_else(|| "type".to_string());
             params.push(AstTypeParam { name, constraint });
-            if !self.eat(TokenKind::Comma).is_some() {
+            if self.eat(TokenKind::Comma).is_none() {
                 break;
             }
         }
@@ -1975,7 +1976,7 @@ impl<'a, 'd> Parser<'a, 'd> {
             self.expect(TokenKind::Colon);
             let ty = self.parse_type();
             params.push(AstParam { name, ty });
-            if !self.eat(TokenKind::Comma).is_some() {
+            if self.eat(TokenKind::Comma).is_none() {
                 break;
             }
         }
@@ -1992,7 +1993,7 @@ impl<'a, 'd> Parser<'a, 'd> {
             self.expect(TokenKind::Eq);
             let value = self.parse_value_ref(None)?;
             pairs.push((key, value));
-            if !self.eat(TokenKind::Comma).is_some() {
+            if self.eat(TokenKind::Comma).is_none() {
                 break;
             }
         }
@@ -2010,7 +2011,7 @@ impl<'a, 'd> Parser<'a, 'd> {
             self.expect(TokenKind::Eq);
             let value = self.parse_arg_value()?;
             pairs.push((key, value));
-            if !self.eat(TokenKind::Comma).is_some() {
+            if self.eat(TokenKind::Comma).is_none() {
                 break;
             }
         }
@@ -2025,7 +2026,7 @@ impl<'a, 'd> Parser<'a, 'd> {
             let mut elems = Vec::new();
             while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
                 elems.push(self.parse_arg_list_elem()?);
-                if !self.eat(TokenKind::Comma).is_some() {
+                if self.eat(TokenKind::Comma).is_none() {
                     break;
                 }
             }
@@ -2580,6 +2581,8 @@ impl<'a, 'd> Parser<'a, 'd> {
             explanation_md: None,
             why: None,
             suggested_fixes: Vec::new(),
+            rag_bundle: Vec::new(),
+            related_docs: Vec::new(),
         });
     }
 

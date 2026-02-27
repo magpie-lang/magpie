@@ -7,9 +7,14 @@
 
 use std::alloc::{self, Layout};
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::ffi::c_char;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Mutex, Once, OnceLock, RwLock};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // §20.1.1  Object header
@@ -69,9 +74,9 @@ pub struct MpRtTypeInfo {
 unsafe impl Send for MpRtTypeInfo {}
 unsafe impl Sync for MpRtTypeInfo {}
 
-pub type MpRtHashFn = unsafe extern "C" fn(*const u8) -> u64;
-pub type MpRtEqFn = unsafe extern "C" fn(*const u8, *const u8) -> i32;
-pub type MpRtCmpFn = unsafe extern "C" fn(*const u8, *const u8) -> i32;
+pub type MpRtHashFn = Option<unsafe extern "C" fn(*const u8) -> u64>;
+pub type MpRtEqFn = Option<unsafe extern "C" fn(*const u8, *const u8) -> i32>;
+pub type MpRtCmpFn = Option<unsafe extern "C" fn(*const u8, *const u8) -> i32>;
 
 // ---------------------------------------------------------------------------
 // §20.1.4  Fixed type_ids
@@ -112,6 +117,10 @@ impl TypeRegistry {
     fn find(&self, type_id: u32) -> Option<&MpRtTypeInfo> {
         self.entries.iter().find(|e| e.type_id == type_id)
     }
+
+    fn find_mut(&mut self, type_id: u32) -> Option<&mut MpRtTypeInfo> {
+        self.entries.iter_mut().find(|e| e.type_id == type_id)
+    }
 }
 
 static TYPE_REGISTRY: OnceLock<Mutex<TypeRegistry>> = OnceLock::new();
@@ -143,7 +152,7 @@ pub unsafe extern "C" fn mp_rt_register_types(infos: *const MpRtTypeInfo, count:
     let mut reg = registry().lock().unwrap();
     for info in slice {
         // Overwrite existing entry for same type_id.
-        if let Some(existing) = reg.entries.iter_mut().find(|e| e.type_id == info.type_id) {
+        if let Some(existing) = reg.find_mut(info.type_id) {
             existing.flags = info.flags;
             existing.payload_size = info.payload_size;
             existing.payload_align = info.payload_align;
@@ -216,7 +225,7 @@ pub unsafe extern "C" fn mp_rt_alloc(
     (*header).weak = AtomicU64::new(1);
     (*header).type_id = type_id;
     (*header).flags = flags;
-    (*header).reserved0 = 0;
+    (*header).reserved0 = layout.size() as u64;
 
     header
 }
@@ -278,6 +287,23 @@ unsafe fn builtin_drop(obj: *mut MpRtHeader) {
                 // Zero the pointer so double-free is a null deref, not UB.
                 *(payload as *mut *mut Vec<u8>) = std::ptr::null_mut();
             }
+        }
+        TYPE_ID_TCALLABLE => {
+            let payload = str_payload_base(obj) as *mut MpRtCallablePayload;
+            let vtable = (*payload).vtable_ptr;
+            let data_ptr = (*payload).data_ptr;
+            if !vtable.is_null() {
+                if let Some(drop_fn) = (*vtable).drop_fn {
+                    drop_fn(data_ptr);
+                } else if !data_ptr.is_null() && (*vtable).size > 0 {
+                    let layout = Layout::from_size_align((*vtable).size as usize, 8)
+                        .expect("callable capture layout");
+                    alloc::dealloc(data_ptr, layout);
+                }
+                drop(Box::from_raw(vtable as *mut MpRtCallableVtable));
+            }
+            (*payload).vtable_ptr = std::ptr::null();
+            (*payload).data_ptr = std::ptr::null_mut();
         }
         _ => {}
     }
@@ -471,6 +497,35 @@ pub unsafe extern "C" fn mp_rt_str_eq(a: *mut MpRtHeader, b: *mut MpRtHeader) ->
     }
 }
 
+/// Lexicographic compare for Str objects.
+///
+/// Returns negative / 0 / positive according to byte ordering.
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_str_cmp(a: *mut MpRtHeader, b: *mut MpRtHeader) -> i32 {
+    let base_a = str_payload_base(a);
+    let base_b = str_payload_base(b);
+    let len_a = *(base_a as *const u64) as usize;
+    let len_b = *(base_b as *const u64) as usize;
+    let shared = std::cmp::min(len_a, len_b);
+    let bytes_a = std::slice::from_raw_parts(base_a.add(8), shared);
+    let bytes_b = std::slice::from_raw_parts(base_b.add(8), shared);
+    for i in 0..shared {
+        if bytes_a[i] < bytes_b[i] {
+            return -1;
+        }
+        if bytes_a[i] > bytes_b[i] {
+            return 1;
+        }
+    }
+    if len_a < len_b {
+        -1
+    } else if len_a > len_b {
+        1
+    } else {
+        0
+    }
+}
+
 /// Concatenate two Str objects and return a new Str.
 ///
 /// # Safety
@@ -629,6 +684,10 @@ pub unsafe extern "C" fn mp_rt_strbuilder_build(b: *mut MpRtHeader) -> *mut MpRt
 /// `str_msg` must be a valid Str object.
 #[no_mangle]
 pub unsafe extern "C" fn mp_rt_panic(str_msg: *mut MpRtHeader) -> ! {
+    if str_msg.is_null() {
+        eprintln!("magpie panic");
+        std::process::abort();
+    }
     let base = str_payload_base(str_msg);
     let len = *(base as *const u64);
     let bytes = std::slice::from_raw_parts(base.add(8), len as usize);
@@ -638,15 +697,17 @@ pub unsafe extern "C" fn mp_rt_panic(str_msg: *mut MpRtHeader) -> ! {
 }
 
 #[no_mangle]
-pub extern "C" fn mp_std_println(s: *const u8, len: usize) {
-    let slice = unsafe { std::slice::from_raw_parts(s, len) };
-    let text = std::str::from_utf8(slice).unwrap_or("<invalid utf8>");
-    println!("{}", text);
+pub unsafe extern "C" fn mp_std_println(s: *mut MpRtHeader) {
+    if s.is_null() {
+        println!();
+    } else {
+        println!("{}", str_to_rust_str(s));
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn mp_std_eprintln(s: *const u8, len: usize) {
-    let slice = unsafe { std::slice::from_raw_parts(s, len) };
+pub unsafe extern "C" fn mp_std_eprintln(s: *const u8, len: usize) {
+    let slice = std::slice::from_raw_parts(s, len);
     let text = std::str::from_utf8(slice).unwrap_or("<invalid utf8>");
     eprintln!("{}", text);
 }
@@ -663,25 +724,125 @@ pub extern "C" fn mp_std_readln() -> *mut u8 {
     if line.ends_with('\r') {
         line.pop();
     }
-    // Return as a Magpie TStr (ptr to heap-allocated UTF-8 with length prefix)
-    // For now, use the same pattern as mp_rt_str_from_utf8
-    let bytes = line.into_bytes();
-    let len = bytes.len();
-    let layout = std::alloc::Layout::from_size_align(16 + len, 8).unwrap();
-    let ptr = unsafe { std::alloc::alloc(layout) };
-    if ptr.is_null() {
-        std::process::abort();
-    }
-    unsafe {
-        *(ptr as *mut u64) = len as u64;
-        *(ptr.add(8) as *mut u64) = len as u64;
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), len);
-    }
-    ptr
+    unsafe { mp_rt_str_from_utf8(line.as_ptr(), line.len() as u64) as *mut u8 }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_std_assert(cond: i32, msg: *const u8, msg_len: usize) {
+pub unsafe extern "C" fn mp_std_assert(cond: i32, msg: *mut MpRtHeader) {
+    if cond == 0 {
+        let text = if msg.is_null() {
+            "assertion failed"
+        } else {
+            str_to_rust_str(msg)
+        };
+        eprintln!("assertion failed: {}", text);
+        std::process::abort();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_std_assert_eq(a: i64, b: i64, msg: *mut MpRtHeader) {
+    if a != b {
+        if msg.is_null() {
+            eprintln!("assertion failed: {} != {}", a, b);
+        } else {
+            eprintln!(
+                "assertion failed: {} != {} ({})",
+                a,
+                b,
+                str_to_rust_str(msg)
+            );
+        }
+        std::process::abort();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_std_assert_ne(a: i64, b: i64, msg: *mut MpRtHeader) {
+    if a == b {
+        if msg.is_null() {
+            eprintln!("assertion failed: {} == {}", a, b);
+        } else {
+            eprintln!(
+                "assertion failed: {} == {} ({})",
+                a,
+                b,
+                str_to_rust_str(msg)
+            );
+        }
+        std::process::abort();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_std_fail(msg: *mut MpRtHeader) {
+    if msg.is_null() {
+        eprintln!("test failed");
+    } else {
+        eprintln!("test failed: {}", str_to_rust_str(msg));
+    }
+    std::process::abort();
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_exit(code: i32) {
+    std::process::exit(code);
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_cwd() -> *mut MpRtHeader {
+    match std::env::current_dir() {
+        Ok(path) => {
+            let text = path.to_string_lossy();
+            unsafe { mp_rt_str_from_utf8(text.as_ptr(), text.len() as u64) }
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_std_env_var(name: *mut MpRtHeader) -> *mut MpRtHeader {
+    if name.is_null() {
+        return std::ptr::null_mut();
+    }
+    let key = str_to_rust_str(name);
+    match std::env::var(key) {
+        Ok(val) => mp_rt_str_from_utf8(val.as_ptr(), val.len() as u64),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_args() -> *mut MpRtHeader {
+    let args = std::env::args().collect::<Vec<_>>();
+    let arr = unsafe {
+        mp_rt_arr_new(
+            TYPE_ID_STR,
+            std::mem::size_of::<*mut MpRtHeader>() as u64,
+            args.len() as u64,
+        )
+    };
+
+    for arg in args {
+        let arg_obj = unsafe { mp_rt_str_from_utf8(arg.as_ptr(), arg.len() as u64) };
+        let arg_ptr = &arg_obj as *const *mut MpRtHeader as *const u8;
+        unsafe {
+            mp_rt_arr_push(arr, arg_ptr, std::mem::size_of::<*mut MpRtHeader>() as u64);
+        }
+    }
+
+    arr
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_std_println_bytes(s: *const u8, len: usize) {
+    let slice = std::slice::from_raw_parts(s, len);
+    let text = std::str::from_utf8(slice).unwrap_or("<invalid utf8>");
+    println!("{}", text);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_std_assert_bytes(cond: i32, msg: *const u8, msg_len: usize) {
     if cond == 0 {
         let slice = std::slice::from_raw_parts(msg, msg_len);
         let text = std::str::from_utf8(slice).unwrap_or("assertion failed");
@@ -691,20 +852,17 @@ pub unsafe extern "C" fn mp_std_assert(cond: i32, msg: *const u8, msg_len: usize
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_std_assert_eq(a: i64, b: i64) {
-    if a != b {
-        eprintln!("assertion failed: {} != {}", a, b);
-        std::process::abort();
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn mp_std_hash_str(s: *mut MpRtHeader) -> u64 {
+pub unsafe extern "C" fn mp_std_hash_str(s: *mut MpRtHeader) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    unsafe { str_to_rust_str(s) }.hash(&mut hasher);
+    str_to_rust_str(s).hash(&mut hasher);
     hasher.finish()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_std_hash_Str(s: *mut MpRtHeader) -> u64 {
+    mp_std_hash_str(s)
 }
 
 #[no_mangle]
@@ -723,6 +881,30 @@ pub extern "C" fn mp_std_hash_i64(v: i64) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     v.hash(&mut hasher);
     hasher.finish()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_std_block_on(fut: *mut u8) {
+    if fut.is_null() {
+        return;
+    }
+
+    let mut spins: u32 = 0;
+    while mp_rt_future_poll(fut) == 0 {
+        std::thread::yield_now();
+        spins = spins.saturating_add(1);
+        if spins > 1_000_000 {
+            eprintln!("magpie: mp_std_block_on timed out waiting for future readiness");
+            return;
+        }
+    }
+
+    mp_rt_future_take(fut, std::ptr::null_mut());
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_std_spawn_task(fut: *mut u8) -> *mut u8 {
+    fut
 }
 
 #[no_mangle]
@@ -748,38 +930,6 @@ pub extern "C" fn mp_std_min_i32(a: i32, b: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn mp_std_max_i32(a: i32, b: i32) -> i32 {
     a.max(b)
-}
-
-#[no_mangle]
-pub extern "C" fn mp_std_env_var(name: *const u8, name_len: usize) -> *mut MpRtHeader {
-    let slice = unsafe { std::slice::from_raw_parts(name, name_len) };
-    let key = std::str::from_utf8(slice).unwrap_or("");
-    match std::env::var(key) {
-        Ok(val) => unsafe { mp_rt_str_from_utf8(val.as_ptr(), val.len() as u64) },
-        Err(_) => std::ptr::null_mut(),
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn mp_std_args() -> *mut MpRtHeader {
-    let args = std::env::args().collect::<Vec<_>>();
-    let arr = unsafe {
-        mp_rt_arr_new(
-            TYPE_ID_STR,
-            std::mem::size_of::<*mut MpRtHeader>() as u64,
-            args.len() as u64,
-        )
-    };
-
-    for arg in args {
-        let arg_obj = unsafe { mp_rt_str_from_utf8(arg.as_ptr(), arg.len() as u64) };
-        let arg_ptr = &arg_obj as *const *mut MpRtHeader as *const u8;
-        unsafe {
-            mp_rt_arr_push(arr, arg_ptr, std::mem::size_of::<*mut MpRtHeader>() as u64);
-        }
-    }
-
-    arr
 }
 
 // ---------------------------------------------------------------------------
@@ -809,7 +959,7 @@ pub unsafe extern "C" fn mp_rt_callable_new(fn_ptr: *mut u8, captures_ptr: *mut 
     let mut captures_size: usize = 0;
     let mut captures_data = std::ptr::null_mut::<u8>();
     if !captures_ptr.is_null() {
-        captures_size = *(captures_ptr as *const u64) as usize;
+        captures_size = std::ptr::read_unaligned(captures_ptr as *const u64) as usize;
         if captures_size > 0 {
             let layout =
                 Layout::from_size_align(captures_size, 8).expect("callable captures layout");
@@ -859,6 +1009,41 @@ unsafe fn callable_parts(callable: *mut u8) -> (*mut u8, *mut u8) {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn mp_rt_callable_fn_ptr(callable: *mut u8) -> *mut u8 {
+    if callable.is_null() {
+        return std::ptr::null_mut();
+    }
+    let payload = callable_payload(callable);
+    let vtable = (*payload).vtable_ptr;
+    if vtable.is_null() {
+        return std::ptr::null_mut();
+    }
+    (*vtable).call_fn
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_callable_capture_size(callable: *mut u8) -> u64 {
+    if callable.is_null() {
+        return 0;
+    }
+    let payload = callable_payload(callable);
+    let vtable = (*payload).vtable_ptr;
+    if vtable.is_null() {
+        return 0;
+    }
+    (*vtable).size
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_callable_data_ptr(callable: *mut u8) -> *mut u8 {
+    if callable.is_null() {
+        return std::ptr::null_mut();
+    }
+    let payload = callable_payload(callable);
+    (*payload).data_ptr
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn mp_rt_arr_foreach(arr: *mut MpRtHeader, callable: *mut u8) {
     let payload = arr_payload(arr);
     let (call_fn, data_ptr) = callable_parts(callable);
@@ -876,6 +1061,11 @@ pub unsafe extern "C" fn mp_rt_arr_foreach(arr: *mut MpRtHeader, callable: *mut 
         };
         callback(data_ptr, elem_ptr);
     }
+}
+
+#[inline]
+unsafe fn read_u64_unaligned(ptr: *const u8) -> u64 {
+    std::ptr::read_unaligned(ptr as *const u64)
 }
 
 #[no_mangle]
@@ -1132,13 +1322,15 @@ pub unsafe extern "C" fn mp_rt_future_poll(future: *mut u8) -> i32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_future_take(future: *mut u8) -> *mut u8 {
+pub unsafe extern "C" fn mp_rt_future_take(future: *mut u8, out_result: *mut u8) {
     assert!(!future.is_null(), "mp_rt_future_take: null future");
     let state = future as *mut MpRtFutureState;
     assert!((*state).ready, "mp_rt_future_take: future not ready");
     let value = (*state).value;
     (*state).value = std::ptr::null_mut();
-    value
+    if !out_result.is_null() {
+        std::ptr::write(out_result as *mut *mut u8, value);
+    }
 }
 
 #[inline]
@@ -1257,7 +1449,7 @@ pub unsafe extern "C" fn mp_rt_json_decode(json_str: *mut MpRtHeader, type_id: u
             } else {
                 0_u8
             },
-        )) as *mut u8,
+        )),
         TYPE_ID_I8 => {
             Box::into_raw(Box::new(src.parse::<i8>().expect("JSON i8 parse failed"))) as *mut u8
         }
@@ -1270,9 +1462,7 @@ pub unsafe extern "C" fn mp_rt_json_decode(json_str: *mut MpRtHeader, type_id: u
         TYPE_ID_I64 => {
             Box::into_raw(Box::new(src.parse::<i64>().expect("JSON i64 parse failed"))) as *mut u8
         }
-        TYPE_ID_U8 => {
-            Box::into_raw(Box::new(src.parse::<u8>().expect("JSON u8 parse failed"))) as *mut u8
-        }
+        TYPE_ID_U8 => Box::into_raw(Box::new(src.parse::<u8>().expect("JSON u8 parse failed"))),
         TYPE_ID_U16 => {
             Box::into_raw(Box::new(src.parse::<u16>().expect("JSON u16 parse failed"))) as *mut u8
         }
@@ -1300,138 +1490,982 @@ pub unsafe extern "C" fn mp_rt_json_decode(json_str: *mut MpRtHeader, type_id: u
 }
 
 // ---------------------------------------------------------------------------
-// Runtime stubs: channels / web / GPU
+// Runtime support: channels / web bridge / GPU CPU-fallback bridge
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub unsafe extern "C" fn mp_rt_channel_new(_cap: u64) -> *mut u8 {
-    std::ptr::null_mut()
+struct MpRtChannelState {
+    elem_size: u64,
+    sender: Sender<Vec<u8>>,
+    receiver: Mutex<Receiver<Vec<u8>>>,
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_channel_send(_ch: *mut u8, _val: *mut u8) -> i32 {
-    -1
+pub unsafe extern "C" fn mp_rt_channel_new(_elem_type_id: u32, elem_size: u64) -> *mut MpRtHeader {
+    let (sender, receiver) = channel::<Vec<u8>>();
+    Box::into_raw(Box::new(MpRtChannelState {
+        elem_size,
+        sender,
+        receiver: Mutex::new(receiver),
+    })) as *mut MpRtHeader
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_channel_recv(_ch: *mut u8) -> *mut u8 {
-    std::ptr::null_mut()
+pub unsafe extern "C" fn mp_rt_channel_send(
+    sender: *mut MpRtHeader,
+    val: *const u8,
+    elem_size: u64,
+) {
+    if sender.is_null() || val.is_null() {
+        return;
+    }
+    let state = sender as *mut MpRtChannelState;
+    let copy_len = std::cmp::min((*state).elem_size, elem_size) as usize;
+    let bytes = std::slice::from_raw_parts(val, copy_len).to_vec();
+    let _ = (*state).sender.send(bytes);
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_web_serve(port: u32, _handler: *mut u8) -> i32 {
-    // TODO: implement HTTP/1.1 server
-    eprintln!("magpie: web server not yet implemented (port={})", port);
-    -1
+pub unsafe extern "C" fn mp_rt_channel_recv(
+    receiver: *mut MpRtHeader,
+    out: *mut u8,
+    elem_size: u64,
+) -> i32 {
+    if receiver.is_null() || out.is_null() {
+        return 0;
+    }
+    let state = receiver as *mut MpRtChannelState;
+    let guard = match (*state).receiver.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match guard.recv() {
+        Ok(value) => {
+            let copy_len = std::cmp::min(value.len(), elem_size as usize);
+            std::ptr::copy_nonoverlapping(value.as_ptr(), out, copy_len);
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+unsafe fn str_obj_to_string(value: *mut MpRtHeader) -> Option<String> {
+    if value.is_null() || (*value).type_id != TYPE_ID_STR {
+        return None;
+    }
+    let mut len = 0_u64;
+    let ptr = mp_rt_str_bytes(value, &mut len);
+    if ptr.is_null() {
+        return Some(String::new());
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len as usize);
+    Some(String::from_utf8_lossy(bytes).to_string())
+}
+
+fn parse_http_line(req: &str) -> Option<(&str, &str)> {
+    let mut lines = req.lines();
+    let first = lines.next()?.trim();
+    let mut parts = first.split_whitespace();
+    let method = parts.next()?;
+    let path = parts.next()?;
+    Some((method, path))
+}
+
+fn write_simple_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(header.as_bytes())
+        .map_err(|err| format!("failed to write response header: {err}"))?;
+    stream
+        .write_all(body)
+        .map_err(|err| format!("failed to write response body: {err}"))?;
+    stream
+        .flush()
+        .map_err(|err| format!("failed to flush response: {err}"))
+}
+
+fn handle_web_connection(
+    stream: &mut TcpStream,
+    max_body_bytes: usize,
+    log_requests: bool,
+) -> Result<(), String> {
+    let mut request = vec![0_u8; max_body_bytes.clamp(1024, 64 * 1024)];
+    let read = stream
+        .read(&mut request)
+        .map_err(|err| format!("failed to read request: {err}"))?;
+    let text = std::str::from_utf8(&request[..read]).unwrap_or_default();
+    let (method, path) = parse_http_line(text).unwrap_or(("INVALID", "/"));
+
+    if log_requests {
+        eprintln!("magpie_rt web: {method} {path}");
+    }
+
+    if method != "GET" {
+        return write_simple_http_response(
+            stream,
+            "405 Method Not Allowed",
+            "text/plain; charset=utf-8",
+            b"method not allowed",
+        );
+    }
+
+    let body = format!("{{\"ok\":true,\"path\":\"{}\"}}", path);
+    write_simple_http_response(
+        stream,
+        "200 OK",
+        "application/json; charset=utf-8",
+        body.as_bytes(),
+    )
 }
 
 #[no_mangle]
-pub extern "C" fn mp_rt_gpu_device_count() -> i32 {
+pub unsafe extern "C" fn mp_rt_web_serve(
+    svc: *mut MpRtHeader,
+    addr: *mut MpRtHeader,
+    port: u16,
+    keep_alive: u8,
+    _threads: u32,
+    max_body_bytes: u64,
+    read_timeout_ms: u64,
+    write_timeout_ms: u64,
+    log_requests: u8,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_errmsg);
+
+    if svc.is_null() {
+        gpu_set_error(out_errmsg, "invalid web service handle");
+        return -1;
+    }
+
+    let host = str_obj_to_string(addr)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let bind_addr = format!("{host}:{port}");
+
+    let listener = match TcpListener::bind(&bind_addr) {
+        Ok(listener) => listener,
+        Err(err) => {
+            gpu_set_error(
+                out_errmsg,
+                &format!("failed to bind web runtime listener '{bind_addr}': {err}"),
+            );
+            return -1;
+        }
+    };
+
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(stream) => stream,
+            Err(err) => {
+                gpu_set_error(out_errmsg, &format!("failed to accept connection: {err}"));
+                return -1;
+            }
+        };
+
+        if read_timeout_ms > 0 {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(read_timeout_ms)));
+        }
+        if write_timeout_ms > 0 {
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(write_timeout_ms)));
+        }
+
+        if let Err(err) = handle_web_connection(
+            &mut stream,
+            usize::try_from(max_body_bytes).unwrap_or(usize::MAX),
+            log_requests != 0,
+        ) {
+            gpu_set_error(out_errmsg, &err);
+            return -1;
+        }
+
+        if keep_alive == 0 {
+            break;
+        }
+    }
+
+    0
+}
+
+const TYPE_ID_GPU_DEVICE_RT: u32 = 9001;
+const TYPE_ID_GPU_BUFFER_RT: u32 = 9002;
+const TYPE_ID_GPU_FENCE_RT: u32 = 9003;
+const TYPE_ID_GPU_KERNEL_RT: u32 = 9004;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MpRtGpuParam {
+    kind: u8,
+    _reserved0: u8,
+    _reserved1: u16,
+    type_id: u32,
+    offset_or_binding: u32,
+    size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MpRtGpuKernelEntry {
+    sid_hash: u64,
+    backend: u32,
+    blob: *const u8,
+    blob_len: u64,
+    num_params: u32,
+    params: *const MpRtGpuParam,
+    num_buffers: u32,
+    push_const_size: u32,
+}
+
+#[repr(C)]
+struct MpRtGpuDevicePayload {
+    index: u32,
+    _reserved: u32,
+}
+
+#[repr(C)]
+struct MpRtGpuBufferPayload {
+    elem_type_id: u32,
+    _reserved: u32,
+    elem_size: u64,
+    len: u64,
+    bytes: UnsafeCell<Vec<u8>>,
+}
+
+#[repr(C)]
+struct MpRtGpuFencePayload {
+    done: u8,
+    _reserved: [u8; 7],
+}
+
+#[repr(C)]
+struct MpRtGpuKernelPayload {
+    sid_hash: u64,
+    blob: UnsafeCell<Vec<u8>>,
+}
+
+#[derive(Clone, Copy)]
+struct GpuKernelMeta {
+    num_buffers: u32,
+    push_const_size: u32,
+}
+
+static GPU_REGISTERED_KERNEL_COUNT: AtomicU64 = AtomicU64::new(0);
+static GPU_TYPES_ONCE: Once = Once::new();
+static GPU_KERNEL_REGISTRY: OnceLock<RwLock<HashMap<u64, GpuKernelMeta>>> = OnceLock::new();
+
+fn gpu_kernel_registry() -> &'static RwLock<HashMap<u64, GpuKernelMeta>> {
+    GPU_KERNEL_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+unsafe extern "C" fn mp_rt_gpu_buffer_drop(obj: *mut MpRtHeader) {
+    let payload = gpu_buffer_payload(obj);
+    std::ptr::drop_in_place((*payload).bytes.get());
+}
+
+unsafe extern "C" fn mp_rt_gpu_kernel_drop(obj: *mut MpRtHeader) {
+    let payload = gpu_kernel_payload(obj);
+    std::ptr::drop_in_place((*payload).blob.get());
+}
+
+fn ensure_gpu_types_registered() {
+    GPU_TYPES_ONCE.call_once(|| unsafe {
+        let infos = [
+            MpRtTypeInfo {
+                type_id: TYPE_ID_GPU_DEVICE_RT,
+                flags: FLAG_HEAP | FLAG_SEND | FLAG_SYNC,
+                payload_size: std::mem::size_of::<MpRtGpuDevicePayload>() as u64,
+                payload_align: std::mem::align_of::<MpRtGpuDevicePayload>() as u64,
+                drop_fn: None,
+                debug_fqn: c"gpu.Device".as_ptr(),
+            },
+            MpRtTypeInfo {
+                type_id: TYPE_ID_GPU_BUFFER_RT,
+                flags: FLAG_HEAP | FLAG_HAS_DROP | FLAG_SEND | FLAG_SYNC,
+                payload_size: std::mem::size_of::<MpRtGpuBufferPayload>() as u64,
+                payload_align: std::mem::align_of::<MpRtGpuBufferPayload>() as u64,
+                drop_fn: Some(mp_rt_gpu_buffer_drop),
+                debug_fqn: c"gpu.Buffer".as_ptr(),
+            },
+            MpRtTypeInfo {
+                type_id: TYPE_ID_GPU_FENCE_RT,
+                flags: FLAG_HEAP | FLAG_SEND | FLAG_SYNC,
+                payload_size: std::mem::size_of::<MpRtGpuFencePayload>() as u64,
+                payload_align: std::mem::align_of::<MpRtGpuFencePayload>() as u64,
+                drop_fn: None,
+                debug_fqn: c"gpu.Fence".as_ptr(),
+            },
+            MpRtTypeInfo {
+                type_id: TYPE_ID_GPU_KERNEL_RT,
+                flags: FLAG_HEAP | FLAG_HAS_DROP | FLAG_SEND | FLAG_SYNC,
+                payload_size: std::mem::size_of::<MpRtGpuKernelPayload>() as u64,
+                payload_align: std::mem::align_of::<MpRtGpuKernelPayload>() as u64,
+                drop_fn: Some(mp_rt_gpu_kernel_drop),
+                debug_fqn: c"gpu.Kernel".as_ptr(),
+            },
+        ];
+        mp_rt_register_types(infos.as_ptr(), infos.len() as u32);
+    });
+}
+
+#[inline]
+unsafe fn gpu_device_payload(dev: *mut MpRtHeader) -> *mut MpRtGpuDevicePayload {
+    str_payload_base(dev) as *mut MpRtGpuDevicePayload
+}
+
+#[inline]
+unsafe fn gpu_buffer_payload(buf: *mut MpRtHeader) -> *mut MpRtGpuBufferPayload {
+    str_payload_base(buf) as *mut MpRtGpuBufferPayload
+}
+
+#[inline]
+unsafe fn gpu_fence_payload(fence: *mut MpRtHeader) -> *mut MpRtGpuFencePayload {
+    str_payload_base(fence) as *mut MpRtGpuFencePayload
+}
+
+#[inline]
+unsafe fn gpu_kernel_payload(kernel: *mut MpRtHeader) -> *mut MpRtGpuKernelPayload {
+    str_payload_base(kernel) as *mut MpRtGpuKernelPayload
+}
+
+#[inline]
+unsafe fn gpu_is_device(dev: *mut MpRtHeader) -> bool {
+    !dev.is_null() && (*dev).type_id == TYPE_ID_GPU_DEVICE_RT
+}
+
+#[inline]
+unsafe fn gpu_is_buffer(buf: *mut MpRtHeader) -> bool {
+    !buf.is_null() && (*buf).type_id == TYPE_ID_GPU_BUFFER_RT
+}
+
+#[inline]
+unsafe fn gpu_is_fence(fence: *mut MpRtHeader) -> bool {
+    !fence.is_null() && (*fence).type_id == TYPE_ID_GPU_FENCE_RT
+}
+
+#[inline]
+unsafe fn gpu_is_kernel(kernel: *mut MpRtHeader) -> bool {
+    !kernel.is_null() && (*kernel).type_id == TYPE_ID_GPU_KERNEL_RT
+}
+
+unsafe fn gpu_new_device(index: u32) -> *mut MpRtHeader {
+    ensure_gpu_types_registered();
+    let obj = alloc_builtin(
+        TYPE_ID_GPU_DEVICE_RT,
+        FLAG_HEAP | FLAG_SEND | FLAG_SYNC,
+        std::mem::size_of::<MpRtGpuDevicePayload>(),
+        std::mem::align_of::<MpRtGpuDevicePayload>(),
+    );
+    let payload = gpu_device_payload(obj);
+    (*payload).index = index;
+    (*payload)._reserved = 0;
+    obj
+}
+
+unsafe fn gpu_new_buffer(
+    elem_type_id: u32,
+    elem_size: u64,
+    len: u64,
+) -> Result<*mut MpRtHeader, String> {
+    ensure_gpu_types_registered();
+    let total_bytes = len
+        .checked_mul(elem_size)
+        .ok_or_else(|| "gpu buffer byte length overflow".to_string())?;
+    let total_bytes = usize::try_from(total_bytes)
+        .map_err(|_| "gpu buffer byte length does not fit host usize".to_string())?;
+
+    let obj = alloc_builtin(
+        TYPE_ID_GPU_BUFFER_RT,
+        FLAG_HEAP | FLAG_HAS_DROP | FLAG_SEND | FLAG_SYNC,
+        std::mem::size_of::<MpRtGpuBufferPayload>(),
+        std::mem::align_of::<MpRtGpuBufferPayload>(),
+    );
+    let payload = gpu_buffer_payload(obj);
+    (*payload).elem_type_id = elem_type_id;
+    (*payload)._reserved = 0;
+    (*payload).elem_size = elem_size;
+    (*payload).len = len;
+    std::ptr::write((*payload).bytes.get(), vec![0_u8; total_bytes]);
+    Ok(obj)
+}
+
+unsafe fn gpu_new_fence(done: u8) -> *mut MpRtHeader {
+    ensure_gpu_types_registered();
+    let obj = alloc_builtin(
+        TYPE_ID_GPU_FENCE_RT,
+        FLAG_HEAP | FLAG_SEND | FLAG_SYNC,
+        std::mem::size_of::<MpRtGpuFencePayload>(),
+        std::mem::align_of::<MpRtGpuFencePayload>(),
+    );
+    let payload = gpu_fence_payload(obj);
+    (*payload).done = done;
+    (*payload)._reserved = [0; 7];
+    obj
+}
+
+fn gpu_hash_bytes(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001b3;
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+unsafe fn gpu_new_kernel(blob: &[u8]) -> *mut MpRtHeader {
+    ensure_gpu_types_registered();
+    let obj = alloc_builtin(
+        TYPE_ID_GPU_KERNEL_RT,
+        FLAG_HEAP | FLAG_HAS_DROP | FLAG_SEND | FLAG_SYNC,
+        std::mem::size_of::<MpRtGpuKernelPayload>(),
+        std::mem::align_of::<MpRtGpuKernelPayload>(),
+    );
+    let payload = gpu_kernel_payload(obj);
+    (*payload).sid_hash = gpu_hash_bytes(blob);
+    std::ptr::write((*payload).blob.get(), blob.to_vec());
+    obj
+}
+
+#[no_mangle]
+pub extern "C" fn mp_rt_gpu_device_count() -> u32 {
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_register_kernels(entries: *const u8, count: i32) {
+    let mut registry = gpu_kernel_registry().write().unwrap();
+    registry.clear();
+
+    if entries.is_null() || count <= 0 {
+        GPU_REGISTERED_KERNEL_COUNT.store(0, Ordering::Relaxed);
+        return;
+    }
+
+    let entries = std::slice::from_raw_parts(entries as *const MpRtGpuKernelEntry, count as usize);
+    for entry in entries {
+        registry.insert(
+            entry.sid_hash,
+            GpuKernelMeta {
+                num_buffers: entry.num_buffers,
+                push_const_size: entry.push_const_size,
+            },
+        );
+    }
+    GPU_REGISTERED_KERNEL_COUNT.store(registry.len() as u64, Ordering::Relaxed);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_device_default(
+    out_dev: *mut *mut MpRtHeader,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_dev);
+    gpu_clear_handle(out_errmsg);
+    if out_dev.is_null() {
+        gpu_set_error(out_errmsg, "out_dev must not be null");
+        return -1;
+    }
+    *out_dev = gpu_new_device(0);
     0
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_gpu_device_open(_idx: i32) -> *mut u8 {
-    std::ptr::null_mut()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn mp_rt_gpu_device_close(_dev: *mut u8) {}
-
-#[no_mangle]
-pub unsafe extern "C" fn mp_rt_gpu_buffer_alloc(_dev: *mut u8, _size: u64) -> *mut u8 {
-    std::ptr::null_mut()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn mp_rt_gpu_buffer_free(_buf: *mut u8) {}
-
-#[no_mangle]
-pub unsafe extern "C" fn mp_rt_gpu_buffer_write(
-    _buf: *mut u8,
-    _offset: u64,
-    _data: *const u8,
-    _len: u64,
+pub unsafe extern "C" fn mp_rt_gpu_device_by_index(
+    idx: u32,
+    out_dev: *mut *mut MpRtHeader,
+    out_errmsg: *mut *mut MpRtHeader,
 ) -> i32 {
-    -1
+    gpu_clear_handle(out_dev);
+    gpu_clear_handle(out_errmsg);
+    if out_dev.is_null() {
+        gpu_set_error(out_errmsg, "out_dev must not be null");
+        return -1;
+    }
+    if idx != 0 {
+        gpu_set_error(out_errmsg, &format!("gpu device index out of range: {idx}"));
+        return -1;
+    }
+    *out_dev = gpu_new_device(idx);
+    0
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_gpu_buffer_read(
-    _buf: *mut u8,
-    _offset: u64,
-    _out: *mut u8,
-    _len: u64,
+pub unsafe extern "C" fn mp_rt_gpu_device_name(dev: *mut MpRtHeader) -> *mut MpRtHeader {
+    let label = if gpu_is_device(dev) {
+        "cpu-fallback-gpu:0"
+    } else {
+        "invalid-gpu-device"
+    };
+    mp_rt_str_from_utf8(label.as_ptr(), label.len() as u64)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_buffer_new(
+    dev: *mut MpRtHeader,
+    elem_type_id: u32,
+    elem_size: u64,
+    len: u64,
+    _usage_flags: u32,
+    out_buf: *mut *mut MpRtHeader,
+    out_errmsg: *mut *mut MpRtHeader,
 ) -> i32 {
-    -1
+    gpu_clear_handle(out_buf);
+    gpu_clear_handle(out_errmsg);
+    if out_buf.is_null() {
+        gpu_set_error(out_errmsg, "out_buf must not be null");
+        return -1;
+    }
+    if !gpu_is_device(dev) {
+        gpu_set_error(out_errmsg, "invalid gpu device handle");
+        return -1;
+    }
+    match gpu_new_buffer(elem_type_id, elem_size, len) {
+        Ok(buf) => {
+            *out_buf = buf;
+            0
+        }
+        Err(err) => {
+            gpu_set_error(out_errmsg, &err);
+            -1
+        }
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_gpu_kernel_load(
-    _dev: *mut u8,
-    _spv: *const u8,
-    _spv_len: u64,
-) -> *mut u8 {
-    std::ptr::null_mut()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn mp_rt_gpu_kernel_free(_kernel: *mut u8) {}
-
-#[no_mangle]
-pub unsafe extern "C" fn mp_rt_gpu_launch(
-    _kernel: *mut u8,
-    _groups_x: u32,
-    _groups_y: u32,
-    _groups_z: u32,
-    _args: *const *mut u8,
-    _arg_count: u32,
+pub unsafe extern "C" fn mp_rt_gpu_buffer_from_array(
+    dev: *mut MpRtHeader,
+    host_arr: *mut MpRtHeader,
+    _usage_flags: u32,
+    out_buf: *mut *mut MpRtHeader,
+    out_errmsg: *mut *mut MpRtHeader,
 ) -> i32 {
-    -1
+    gpu_clear_handle(out_buf);
+    gpu_clear_handle(out_errmsg);
+    if out_buf.is_null() {
+        gpu_set_error(out_errmsg, "out_buf must not be null");
+        return -1;
+    }
+    if !gpu_is_device(dev) {
+        gpu_set_error(out_errmsg, "invalid gpu device handle");
+        return -1;
+    }
+    if host_arr.is_null() || (*host_arr).type_id != TYPE_ID_ARRAY {
+        gpu_set_error(out_errmsg, "host_arr must be a valid Array handle");
+        return -1;
+    }
+    let arr = arr_payload(host_arr);
+    let buf = match gpu_new_buffer((*arr).elem_type_id, (*arr).elem_size, (*arr).len) {
+        Ok(buf) => buf,
+        Err(err) => {
+            gpu_set_error(out_errmsg, &err);
+            return -1;
+        }
+    };
+    let payload = gpu_buffer_payload(buf);
+    let bytes_len = usize::try_from((*arr).len.saturating_mul((*arr).elem_size)).unwrap_or(0);
+    if bytes_len > 0 && !(*arr).data_ptr.is_null() {
+        let target = &mut *(*payload).bytes.get();
+        std::ptr::copy_nonoverlapping((*arr).data_ptr, target.as_mut_ptr(), bytes_len);
+    }
+    *out_buf = buf;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_buffer_to_array(
+    buf: *mut MpRtHeader,
+    out_arr: *mut *mut MpRtHeader,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_arr);
+    gpu_clear_handle(out_errmsg);
+    if out_arr.is_null() {
+        gpu_set_error(out_errmsg, "out_arr must not be null");
+        return -1;
+    }
+    if !gpu_is_buffer(buf) {
+        gpu_set_error(out_errmsg, "invalid gpu buffer handle");
+        return -1;
+    }
+
+    let payload = gpu_buffer_payload(buf);
+    let arr = mp_rt_arr_new(
+        (*payload).elem_type_id,
+        (*payload).elem_size,
+        (*payload).len,
+    );
+    let bytes = &*(*payload).bytes.get();
+    let elem_size = usize::try_from((*payload).elem_size).unwrap_or(0);
+    if elem_size == 0 {
+        for _ in 0..(*payload).len {
+            mp_rt_arr_push(arr, std::ptr::null(), 0);
+        }
+    } else {
+        for idx in 0..(*payload).len {
+            let idx = usize::try_from(idx).unwrap_or(0);
+            let off = idx.saturating_mul(elem_size);
+            mp_rt_arr_push(arr, bytes.as_ptr().add(off), (*payload).elem_size);
+        }
+    }
+    *out_arr = arr;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_buffer_len(buf: *mut MpRtHeader) -> u64 {
+    if !gpu_is_buffer(buf) {
+        return 0;
+    }
+    (*gpu_buffer_payload(buf)).len
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_buffer_copy(
+    src: *mut MpRtHeader,
+    dst: *mut MpRtHeader,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_errmsg);
+    if !gpu_is_buffer(src) || !gpu_is_buffer(dst) {
+        gpu_set_error(out_errmsg, "invalid gpu buffer handle");
+        return -1;
+    }
+    let src_payload = gpu_buffer_payload(src);
+    let dst_payload = gpu_buffer_payload(dst);
+    if (*src_payload).elem_size != (*dst_payload).elem_size
+        || (*src_payload).len != (*dst_payload).len
+    {
+        gpu_set_error(out_errmsg, "buffer shape mismatch");
+        return -1;
+    }
+    let src_vec = &*(*src_payload).bytes.get();
+    let dst_vec = &mut *(*dst_payload).bytes.get();
+    dst_vec.clone_from_slice(src_vec);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_device_sync(
+    dev: *mut MpRtHeader,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_errmsg);
+    if !gpu_is_device(dev) {
+        gpu_set_error(out_errmsg, "invalid gpu device handle");
+        return -1;
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_launch_sync(
+    dev: *mut MpRtHeader,
+    kernel_sid_hash: u64,
+    _grid_x: u32,
+    _grid_y: u32,
+    _grid_z: u32,
+    _block_x: u32,
+    _block_y: u32,
+    _block_z: u32,
+    args_blob: *const u8,
+    args_len: u64,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_errmsg);
+    if !gpu_is_device(dev) {
+        gpu_set_error(out_errmsg, "invalid gpu device handle");
+        return -1;
+    }
+    let Some(meta) = gpu_kernel_registry()
+        .read()
+        .unwrap()
+        .get(&kernel_sid_hash)
+        .copied()
+    else {
+        gpu_set_error(
+            out_errmsg,
+            &format!("kernel sid hash not registered: {kernel_sid_hash}"),
+        );
+        return -1;
+    };
+
+    let expected_len = u64::from(meta.num_buffers)
+        .checked_mul(8)
+        .and_then(|v| v.checked_add(u64::from(meta.push_const_size)))
+        .unwrap_or(u64::MAX);
+    if args_len != expected_len {
+        gpu_set_error(
+            out_errmsg,
+            &format!("args_len mismatch: expected {expected_len}, got {args_len}"),
+        );
+        return -1;
+    }
+    if args_len > 0 && args_blob.is_null() {
+        gpu_set_error(out_errmsg, "args_blob must not be null when args_len > 0");
+        return -1;
+    }
+
+    if meta.num_buffers > 0 {
+        for idx in 0..(meta.num_buffers as usize) {
+            let off = idx
+                .checked_mul(std::mem::size_of::<u64>())
+                .expect("gpu launch arg offset overflow");
+            let raw = read_u64_unaligned(args_blob.add(off));
+            let ptr = raw as usize as *mut MpRtHeader;
+            if !gpu_is_buffer(ptr) {
+                gpu_set_error(out_errmsg, "launch args contain invalid gpu buffer handle");
+                return -1;
+            }
+        }
+    }
+
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn mp_rt_gpu_launch_async(
-    _kernel: *mut u8,
+    dev: *mut MpRtHeader,
+    kernel_sid_hash: u64,
+    _grid_x: u32,
+    _grid_y: u32,
+    _grid_z: u32,
+    _block_x: u32,
+    _block_y: u32,
+    _block_z: u32,
+    args_blob: *const u8,
+    args_len: u64,
+    out_fence: *mut *mut MpRtHeader,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_fence);
+    gpu_clear_handle(out_errmsg);
+    if out_fence.is_null() {
+        gpu_set_error(out_errmsg, "out_fence must not be null");
+        return -1;
+    }
+    let sync = mp_rt_gpu_launch_sync(
+        dev,
+        kernel_sid_hash,
+        _grid_x,
+        _grid_y,
+        _grid_z,
+        _block_x,
+        _block_y,
+        _block_z,
+        args_blob,
+        args_len,
+        out_errmsg,
+    );
+    if sync != 0 {
+        return -1;
+    }
+    *out_fence = gpu_new_fence(1);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_fence_wait(
+    fence: *mut MpRtHeader,
+    _timeout_ms: u64,
+    out_done: *mut u8,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> i32 {
+    gpu_clear_handle(out_errmsg);
+    if !out_done.is_null() {
+        *out_done = 0;
+    }
+    if !gpu_is_fence(fence) {
+        gpu_set_error(out_errmsg, "invalid gpu fence handle");
+        return -1;
+    }
+    if !out_done.is_null() {
+        *out_done = (*gpu_fence_payload(fence)).done;
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_fence_free(fence: *mut MpRtHeader) {
+    if !fence.is_null() {
+        mp_rt_release_strong(fence);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_device_open(idx: i32) -> *mut u8 {
+    if idx < 0 {
+        return std::ptr::null_mut();
+    }
+    let mut out_dev: *mut MpRtHeader = std::ptr::null_mut();
+    let mut out_err: *mut MpRtHeader = std::ptr::null_mut();
+    let _ = mp_rt_gpu_device_by_index(idx as u32, &mut out_dev, &mut out_err);
+    if !out_err.is_null() {
+        mp_rt_release_strong(out_err);
+    }
+    out_dev as *mut u8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_device_close(dev: *mut u8) {
+    if !dev.is_null() {
+        mp_rt_release_strong(dev as *mut MpRtHeader);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_buffer_alloc(dev: *mut u8, size: u64) -> *mut u8 {
+    let mut out_buf: *mut MpRtHeader = std::ptr::null_mut();
+    let mut out_err: *mut MpRtHeader = std::ptr::null_mut();
+    let rc = mp_rt_gpu_buffer_new(
+        dev as *mut MpRtHeader,
+        TYPE_ID_U8,
+        1,
+        size,
+        0,
+        &mut out_buf,
+        &mut out_err,
+    );
+    if !out_err.is_null() {
+        mp_rt_release_strong(out_err);
+    }
+    if rc == 0 {
+        out_buf as *mut u8
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_buffer_free(buf: *mut u8) {
+    if !buf.is_null() {
+        mp_rt_release_strong(buf as *mut MpRtHeader);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_buffer_write(
+    buf: *mut u8,
+    offset: u64,
+    data: *const u8,
+    len: u64,
+) -> i32 {
+    if data.is_null() {
+        return -1;
+    }
+    let buf = buf as *mut MpRtHeader;
+    if !gpu_is_buffer(buf) {
+        return -1;
+    }
+    let payload = gpu_buffer_payload(buf);
+    let bytes = &mut *(*payload).bytes.get();
+    let offset = match usize::try_from(offset) {
+        Ok(offset) => offset,
+        Err(_) => return -1,
+    };
+    let len = match usize::try_from(len) {
+        Ok(len) => len,
+        Err(_) => return -1,
+    };
+    if offset > bytes.len() || len > bytes.len().saturating_sub(offset) {
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(data, bytes.as_mut_ptr().add(offset), len);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_buffer_read(
+    buf: *mut u8,
+    offset: u64,
+    out: *mut u8,
+    len: u64,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let buf = buf as *mut MpRtHeader;
+    if !gpu_is_buffer(buf) {
+        return -1;
+    }
+    let payload = gpu_buffer_payload(buf);
+    let bytes = &*(*payload).bytes.get();
+    let offset = match usize::try_from(offset) {
+        Ok(offset) => offset,
+        Err(_) => return -1,
+    };
+    let len = match usize::try_from(len) {
+        Ok(len) => len,
+        Err(_) => return -1,
+    };
+    if offset > bytes.len() || len > bytes.len().saturating_sub(offset) {
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr().add(offset), out, len);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_kernel_load(
+    dev: *mut u8,
+    spv: *const u8,
+    spv_len: u64,
+) -> *mut u8 {
+    if !gpu_is_device(dev as *mut MpRtHeader) || spv.is_null() {
+        return std::ptr::null_mut();
+    }
+    let len = match usize::try_from(spv_len) {
+        Ok(len) => len,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let blob = std::slice::from_raw_parts(spv, len);
+    gpu_new_kernel(blob) as *mut u8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_kernel_free(kernel: *mut u8) {
+    if !kernel.is_null() {
+        mp_rt_release_strong(kernel as *mut MpRtHeader);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_launch(
+    kernel: *mut u8,
     _groups_x: u32,
     _groups_y: u32,
     _groups_z: u32,
     _args: *const *mut u8,
     _arg_count: u32,
-) -> *mut u8 {
-    std::ptr::null_mut()
+) -> i32 {
+    if !gpu_is_kernel(kernel as *mut MpRtHeader) {
+        return -1;
+    }
+    0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn mp_rt_gpu_fence_wait(_fence: *mut u8) -> i32 {
-    -1
+unsafe fn gpu_clear_handle<T>(slot: *mut *mut T) {
+    if !slot.is_null() {
+        *slot = std::ptr::null_mut();
+    }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn mp_rt_gpu_fence_free(_fence: *mut u8) {}
-
-// ---------------------------------------------------------------------------
-// Public helper: mp_rt_alloc with layout stored in reserved0.
-// Overrides the no_mangle version above so callers that go through the
-// registry get the correct dealloc behaviour.
-// ---------------------------------------------------------------------------
-
-// NOTE: the exported mp_rt_alloc uses the registry to find alignment for
-// dealloc. We patch it here so reserved0 is also filled in.
-//
-// The existing #[no_mangle] mp_rt_alloc above does NOT set reserved0; we
-// replace its body via a separate wrapper approach. To keep the single
-// no_mangle symbol, we update the function in place.
-
-// Actually, we need to fix mp_rt_alloc to set reserved0 for dealloc.
-// Let's shadow it by making the public symbol call alloc_builtin-style logic.
-// Since we already have the #[no_mangle] above, we'll adjust it here with
-// a note that the version above is incomplete — we instead provide the
-// correct version below and remove the old one.
-//
-// (The Write tool replaces the file entirely, so the version in this file
-//  is the only version. The mp_rt_alloc above sets reserved0=0; we need
-//  to fix that. The cleanest approach: rewrite mp_rt_alloc to store the size.)
+unsafe fn gpu_set_error(out_errmsg: *mut *mut MpRtHeader, msg: &str) {
+    let owned = mp_rt_str_from_utf8(msg.as_ptr(), msg.len() as u64);
+    if out_errmsg.is_null() {
+        mp_rt_release_strong(owned);
+        return;
+    }
+    *out_errmsg = owned;
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1454,7 +2488,7 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
-    unsafe fn make_test_callable(call_fn: *mut u8) -> (*mut u8, *mut MpRtCallableVtable) {
+    unsafe fn make_test_callable(call_fn: *mut u8) -> *mut u8 {
         let callable = alloc_builtin(
             TYPE_ID_TCALLABLE,
             FLAG_HEAP,
@@ -1469,7 +2503,7 @@ mod tests {
         }));
         (*payload).vtable_ptr = vtable;
         (*payload).data_ptr = std::ptr::null_mut();
-        (callable as *mut u8, vtable)
+        callable as *mut u8
     }
 
     unsafe extern "C" fn arr_map_double(_ctx: *mut u8, elem: *const u8, out: *mut u8) {
@@ -1490,22 +2524,115 @@ mod tests {
         *acc += *(elem as *const i32);
     }
 
+    fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static GPU_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        GPU_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     // -----------------------------------------------------------------------
     // ARC: alloc + retain + release cycle
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_std_println_does_not_crash() {
-        let msg = b"Hello, world!";
-        mp_std_println(msg.as_ptr(), msg.len());
+        unsafe {
+            let msg = make_str("Hello, world!");
+            mp_std_println(msg);
+            mp_rt_release_strong(msg);
+        }
+    }
+
+    #[test]
+    fn test_callable_introspection_reports_fn_and_capture_data() {
+        unsafe {
+            let fn_ptr = arr_filter_even as *const () as *mut u8;
+            let mut capture_blob = Vec::new();
+            capture_blob.extend_from_slice(&(4_u64).to_le_bytes());
+            capture_blob.extend_from_slice(&[1_u8, 2, 3, 4]);
+
+            let callable = mp_rt_callable_new(fn_ptr, capture_blob.as_ptr() as *mut u8);
+            assert_eq!(mp_rt_callable_fn_ptr(callable), fn_ptr);
+            assert_eq!(mp_rt_callable_capture_size(callable), 4);
+
+            let data_ptr = mp_rt_callable_data_ptr(callable);
+            assert!(!data_ptr.is_null());
+            let captured = std::slice::from_raw_parts(data_ptr as *const u8, 4);
+            assert_eq!(captured, &[1_u8, 2, 3, 4]);
+
+            mp_rt_release_strong(callable as *mut MpRtHeader);
+
+            let nocap = mp_rt_callable_new(fn_ptr, std::ptr::null_mut());
+            assert_eq!(mp_rt_callable_capture_size(nocap), 0);
+            assert!(mp_rt_callable_data_ptr(nocap).is_null());
+            mp_rt_release_strong(nocap as *mut MpRtHeader);
+        }
+    }
+
+    #[test]
+    fn test_callable_new_accepts_unaligned_capture_blob() {
+        unsafe {
+            let fn_ptr = arr_filter_even as *const () as *mut u8;
+            let mut raw = vec![0_u8; 8 + 4 + 1];
+            let blob = raw.as_mut_ptr().add(1);
+            std::ptr::write_unaligned(blob as *mut u64, 4_u64);
+            std::ptr::copy_nonoverlapping([9_u8, 8, 7, 6].as_ptr(), blob.add(8), 4);
+
+            let callable = mp_rt_callable_new(fn_ptr, blob);
+            assert_eq!(mp_rt_callable_fn_ptr(callable), fn_ptr);
+            assert_eq!(mp_rt_callable_capture_size(callable), 4);
+            let data = mp_rt_callable_data_ptr(callable);
+            assert!(!data.is_null());
+            assert_eq!(
+                std::slice::from_raw_parts(data as *const u8, 4),
+                &[9, 8, 7, 6]
+            );
+            mp_rt_release_strong(callable as *mut MpRtHeader);
+        }
     }
 
     #[test]
     fn test_std_assert_success_paths() {
         unsafe {
-            let msg = b"ok";
-            mp_std_assert(1, msg.as_ptr(), msg.len());
-            mp_std_assert_eq(7, 7);
+            let msg = make_str("ok");
+            mp_std_assert(1, msg);
+            mp_std_assert_eq(7, 7, msg);
+            mp_std_assert_ne(7, 8, msg);
+            mp_rt_release_strong(msg);
+        }
+    }
+
+    #[test]
+    fn test_std_os_functions() {
+        unsafe {
+            let cwd = mp_std_cwd();
+            assert!(!cwd.is_null());
+            let cwd_text = read_str(cwd);
+            assert!(!cwd_text.is_empty());
+            mp_rt_release_strong(cwd);
+
+            let key = if std::env::var("PATH").is_ok() {
+                "PATH"
+            } else if std::env::var("HOME").is_ok() {
+                "HOME"
+            } else {
+                // Environment can be highly constrained in sandboxed runners.
+                // Validate missing-key behavior in that case.
+                let missing = make_str("MAGPIE_RT_TEST_MISSING_ENV");
+                let none = mp_std_env_var(missing);
+                assert!(none.is_null());
+                mp_rt_release_strong(missing);
+                return;
+            };
+            let expected = std::env::var(key).expect("selected env key should exist");
+            let key_obj = make_str(key);
+            let env_val = mp_std_env_var(key_obj);
+            assert!(!env_val.is_null());
+            assert_eq!(read_str(env_val), expected);
+            mp_rt_release_strong(env_val);
+            mp_rt_release_strong(key_obj);
         }
     }
 
@@ -1516,10 +2643,12 @@ mod tests {
         unsafe {
             let s = make_str("hash-me");
             let actual = mp_std_hash_str(s);
+            let actual_pascal = mp_std_hash_Str(s);
             let mut expected_hasher = std::collections::hash_map::DefaultHasher::new();
             "hash-me".hash(&mut expected_hasher);
             let expected = expected_hasher.finish();
             assert_eq!(actual, expected);
+            assert_eq!(actual_pascal, expected);
             mp_rt_release_strong(s);
         }
 
@@ -1533,6 +2662,22 @@ mod tests {
     }
 
     #[test]
+    fn test_std_async_shims() {
+        unsafe {
+            mp_std_block_on(std::ptr::null_mut());
+
+            let state = Box::into_raw(Box::new(MpRtFutureState {
+                ready: true,
+                value: std::ptr::null_mut(),
+            }));
+            let future = state as *mut u8;
+            assert_eq!(mp_std_spawn_task(future), future);
+            mp_std_block_on(future);
+            drop(Box::from_raw(state));
+        }
+    }
+
+    #[test]
     fn test_std_math_functions() {
         assert_eq!(mp_std_abs_i32(-9), 9);
         assert_eq!(mp_std_abs_i64(-11), 11);
@@ -1542,14 +2687,92 @@ mod tests {
     }
 
     #[test]
-    fn test_gpu_stubs_return_safe_defaults() {
+    fn test_gpu_runtime_cpu_fallback_roundtrip() {
+        let _guard = gpu_test_lock();
         unsafe {
-            assert_eq!(mp_rt_gpu_device_count(), 0);
-            assert!(mp_rt_gpu_device_open(0).is_null());
-            mp_rt_gpu_device_close(std::ptr::null_mut());
+            assert_eq!(mp_rt_gpu_device_count(), 1_u32);
+            mp_rt_gpu_register_kernels(std::ptr::null(), 0);
+            assert_eq!(GPU_REGISTERED_KERNEL_COUNT.load(Ordering::Relaxed), 0);
 
-            assert!(mp_rt_gpu_buffer_alloc(std::ptr::null_mut(), 64).is_null());
-            mp_rt_gpu_buffer_free(std::ptr::null_mut());
+            let params: [MpRtGpuParam; 1] = [MpRtGpuParam {
+                kind: 1,
+                _reserved0: 0,
+                _reserved1: 0,
+                type_id: 0,
+                offset_or_binding: 0,
+                size: 0,
+            }];
+            let entries = [MpRtGpuKernelEntry {
+                sid_hash: 42,
+                backend: 1,
+                blob: std::ptr::null(),
+                blob_len: 0,
+                num_params: 1,
+                params: params.as_ptr(),
+                num_buffers: 1,
+                push_const_size: 16,
+            }];
+            mp_rt_gpu_register_kernels(entries.as_ptr().cast::<u8>(), entries.len() as i32);
+            assert_eq!(GPU_REGISTERED_KERNEL_COUNT.load(Ordering::Relaxed), 1);
+
+            let compat_dev = mp_rt_gpu_device_open(0);
+            assert!(!compat_dev.is_null());
+            mp_rt_gpu_device_close(compat_dev);
+
+            let mut dev: *mut MpRtHeader = std::ptr::null_mut();
+            let mut gpu_err: *mut MpRtHeader = std::ptr::null_mut();
+            assert_eq!(mp_rt_gpu_device_default(&mut dev, &mut gpu_err), 0);
+            assert!(!dev.is_null());
+            assert!(gpu_err.is_null());
+
+            let mut bad_dev: *mut MpRtHeader = std::ptr::null_mut();
+            gpu_err = std::ptr::null_mut();
+            assert_eq!(mp_rt_gpu_device_by_index(1, &mut bad_dev, &mut gpu_err), -1);
+            assert!(bad_dev.is_null());
+            assert!(!gpu_err.is_null());
+            assert!(read_str(gpu_err).contains("out of range"));
+            mp_rt_release_strong(gpu_err);
+
+            let mut dev2: *mut MpRtHeader = std::ptr::null_mut();
+            gpu_err = std::ptr::null_mut();
+            assert_eq!(mp_rt_gpu_device_by_index(0, &mut dev2, &mut gpu_err), 0);
+            assert!(!dev2.is_null());
+            assert!(gpu_err.is_null());
+
+            let dev_name = mp_rt_gpu_device_name(std::ptr::null_mut());
+            assert!(!dev_name.is_null());
+            assert_eq!(read_str(dev_name), "invalid-gpu-device");
+            mp_rt_release_strong(dev_name);
+
+            let dev_name_ok = mp_rt_gpu_device_name(dev);
+            assert_eq!(read_str(dev_name_ok), "cpu-fallback-gpu:0");
+            mp_rt_release_strong(dev_name_ok);
+
+            let compat_buf = mp_rt_gpu_buffer_alloc(dev as *mut u8, 8);
+            assert!(!compat_buf.is_null());
+            let write_word: u64 = 0xAABBCCDDEEFF0011;
+            assert_eq!(
+                mp_rt_gpu_buffer_write(
+                    compat_buf,
+                    0,
+                    (&write_word as *const u64).cast::<u8>(),
+                    std::mem::size_of::<u64>() as u64,
+                ),
+                0
+            );
+            let mut read_word: u64 = 0;
+            assert_eq!(
+                mp_rt_gpu_buffer_read(
+                    compat_buf,
+                    0,
+                    (&mut read_word as *mut u64).cast::<u8>(),
+                    std::mem::size_of::<u64>() as u64,
+                ),
+                0
+            );
+            assert_eq!(read_word, write_word);
+            mp_rt_gpu_buffer_free(compat_buf);
+
             assert_eq!(
                 mp_rt_gpu_buffer_write(std::ptr::null_mut(), 0, std::ptr::null(), 0),
                 -1
@@ -1559,23 +2782,310 @@ mod tests {
                 -1
             );
 
-            assert!(mp_rt_gpu_kernel_load(std::ptr::null_mut(), std::ptr::null(), 0).is_null());
-            mp_rt_gpu_kernel_free(std::ptr::null_mut());
-
+            let kernel_blob = [0x03_u8, 0x02, 0x23, 0x07];
+            let kernel = mp_rt_gpu_kernel_load(
+                dev as *mut u8,
+                kernel_blob.as_ptr(),
+                kernel_blob.len() as u64,
+            );
+            assert!(!kernel.is_null());
             let args: [*mut u8; 0] = [];
+            assert_eq!(mp_rt_gpu_launch(kernel, 1, 1, 1, args.as_ptr(), 0), 0);
+            mp_rt_gpu_kernel_free(kernel);
+
+            let mut out_buf: *mut MpRtHeader = std::ptr::null_mut();
+            let mut out_err: *mut MpRtHeader = std::ptr::null_mut();
             assert_eq!(
-                mp_rt_gpu_launch(std::ptr::null_mut(), 1, 1, 1, args.as_ptr(), 0),
+                mp_rt_gpu_buffer_new(
+                    dev,
+                    TYPE_ID_I32,
+                    std::mem::size_of::<i32>() as u64,
+                    4,
+                    0,
+                    &mut out_buf,
+                    &mut out_err,
+                ),
+                0
+            );
+            assert!(!out_buf.is_null());
+            assert!(out_err.is_null());
+            assert_eq!(mp_rt_gpu_buffer_len(out_buf), 4);
+
+            let host_arr = mp_rt_arr_new(TYPE_ID_I32, std::mem::size_of::<i32>() as u64, 0);
+            for value in [10_i32, 20, 30, 40] {
+                mp_rt_arr_push(
+                    host_arr,
+                    (&value as *const i32).cast::<u8>(),
+                    std::mem::size_of::<i32>() as u64,
+                );
+            }
+
+            let mut from_arr_buf: *mut MpRtHeader = std::ptr::null_mut();
+            out_err = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_gpu_buffer_from_array(dev, host_arr, 0, &mut from_arr_buf, &mut out_err,),
+                0
+            );
+            assert!(!from_arr_buf.is_null());
+            assert!(out_err.is_null());
+
+            let mut out_arr: *mut MpRtHeader = std::ptr::null_mut();
+            out_err = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_gpu_buffer_to_array(from_arr_buf, &mut out_arr, &mut out_err),
+                0
+            );
+            assert!(!out_arr.is_null());
+            assert!(out_err.is_null());
+            assert_eq!(mp_rt_arr_len(out_arr), 4);
+            assert_eq!(*(mp_rt_arr_get(out_arr, 0) as *const i32), 10);
+            assert_eq!(*(mp_rt_arr_get(out_arr, 1) as *const i32), 20);
+            assert_eq!(*(mp_rt_arr_get(out_arr, 2) as *const i32), 30);
+            assert_eq!(*(mp_rt_arr_get(out_arr, 3) as *const i32), 40);
+
+            let mut dst_buf: *mut MpRtHeader = std::ptr::null_mut();
+            out_err = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_gpu_buffer_new(
+                    dev,
+                    TYPE_ID_I32,
+                    std::mem::size_of::<i32>() as u64,
+                    4,
+                    0,
+                    &mut dst_buf,
+                    &mut out_err,
+                ),
+                0
+            );
+            assert!(!dst_buf.is_null());
+            assert!(out_err.is_null());
+
+            out_err = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_gpu_buffer_copy(from_arr_buf, dst_buf, &mut out_err),
+                0
+            );
+            assert!(out_err.is_null());
+
+            let mut copied_arr: *mut MpRtHeader = std::ptr::null_mut();
+            out_err = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_gpu_buffer_to_array(dst_buf, &mut copied_arr, &mut out_err),
+                0
+            );
+            assert!(out_err.is_null());
+            assert_eq!(*(mp_rt_arr_get(copied_arr, 0) as *const i32), 10);
+            assert_eq!(*(mp_rt_arr_get(copied_arr, 1) as *const i32), 20);
+
+            out_err = std::ptr::null_mut();
+            assert_eq!(mp_rt_gpu_device_sync(dev, &mut out_err), 0);
+            assert!(out_err.is_null());
+
+            let mut args_blob = [0_u8; 24];
+            let ptr_word = (from_arr_buf as usize as u64).to_ne_bytes();
+            args_blob[0..8].copy_from_slice(&ptr_word);
+            let mut sync_err: *mut MpRtHeader = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_gpu_launch_sync(
+                    dev,
+                    42,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    args_blob.as_ptr(),
+                    args_blob.len() as u64,
+                    &mut sync_err,
+                ),
+                0
+            );
+            assert!(sync_err.is_null());
+
+            let mut fence: *mut MpRtHeader = std::ptr::null_mut();
+            let mut launch_err: *mut MpRtHeader = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_gpu_launch_async(
+                    dev,
+                    42,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    args_blob.as_ptr(),
+                    args_blob.len() as u64,
+                    &mut fence,
+                    &mut launch_err,
+                ),
+                0
+            );
+            assert!(!fence.is_null());
+            assert!(launch_err.is_null());
+
+            let mut done = 0_u8;
+            let mut wait_err: *mut MpRtHeader = std::ptr::null_mut();
+            assert_eq!(mp_rt_gpu_fence_wait(fence, 0, &mut done, &mut wait_err), 0);
+            assert_eq!(done, 1);
+            assert!(wait_err.is_null());
+            mp_rt_gpu_fence_free(fence);
+
+            let addr = make_str("127.0.0.1");
+            let mut err_msg: *mut MpRtHeader = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_web_serve(
+                    std::ptr::null_mut(),
+                    addr,
+                    8080,
+                    1,
+                    1,
+                    1_000_000,
+                    1_000,
+                    1_000,
+                    0,
+                    &mut err_msg as *mut *mut MpRtHeader,
+                ),
                 -1
             );
-            assert!(mp_rt_gpu_launch_async(std::ptr::null_mut(), 1, 1, 1, args.as_ptr(), 0).is_null());
-            assert_eq!(mp_rt_gpu_fence_wait(std::ptr::null_mut()), -1);
-            mp_rt_gpu_fence_free(std::ptr::null_mut());
+            assert!(!err_msg.is_null());
+            let err_text = read_str(err_msg);
+            assert!(err_text.contains("invalid web service handle"));
+            mp_rt_release_strong(err_msg);
+            mp_rt_release_strong(addr);
 
-            assert!(mp_rt_channel_new(1).is_null());
-            assert_eq!(mp_rt_channel_send(std::ptr::null_mut(), std::ptr::null_mut()), -1);
-            assert!(mp_rt_channel_recv(std::ptr::null_mut()).is_null());
+            mp_rt_release_strong(out_buf);
+            mp_rt_release_strong(from_arr_buf);
+            mp_rt_release_strong(dst_buf);
+            mp_rt_release_strong(out_arr);
+            mp_rt_release_strong(copied_arr);
+            mp_rt_release_strong(host_arr);
+            mp_rt_release_strong(dev);
+            mp_rt_release_strong(dev2);
+        }
+    }
 
-            assert_eq!(mp_rt_web_serve(8080, std::ptr::null_mut()), -1);
+    #[test]
+    fn test_gpu_launch_sync_accepts_unaligned_args_blob() {
+        let _guard = gpu_test_lock();
+        unsafe {
+            let params: [MpRtGpuParam; 1] = [MpRtGpuParam {
+                kind: 1,
+                _reserved0: 0,
+                _reserved1: 0,
+                type_id: 0,
+                offset_or_binding: 0,
+                size: 0,
+            }];
+            let entries = [MpRtGpuKernelEntry {
+                sid_hash: 77,
+                backend: 1,
+                blob: std::ptr::null(),
+                blob_len: 0,
+                num_params: 1,
+                params: params.as_ptr(),
+                num_buffers: 1,
+                push_const_size: 0,
+            }];
+            mp_rt_gpu_register_kernels(entries.as_ptr().cast::<u8>(), entries.len() as i32);
+
+            let mut dev: *mut MpRtHeader = std::ptr::null_mut();
+            let mut err: *mut MpRtHeader = std::ptr::null_mut();
+            assert_eq!(mp_rt_gpu_device_default(&mut dev, &mut err), 0);
+            assert!(err.is_null());
+            assert!(!dev.is_null());
+
+            let mut buf: *mut MpRtHeader = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_gpu_buffer_new(
+                    dev,
+                    TYPE_ID_I32,
+                    std::mem::size_of::<i32>() as u64,
+                    1,
+                    0,
+                    &mut buf,
+                    &mut err
+                ),
+                0
+            );
+            assert!(err.is_null());
+            assert!(!buf.is_null());
+
+            let mut blob = vec![0_u8; 8 + 1];
+            let unaligned = blob.as_mut_ptr().add(1);
+            let ptr_word = (buf as usize as u64).to_ne_bytes();
+            std::ptr::copy_nonoverlapping(ptr_word.as_ptr(), unaligned, ptr_word.len());
+
+            let mut launch_err: *mut MpRtHeader = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_gpu_launch_sync(
+                    dev,
+                    77,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    unaligned as *const u8,
+                    8,
+                    &mut launch_err
+                ),
+                0
+            );
+            assert!(launch_err.is_null());
+
+            mp_rt_release_strong(buf);
+            mp_rt_release_strong(dev);
+        }
+    }
+
+    #[test]
+    fn test_channel_runtime_roundtrip() {
+        unsafe {
+            let elem_size = std::mem::size_of::<i32>() as u64;
+            let ch = mp_rt_channel_new(TYPE_ID_I32, elem_size);
+            assert!(!ch.is_null());
+
+            let input = 0x1234_i32;
+            mp_rt_channel_send(ch, (&input as *const i32).cast::<u8>(), elem_size);
+            let mut output = 0_i32;
+            assert_eq!(
+                mp_rt_channel_recv(ch, (&mut output as *mut i32).cast::<u8>(), elem_size),
+                1
+            );
+            assert_eq!(output, input);
+
+            mp_rt_channel_send(std::ptr::null_mut(), std::ptr::null(), elem_size);
+            assert_eq!(
+                mp_rt_channel_recv(std::ptr::null_mut(), std::ptr::null_mut(), elem_size),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn test_mp_rt_alloc_sets_reserved_layout_size() {
+        unsafe {
+            mp_rt_init();
+            let info = MpRtTypeInfo {
+                type_id: 9901,
+                flags: FLAG_HEAP,
+                payload_size: 8,
+                payload_align: 8,
+                drop_fn: None,
+                debug_fqn: c"test.ReservedAlloc".as_ptr(),
+            };
+            mp_rt_register_types(&info as *const MpRtTypeInfo, 1);
+
+            let obj = mp_rt_alloc(9901, 8, 8, FLAG_HEAP);
+            assert!(!obj.is_null());
+            assert!(
+                (*obj).reserved0 >= (std::mem::size_of::<MpRtHeader>() + 8) as u64,
+                "reserved0 must include full allocation size for dealloc"
+            );
+            mp_rt_release_strong(obj);
         }
     }
 
@@ -1652,8 +3162,8 @@ mod tests {
             let failed = mp_rt_weak_upgrade(obj);
             assert!(failed.is_null());
 
-            // Release both weak references to free memory.
-            mp_rt_release_weak(obj);
+            // Only the explicit weak remains here:
+            // strong drop consumed the implicit weak reference.
             mp_rt_release_weak(obj);
         }
     }
@@ -1689,9 +3199,26 @@ mod tests {
             let c = make_str("bar");
             assert_eq!(mp_rt_str_eq(a, b), 1);
             assert_eq!(mp_rt_str_eq(a, c), 0);
+            assert_eq!(mp_rt_str_cmp(a, b), 0);
+            assert!(mp_rt_str_cmp(c, a) < 0);
+            assert!(mp_rt_str_cmp(a, c) > 0);
             mp_rt_release_strong(a);
             mp_rt_release_strong(b);
             mp_rt_release_strong(c);
+        }
+    }
+
+    #[test]
+    fn test_bytes_helpers() {
+        unsafe {
+            let a = [1_u8, 2, 3];
+            let b = [1_u8, 2, 3];
+            let c = [1_u8, 2, 4];
+            assert_eq!(mp_rt_bytes_eq(a.as_ptr(), b.as_ptr(), 3), 1);
+            assert_eq!(mp_rt_bytes_eq(a.as_ptr(), c.as_ptr(), 3), 0);
+            assert_eq!(mp_rt_bytes_cmp(a.as_ptr(), b.as_ptr(), 3), 0);
+            assert!(mp_rt_bytes_cmp(a.as_ptr(), c.as_ptr(), 3) < 0);
+            assert_ne!(mp_rt_bytes_hash(a.as_ptr(), 3), 0);
         }
     }
 
@@ -1744,7 +3271,7 @@ mod tests {
 
             mp_rt_strbuilder_append_i64(b, 42_i64);
             mp_rt_strbuilder_append_i32(b, -7_i32);
-            mp_rt_strbuilder_append_f64(b, 3.14_f64);
+            mp_rt_strbuilder_append_f64(b, 2.5_f64);
             mp_rt_strbuilder_append_bool(b, 1);
             mp_rt_strbuilder_append_bool(b, 0);
 
@@ -1754,7 +3281,7 @@ mod tests {
             assert!(s.starts_with("hello"));
             assert!(s.contains("42"));
             assert!(s.contains("-7"));
-            assert!(s.contains("3.14"));
+            assert!(s.contains("2.5"));
             assert!(s.contains("true"));
             assert!(s.contains("false"));
 
@@ -1786,8 +3313,7 @@ mod tests {
                 );
             }
 
-            let (map_callable, map_vtable) =
-                make_test_callable(arr_map_double as *const () as *mut u8);
+            let map_callable = make_test_callable(arr_map_double as *const () as *mut u8);
             let mapped = mp_rt_arr_map(arr, map_callable, 4, std::mem::size_of::<i32>() as u64);
             assert_eq!(mp_rt_arr_len(mapped), 4);
             assert_eq!(*(mp_rt_arr_get(mapped, 0) as *const i32), 2);
@@ -1795,15 +3321,13 @@ mod tests {
             assert_eq!(*(mp_rt_arr_get(mapped, 2) as *const i32), 6);
             assert_eq!(*(mp_rt_arr_get(mapped, 3) as *const i32), 8);
 
-            let (filter_callable, filter_vtable) =
-                make_test_callable(arr_filter_even as *const () as *mut u8);
+            let filter_callable = make_test_callable(arr_filter_even as *const () as *mut u8);
             let filtered = mp_rt_arr_filter(arr, filter_callable);
             assert_eq!(mp_rt_arr_len(filtered), 2);
             assert_eq!(*(mp_rt_arr_get(filtered, 0) as *const i32), 2);
             assert_eq!(*(mp_rt_arr_get(filtered, 1) as *const i32), 4);
 
-            let (reduce_callable, reduce_vtable) =
-                make_test_callable(arr_reduce_sum as *const () as *mut u8);
+            let reduce_callable = make_test_callable(arr_reduce_sum as *const () as *mut u8);
             let mut sum = 0_i32;
             mp_rt_arr_reduce(
                 filtered,
@@ -1819,9 +3343,6 @@ mod tests {
             mp_rt_release_strong(map_callable as *mut MpRtHeader);
             mp_rt_release_strong(filter_callable as *mut MpRtHeader);
             mp_rt_release_strong(reduce_callable as *mut MpRtHeader);
-            drop(Box::from_raw(map_vtable));
-            drop(Box::from_raw(filter_vtable));
-            drop(Box::from_raw(reduce_vtable));
         }
     }
 
@@ -1861,7 +3382,8 @@ mod tests {
             (*state).value = result_ptr;
 
             assert_eq!(mp_rt_future_poll(future), 1);
-            let taken = mp_rt_future_take(future);
+            let mut taken: *mut u8 = std::ptr::null_mut();
+            mp_rt_future_take(future, (&mut taken as *mut *mut u8).cast::<u8>());
             assert_eq!(*(taken as *const i64), 77);
 
             drop(Box::from_raw(taken as *mut i64));
@@ -1896,6 +3418,30 @@ mod tests {
             assert_eq!((*found).type_id, 9999);
             assert_eq!((*found).payload_size, 16);
         }
+    }
+
+    #[test]
+    fn test_public_c_header_contains_core_abi_surface() {
+        let header = include_str!("../include/magpie_rt.h");
+        assert!(header.contains("typedef struct MpRtHeader"));
+        assert!(header.contains("typedef struct MpRtTypeInfo"));
+        assert!(header.contains("mp_rt_alloc("));
+        assert!(header.contains("mp_rt_arr_new("));
+        assert!(header.contains("mp_rt_map_new("));
+        assert!(header.contains("mp_rt_str_concat("));
+        assert!(header.contains("mp_rt_arr_foreach("));
+        assert!(header.contains("mp_rt_callable_new("));
+        assert!(header.contains("mp_rt_mutex_new("));
+        assert!(header.contains("mp_rt_channel_new("));
+        assert!(header.contains("mp_rt_web_serve("));
+        assert!(header.contains("typedef struct MpRtGpuKernelEntry"));
+        assert!(header.contains("mp_rt_gpu_register_kernels("));
+        assert!(header.contains("mp_rt_gpu_launch_sync("));
+        assert!(header.contains("mp_rt_gpu_launch_async("));
+        assert!(header.contains("mp_rt_gpu_kernel_load("));
+        assert!(header.contains("mp_std_hash_str("));
+        assert!(header.contains("mp_std_block_on("));
+        assert!(header.contains("mp_std_spawn_task("));
     }
 }
 
@@ -1952,6 +3498,334 @@ fn mul_usize(a: usize, b: usize, ctx: &str) -> usize {
 #[inline]
 fn add_usize(a: usize, b: usize, ctx: &str) -> usize {
     a.checked_add(b).expect(ctx)
+}
+
+#[inline]
+unsafe fn bytes_eq(a: *const u8, b: *const u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    for i in 0..len {
+        if *a.add(i) != *b.add(i) {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline]
+unsafe fn bytes_cmp(a: *const u8, b: *const u8, len: usize) -> i32 {
+    for i in 0..len {
+        let lhs = *a.add(i);
+        let rhs = *b.add(i);
+        if lhs < rhs {
+            return -1;
+        }
+        if lhs > rhs {
+            return 1;
+        }
+    }
+    0
+}
+
+#[inline]
+unsafe fn bytes_hash(data: *const u8, len: usize) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for i in 0..len {
+        hash ^= *data.add(i) as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_bytes_hash(data: *const u8, len: u64) -> u64 {
+    let len = usize_from_u64(len, "byte length too large");
+    if len == 0 {
+        return bytes_hash(std::ptr::null(), 0);
+    }
+    assert!(
+        !data.is_null(),
+        "mp_rt_bytes_hash: null data with non-zero len"
+    );
+    bytes_hash(data, len)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_bytes_eq(a: *const u8, b: *const u8, len: u64) -> i32 {
+    let len = usize_from_u64(len, "byte length too large");
+    if len == 0 {
+        return 1;
+    }
+    assert!(!a.is_null(), "mp_rt_bytes_eq: null lhs with non-zero len");
+    assert!(!b.is_null(), "mp_rt_bytes_eq: null rhs with non-zero len");
+    if bytes_eq(a, b, len) {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_bytes_cmp(a: *const u8, b: *const u8, len: u64) -> i32 {
+    let len = usize_from_u64(len, "byte length too large");
+    if len == 0 {
+        return 0;
+    }
+    assert!(!a.is_null(), "mp_rt_bytes_cmp: null lhs with non-zero len");
+    assert!(!b.is_null(), "mp_rt_bytes_cmp: null rhs with non-zero len");
+    bytes_cmp(a, b, len)
+}
+
+#[inline]
+unsafe fn slot_load_handle(slot: *const u8) -> *mut MpRtHeader {
+    if slot.is_null() {
+        return std::ptr::null_mut();
+    }
+    *(slot as *const *mut MpRtHeader)
+}
+
+#[inline]
+unsafe fn str_handle_bytes(handle: *mut MpRtHeader) -> Option<(*const u8, usize)> {
+    if handle.is_null() || (*handle).type_id != TYPE_ID_STR {
+        return None;
+    }
+    let mut len = 0_u64;
+    let ptr = mp_rt_str_bytes(handle, &mut len);
+    Some((ptr, usize_from_u64(len, "string length too large")))
+}
+
+#[inline]
+unsafe fn str_slot_eq(a_slot: *const u8, b_slot: *const u8) -> bool {
+    let a = slot_load_handle(a_slot);
+    let b = slot_load_handle(b_slot);
+    match (str_handle_bytes(a), str_handle_bytes(b)) {
+        (Some((a_ptr, a_len)), Some((b_ptr, b_len))) => {
+            a_len == b_len && bytes_eq(a_ptr, b_ptr, a_len)
+        }
+        _ => a == b,
+    }
+}
+
+#[inline]
+unsafe fn str_slot_cmp(a_slot: *const u8, b_slot: *const u8) -> i32 {
+    let a = slot_load_handle(a_slot);
+    let b = slot_load_handle(b_slot);
+    match (str_handle_bytes(a), str_handle_bytes(b)) {
+        (Some((a_ptr, a_len)), Some((b_ptr, b_len))) => {
+            let shared = std::cmp::min(a_len, b_len);
+            let prefix = bytes_cmp(a_ptr, b_ptr, shared);
+            if prefix != 0 {
+                prefix
+            } else if a_len < b_len {
+                -1
+            } else if a_len > b_len {
+                1
+            } else {
+                0
+            }
+        }
+        _ => {
+            let ap = a as usize;
+            let bp = b as usize;
+            if ap < bp {
+                -1
+            } else if ap > bp {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+#[inline]
+unsafe fn str_slot_hash(slot: *const u8) -> u64 {
+    let handle = slot_load_handle(slot);
+    match str_handle_bytes(handle) {
+        Some((ptr, len)) => bytes_hash(ptr, len),
+        None => {
+            let addr = (handle as usize as u64).to_le_bytes();
+            bytes_hash(addr.as_ptr(), addr.len())
+        }
+    }
+}
+
+#[inline]
+fn primitive_type_size(type_id: u32) -> Option<usize> {
+    match type_id {
+        TYPE_ID_BOOL => Some(std::mem::size_of::<u8>()),
+        TYPE_ID_I8 => Some(std::mem::size_of::<i8>()),
+        TYPE_ID_I16 => Some(std::mem::size_of::<i16>()),
+        TYPE_ID_I32 => Some(std::mem::size_of::<i32>()),
+        TYPE_ID_I64 => Some(std::mem::size_of::<i64>()),
+        TYPE_ID_U8 => Some(std::mem::size_of::<u8>()),
+        TYPE_ID_U16 => Some(std::mem::size_of::<u16>()),
+        TYPE_ID_U32 => Some(std::mem::size_of::<u32>()),
+        TYPE_ID_U64 => Some(std::mem::size_of::<u64>()),
+        TYPE_ID_F32 => Some(std::mem::size_of::<f32>()),
+        TYPE_ID_F64 => Some(std::mem::size_of::<f64>()),
+        _ => None,
+    }
+}
+
+#[inline]
+unsafe fn primitive_slot_cmp(
+    type_id: u32,
+    elem_size: usize,
+    a: *const u8,
+    b: *const u8,
+) -> Option<i32> {
+    if primitive_type_size(type_id)? != elem_size {
+        return None;
+    }
+    let out = match type_id {
+        TYPE_ID_BOOL => {
+            let av = *a != 0;
+            let bv = *b != 0;
+            if av == bv {
+                0
+            } else if !av && bv {
+                -1
+            } else {
+                1
+            }
+        }
+        TYPE_ID_I8 => {
+            let av = *(a as *const i8);
+            let bv = *(b as *const i8);
+            if av < bv {
+                -1
+            } else if av > bv {
+                1
+            } else {
+                0
+            }
+        }
+        TYPE_ID_I16 => {
+            let av = *(a as *const i16);
+            let bv = *(b as *const i16);
+            if av < bv {
+                -1
+            } else if av > bv {
+                1
+            } else {
+                0
+            }
+        }
+        TYPE_ID_I32 => {
+            let av = *(a as *const i32);
+            let bv = *(b as *const i32);
+            if av < bv {
+                -1
+            } else if av > bv {
+                1
+            } else {
+                0
+            }
+        }
+        TYPE_ID_I64 => {
+            let av = *(a as *const i64);
+            let bv = *(b as *const i64);
+            if av < bv {
+                -1
+            } else if av > bv {
+                1
+            } else {
+                0
+            }
+        }
+        TYPE_ID_U8 => {
+            let av = *a;
+            let bv = *b;
+            if av < bv {
+                -1
+            } else if av > bv {
+                1
+            } else {
+                0
+            }
+        }
+        TYPE_ID_U16 => {
+            let av = *(a as *const u16);
+            let bv = *(b as *const u16);
+            if av < bv {
+                -1
+            } else if av > bv {
+                1
+            } else {
+                0
+            }
+        }
+        TYPE_ID_U32 => {
+            let av = *(a as *const u32);
+            let bv = *(b as *const u32);
+            if av < bv {
+                -1
+            } else if av > bv {
+                1
+            } else {
+                0
+            }
+        }
+        TYPE_ID_U64 => {
+            let av = *(a as *const u64);
+            let bv = *(b as *const u64);
+            if av < bv {
+                -1
+            } else if av > bv {
+                1
+            } else {
+                0
+            }
+        }
+        TYPE_ID_F32 => {
+            let av = *(a as *const f32);
+            let bv = *(b as *const f32);
+            if av < bv {
+                -1
+            } else if av > bv {
+                1
+            } else if av == bv {
+                0
+            } else {
+                let ab = av.to_bits();
+                let bb = bv.to_bits();
+                if ab < bb {
+                    -1
+                } else if ab > bb {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+        TYPE_ID_F64 => {
+            let av = *(a as *const f64);
+            let bv = *(b as *const f64);
+            if av < bv {
+                -1
+            } else if av > bv {
+                1
+            } else if av == bv {
+                0
+            } else {
+                let ab = av.to_bits();
+                let bb = bv.to_bits();
+                if ab < bb {
+                    -1
+                } else if ab > bb {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+        _ => unreachable!("primitive type size check should gate non-primitive ids"),
+    };
+    Some(out)
 }
 
 #[inline]
@@ -2076,7 +3950,7 @@ fn ensure_collection_types_registered() {
                 payload_size: std::mem::size_of::<MpRtArrayPayload>() as u64,
                 payload_align: std::mem::align_of::<MpRtArrayPayload>() as u64,
                 drop_fn: Some(mp_rt_arr_drop),
-                debug_fqn: b"core.Array\0".as_ptr() as *const c_char,
+                debug_fqn: c"core.Array".as_ptr(),
             },
             MpRtTypeInfo {
                 type_id: TYPE_ID_MAP,
@@ -2084,7 +3958,7 @@ fn ensure_collection_types_registered() {
                 payload_size: std::mem::size_of::<MpRtMapPayload>() as u64,
                 payload_align: std::mem::align_of::<MpRtMapPayload>() as u64,
                 drop_fn: Some(mp_rt_map_drop),
-                debug_fqn: b"core.Map\0".as_ptr() as *const c_char,
+                debug_fqn: c"core.Map".as_ptr(),
             },
         ];
         mp_rt_register_types(infos.as_ptr(), infos.len() as u32);
@@ -2127,7 +4001,18 @@ unsafe fn map_find_slot(payload: *mut MpRtMapPayload, key: *const u8) -> (bool, 
     }
 
     let mut first_tombstone = None;
-    let start = ((*payload).hash_fn)(key) as usize % cap;
+    let key_size = usize_from_u64((*payload).key_size, "map key_size too large");
+    let hash = match (*payload).hash_fn {
+        Some(hash_fn) => hash_fn(key),
+        None => {
+            if (*payload).key_type_id == TYPE_ID_STR && key_size == std::mem::size_of::<usize>() {
+                str_slot_hash(key)
+            } else {
+                bytes_hash(key, key_size)
+            }
+        }
+    };
+    let start = hash as usize % cap;
 
     for step in 0..cap {
         let idx = (start + step) % cap;
@@ -2141,7 +4026,19 @@ unsafe fn map_find_slot(payload: *mut MpRtMapPayload, key: *const u8) -> (bool, 
             }
             MAP_SLOT_FULL => {
                 let existing_key = map_key_ptr(payload, idx) as *const u8;
-                if ((*payload).eq_fn)(existing_key, key) != 0 {
+                let is_eq = match (*payload).eq_fn {
+                    Some(eq_fn) => eq_fn(existing_key, key) != 0,
+                    None => {
+                        if (*payload).key_type_id == TYPE_ID_STR
+                            && key_size == std::mem::size_of::<usize>()
+                        {
+                            str_slot_eq(existing_key, key)
+                        } else {
+                            bytes_eq(existing_key, key, key_size)
+                        }
+                    }
+                };
+                if is_eq {
                     return (true, idx);
                 }
             }
@@ -2431,7 +4328,19 @@ pub unsafe extern "C" fn mp_rt_arr_contains(
                 .data_ptr
                 .add(mul_usize(i, elem_size, "array index overflow"))
         };
-        if eq_fn(elem_ptr as *const u8, val) != 0 {
+        let is_eq = match eq_fn {
+            Some(eq_fn) => eq_fn(elem_ptr as *const u8, val) != 0,
+            None => {
+                if (*payload).elem_type_id == TYPE_ID_STR
+                    && elem_size == std::mem::size_of::<*mut MpRtHeader>()
+                {
+                    str_slot_eq(elem_ptr as *const u8, val)
+                } else {
+                    bytes_eq(elem_ptr as *const u8, val, elem_size)
+                }
+            }
+        };
+        if is_eq {
             return 1;
         }
     }
@@ -2458,7 +4367,26 @@ pub unsafe extern "C" fn mp_rt_arr_sort(arr: *mut MpRtHeader, cmp: MpRtCmpFn) {
             let rhs = (*payload)
                 .data_ptr
                 .add(mul_usize(j, elem_size, "array rhs index overflow"));
-            if cmp(lhs as *const u8, rhs as *const u8) <= 0 {
+            let ord = match cmp {
+                Some(cmp_fn) => cmp_fn(lhs as *const u8, rhs as *const u8),
+                None => {
+                    if (*payload).elem_type_id == TYPE_ID_STR
+                        && elem_size == std::mem::size_of::<*mut MpRtHeader>()
+                    {
+                        str_slot_cmp(lhs as *const u8, rhs as *const u8)
+                    } else if let Some(ord) = primitive_slot_cmp(
+                        (*payload).elem_type_id,
+                        elem_size,
+                        lhs as *const u8,
+                        rhs as *const u8,
+                    ) {
+                        ord
+                    } else {
+                        bytes_cmp(lhs as *const u8, rhs as *const u8, elem_size)
+                    }
+                }
+            };
+            if ord <= 0 {
                 break;
             }
             std::ptr::swap_nonoverlapping(lhs, rhs, elem_size);
@@ -2761,12 +4689,12 @@ mod collection_tests {
                     arr,
                     &v2 as *const i32 as *const u8,
                     std::mem::size_of::<i32>() as u64,
-                    i32_eq
+                    Some(i32_eq)
                 ),
                 1
             );
 
-            mp_rt_arr_sort(arr, i32_cmp);
+            mp_rt_arr_sort(arr, Some(i32_cmp));
             assert_eq!(*(mp_rt_arr_get(arr, 0) as *const i32), 10);
             assert_eq!(*(mp_rt_arr_get(arr, 1) as *const i32), 20);
             assert_eq!(*(mp_rt_arr_get(arr, 2) as *const i32), 30);
@@ -2788,6 +4716,105 @@ mod collection_tests {
     }
 
     #[test]
+    fn test_array_contains_and_sort_with_null_callbacks() {
+        unsafe {
+            let arr = mp_rt_arr_new(1, std::mem::size_of::<i32>() as u64, 0);
+            for value in [3_i32, 1_i32, 2_i32] {
+                mp_rt_arr_push(
+                    arr,
+                    &value as *const i32 as *const u8,
+                    std::mem::size_of::<i32>() as u64,
+                );
+            }
+
+            let needle = 2_i32;
+            assert_eq!(
+                mp_rt_arr_contains(
+                    arr,
+                    &needle as *const i32 as *const u8,
+                    std::mem::size_of::<i32>() as u64,
+                    None,
+                ),
+                1
+            );
+
+            mp_rt_arr_sort(arr, None);
+            assert_eq!(*(mp_rt_arr_get(arr, 0) as *const i32), 1);
+            assert_eq!(*(mp_rt_arr_get(arr, 1) as *const i32), 2);
+            assert_eq!(*(mp_rt_arr_get(arr, 2) as *const i32), 3);
+
+            mp_rt_release_strong(arr);
+        }
+    }
+
+    #[test]
+    fn test_array_sort_null_callback_uses_numeric_order_for_i32() {
+        unsafe {
+            let arr = mp_rt_arr_new(TYPE_ID_I32, std::mem::size_of::<i32>() as u64, 0);
+            for value in [2_i32, -1_i32, 1_i32] {
+                mp_rt_arr_push(
+                    arr,
+                    &value as *const i32 as *const u8,
+                    std::mem::size_of::<i32>() as u64,
+                );
+            }
+
+            mp_rt_arr_sort(arr, None);
+            assert_eq!(*(mp_rt_arr_get(arr, 0) as *const i32), -1);
+            assert_eq!(*(mp_rt_arr_get(arr, 1) as *const i32), 1);
+            assert_eq!(*(mp_rt_arr_get(arr, 2) as *const i32), 2);
+
+            mp_rt_release_strong(arr);
+        }
+    }
+
+    #[test]
+    fn test_array_null_callbacks_use_string_value_semantics() {
+        unsafe {
+            let ptr_size = std::mem::size_of::<*mut MpRtHeader>() as u64;
+            let arr = mp_rt_arr_new(TYPE_ID_STR, ptr_size, 0);
+
+            let alpha = b"alpha";
+            let beta = b"beta";
+            let alpha_h = mp_rt_str_from_utf8(alpha.as_ptr(), alpha.len() as u64);
+            let beta_h = mp_rt_str_from_utf8(beta.as_ptr(), beta.len() as u64);
+            let probe_h = mp_rt_str_from_utf8(alpha.as_ptr(), alpha.len() as u64);
+
+            mp_rt_arr_push(
+                arr,
+                &beta_h as *const *mut MpRtHeader as *const u8,
+                ptr_size,
+            );
+            mp_rt_arr_push(
+                arr,
+                &alpha_h as *const *mut MpRtHeader as *const u8,
+                ptr_size,
+            );
+
+            assert_eq!(
+                mp_rt_arr_contains(
+                    arr,
+                    &probe_h as *const *mut MpRtHeader as *const u8,
+                    ptr_size,
+                    None
+                ),
+                1
+            );
+
+            mp_rt_arr_sort(arr, None);
+            let first = *(mp_rt_arr_get(arr, 0) as *const *mut MpRtHeader);
+            let second = *(mp_rt_arr_get(arr, 1) as *const *mut MpRtHeader);
+            assert_eq!(mp_rt_str_eq(first, alpha_h), 1);
+            assert_eq!(mp_rt_str_eq(second, beta_h), 1);
+
+            mp_rt_release_strong(arr);
+            mp_rt_release_strong(alpha_h);
+            mp_rt_release_strong(beta_h);
+            mp_rt_release_strong(probe_h);
+        }
+    }
+
+    #[test]
     fn test_map_set_get_delete() {
         unsafe {
             let map = mp_rt_map_new(
@@ -2796,8 +4823,8 @@ mod collection_tests {
                 std::mem::size_of::<u64>() as u64,
                 std::mem::size_of::<u64>() as u64,
                 4,
-                u64_hash,
-                u64_eq,
+                Some(u64_hash),
+                Some(u64_eq),
             );
 
             let k1 = 11_u64;
@@ -2870,6 +4897,116 @@ mod collection_tests {
 
             mp_rt_release_strong(keys);
             mp_rt_release_strong(values);
+            mp_rt_release_strong(map);
+        }
+    }
+
+    #[test]
+    fn test_map_set_get_delete_with_null_callbacks() {
+        unsafe {
+            let map = mp_rt_map_new(
+                1,
+                2,
+                std::mem::size_of::<u64>() as u64,
+                std::mem::size_of::<u64>() as u64,
+                4,
+                None,
+                None,
+            );
+
+            let key = 7_u64;
+            let val = 70_u64;
+            mp_rt_map_set(
+                map,
+                &key as *const u64 as *const u8,
+                std::mem::size_of::<u64>() as u64,
+                &val as *const u64 as *const u8,
+                std::mem::size_of::<u64>() as u64,
+            );
+
+            let out = mp_rt_map_get(
+                map,
+                &key as *const u64 as *const u8,
+                std::mem::size_of::<u64>() as u64,
+            );
+            assert!(!out.is_null());
+            assert_eq!(*(out as *const u64), 70_u64);
+            assert_eq!(
+                mp_rt_map_contains_key(
+                    map,
+                    &key as *const u64 as *const u8,
+                    std::mem::size_of::<u64>() as u64
+                ),
+                1
+            );
+            assert_eq!(
+                mp_rt_map_delete(
+                    map,
+                    &key as *const u64 as *const u8,
+                    std::mem::size_of::<u64>() as u64
+                ),
+                1
+            );
+            assert_eq!(mp_rt_map_len(map), 0);
+
+            mp_rt_release_strong(map);
+        }
+    }
+
+    #[test]
+    fn test_map_null_callbacks_use_string_key_value_semantics() {
+        unsafe {
+            let ptr_size = std::mem::size_of::<*mut MpRtHeader>() as u64;
+            let map = mp_rt_map_new(
+                TYPE_ID_STR,
+                1,
+                ptr_size,
+                std::mem::size_of::<u64>() as u64,
+                4,
+                None,
+                None,
+            );
+
+            let alpha = b"alpha";
+            let key_insert = mp_rt_str_from_utf8(alpha.as_ptr(), alpha.len() as u64);
+            let key_lookup = mp_rt_str_from_utf8(alpha.as_ptr(), alpha.len() as u64);
+            let val = 42_u64;
+
+            mp_rt_map_set(
+                map,
+                &key_insert as *const *mut MpRtHeader as *const u8,
+                ptr_size,
+                &val as *const u64 as *const u8,
+                std::mem::size_of::<u64>() as u64,
+            );
+
+            let out = mp_rt_map_get(
+                map,
+                &key_lookup as *const *mut MpRtHeader as *const u8,
+                ptr_size,
+            );
+            assert!(!out.is_null());
+            assert_eq!(*(out as *const u64), 42_u64);
+            assert_eq!(
+                mp_rt_map_contains_key(
+                    map,
+                    &key_lookup as *const *mut MpRtHeader as *const u8,
+                    ptr_size
+                ),
+                1
+            );
+            assert_eq!(
+                mp_rt_map_delete(
+                    map,
+                    &key_lookup as *const *mut MpRtHeader as *const u8,
+                    ptr_size
+                ),
+                1
+            );
+            assert_eq!(mp_rt_map_len(map), 0);
+
+            mp_rt_release_strong(key_insert);
+            mp_rt_release_strong(key_lookup);
             mp_rt_release_strong(map);
         }
     }

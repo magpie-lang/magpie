@@ -1,4 +1,5 @@
 //! Semantic analysis, module resolution, symbol metadata, and AST -> HIR lowering.
+#![allow(clippy::result_unit_err, clippy::too_many_arguments)]
 
 use std::collections::{HashMap, HashSet};
 
@@ -6,8 +7,7 @@ use base32::Alphabet;
 use magpie_ast::{
     AstArgListElem, AstArgValue, AstBaseType, AstBuiltinType, AstConstExpr, AstConstLit, AstDecl,
     AstFile, AstImplDecl, AstInstr, AstOp, AstOpVoid, AstSigDecl, AstTerminator, AstType,
-    AstValueRef,
-    BinOpKind, ImportItem, ModulePath, OwnershipMod, Span,
+    AstValueRef, BinOpKind, ImportItem, OwnershipMod, Span,
 };
 use magpie_diag::{Diagnostic, DiagnosticBag, Severity};
 use magpie_hir::{
@@ -28,6 +28,7 @@ pub struct FnSymbol {
     pub sid: Sid,
     pub params: Vec<TypeId>,
     pub ret_ty: TypeId,
+    pub is_unsafe: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +72,7 @@ pub struct ResolvedModule {
     pub ast: AstFile,
     pub symbol_table: SymbolTable,
     pub resolved_imports: Vec<(String, FQN)>,
+    pub unsafe_fn_sids: HashSet<Sid>,
 }
 
 pub fn resolve_modules(
@@ -105,6 +107,7 @@ pub fn resolve_modules(
             ast: file.clone(),
             symbol_table,
             resolved_imports: default_lang_item_imports(),
+            unsafe_fn_sids: HashSet::new(),
         });
     }
 
@@ -298,6 +301,35 @@ pub fn resolve_modules(
                             diag,
                         );
 
+                        if ast_type_returns_rawptr(&item.ret_ty.node) {
+                            match item
+                                .attrs
+                                .iter()
+                                .find(|(key, _)| key == "returns")
+                                .map(|(_, value)| value.as_str())
+                            {
+                                Some("owned") | Some("borrowed") => {}
+                                Some(other) => emit_error(
+                                    diag,
+                                    "MPF0001",
+                                    Some(item.ret_ty.span),
+                                    format!(
+                                        "extern fn '{}' returns rawptr but attrs {{ returns=... }} must be 'owned' or 'borrowed' (got '{}').",
+                                        item.name, other
+                                    ),
+                                ),
+                                None => emit_error(
+                                    diag,
+                                    "MPF0001",
+                                    Some(item.ret_ty.span),
+                                    format!(
+                                        "extern fn '{}' returns rawptr but is missing attrs {{ returns=\"owned|borrowed\" }}.",
+                                        item.name
+                                    ),
+                                ),
+                            }
+                        }
+
                         if let Some(sym) = module.symbol_table.functions.get_mut(&item.name) {
                             sym.params = params;
                             sym.ret_ty = ret_ty;
@@ -347,6 +379,16 @@ pub fn resolve_modules(
                 _ => {}
             }
         }
+    }
+
+    let known_unsafe_fn_sids: HashSet<Sid> = modules
+        .iter()
+        .flat_map(|m| m.symbol_table.functions.values())
+        .filter(|sym| sym.is_unsafe)
+        .map(|sym| sym.sid.clone())
+        .collect();
+    for module in &mut modules {
+        module.unsafe_fn_sids = known_unsafe_fn_sids.clone();
     }
 
     if diag.error_count() > before {
@@ -477,6 +519,8 @@ pub fn lower_to_hir(
                         )
                     })
                     .collect::<Vec<_>>();
+                type_ctx.register_type_fqn(sid.clone(), format!("{}.{}", module_path, s.name));
+                type_ctx.register_value_struct_fields(sid.clone(), fields.clone());
                 type_decls.push(HirTypeDecl::Struct {
                     sid,
                     name: s.name.clone(),
@@ -512,6 +556,14 @@ pub fn lower_to_hir(
                             .collect(),
                     })
                     .collect::<Vec<_>>();
+                type_ctx.register_type_fqn(sid.clone(), format!("{}.{}", module_path, e.name));
+                type_ctx.register_value_enum_variants(
+                    sid.clone(),
+                    variants
+                        .iter()
+                        .map(|v| (v.name.clone(), v.fields.clone()))
+                        .collect(),
+                );
                 type_decls.push(HirTypeDecl::Enum {
                     sid,
                     name: e.name.clone(),
@@ -622,6 +674,7 @@ pub fn lower_to_hir(
                 lower_instr(
                     &instr.node,
                     instr.span,
+                    is_unsafe,
                     &module_path,
                     resolved,
                     &import_map,
@@ -687,6 +740,7 @@ pub fn lower_to_hir(
 fn lower_instr(
     instr: &AstInstr,
     span: Span,
+    in_unsafe_context: bool,
     module_path: &str,
     resolved: &ResolvedModule,
     import_map: &HashMap<String, String>,
@@ -700,6 +754,25 @@ fn lower_instr(
 ) {
     match instr {
         AstInstr::Assign { name, ty, op } => {
+            if !in_unsafe_context {
+                if op_requires_unsafe(op) {
+                    emit_error(
+                        diag,
+                        "MPS0024",
+                        Some(span),
+                        "raw pointer opcodes (`ptr.*`) are only allowed inside `unsafe {}` or `unsafe fn`.".to_string(),
+                    );
+                }
+                if op_calls_unsafe_fn(op, module_path, resolved, import_map) {
+                    emit_error(
+                        diag,
+                        "MPS0025",
+                        Some(span),
+                        "calling an `unsafe fn` requires an unsafe context (`unsafe {}` or `unsafe fn`).".to_string(),
+                    );
+                }
+            }
+
             let dst = if let Some(existing) = local_ids.get(name) {
                 emit_error(
                     diag,
@@ -739,6 +812,25 @@ fn lower_instr(
             out_instrs.push(HirInstr { dst, ty, op });
         }
         AstInstr::Void(v) => {
+            if !in_unsafe_context {
+                if op_void_requires_unsafe(v) {
+                    emit_error(
+                        diag,
+                        "MPS0024",
+                        Some(span),
+                        "raw pointer opcodes (`ptr.*`) are only allowed inside `unsafe {}` or `unsafe fn`.".to_string(),
+                    );
+                }
+                if op_void_calls_unsafe_fn(v, module_path, resolved, import_map) {
+                    emit_error(
+                        diag,
+                        "MPS0025",
+                        Some(span),
+                        "calling an `unsafe fn` requires an unsafe context (`unsafe {}` or `unsafe fn`).".to_string(),
+                    );
+                }
+            }
+
             let op = lower_op_void(
                 v,
                 module_path,
@@ -756,6 +848,7 @@ fn lower_instr(
                 lower_instr(
                     &i.node,
                     i.span,
+                    true,
                     module_path,
                     resolved,
                     import_map,
@@ -770,6 +863,61 @@ fn lower_instr(
             }
         }
     }
+}
+
+fn op_requires_unsafe(op: &AstOp) -> bool {
+    matches!(
+        op,
+        AstOp::PtrNull { .. }
+            | AstOp::PtrAddr { .. }
+            | AstOp::PtrFromAddr { .. }
+            | AstOp::PtrAdd { .. }
+            | AstOp::PtrLoad { .. }
+    )
+}
+
+fn op_void_requires_unsafe(op: &AstOpVoid) -> bool {
+    matches!(op, AstOpVoid::PtrStore { .. })
+}
+
+fn op_calls_unsafe_fn(
+    op: &AstOp,
+    module_path: &str,
+    resolved: &ResolvedModule,
+    import_map: &HashMap<String, String>,
+) -> bool {
+    match op {
+        AstOp::Call { callee, .. }
+        | AstOp::Try { callee, .. }
+        | AstOp::SuspendCall { callee, .. } => {
+            callee_is_unsafe(callee, module_path, resolved, import_map)
+        }
+        _ => false,
+    }
+}
+
+fn op_void_calls_unsafe_fn(
+    op: &AstOpVoid,
+    module_path: &str,
+    resolved: &ResolvedModule,
+    import_map: &HashMap<String, String>,
+) -> bool {
+    match op {
+        AstOpVoid::CallVoid { callee, .. } => {
+            callee_is_unsafe(callee, module_path, resolved, import_map)
+        }
+        _ => false,
+    }
+}
+
+fn callee_is_unsafe(
+    callee: &str,
+    module_path: &str,
+    resolved: &ResolvedModule,
+    import_map: &HashMap<String, String>,
+) -> bool {
+    let sid = resolve_fn_sid(callee, module_path, resolved, import_map);
+    resolved.unsafe_fn_sids.contains(&sid)
 }
 
 fn lower_op(
@@ -2883,7 +3031,7 @@ fn ast_type_to_type_id(
                 .collect::<Vec<_>>();
 
             let fqn = if let Some(path) = path {
-                format!("{}.{}", path.to_string(), name)
+                format!("{}.{}", path, name)
             } else if let Some(local) = symbol_table.types.get(name) {
                 local.fqn.clone()
             } else if let Some(imported) = import_map.get(name) {
@@ -3272,16 +3420,6 @@ fn module_path_str(file: &AstFile) -> String {
     file.header.node.module_path.node.to_string()
 }
 
-fn module_fs_path(path: &ModulePath) -> String {
-    let segments = &path.segments;
-    let rel_segments = if segments.len() > 1 {
-        &segments[1..]
-    } else {
-        segments.as_slice()
-    };
-    format!("src/{}.mp", rel_segments.join("/"))
-}
-
 fn collect_module_symbols(
     file: &AstFile,
     module_path: &str,
@@ -3294,13 +3432,15 @@ fn collect_module_symbols(
         match &decl.node {
             AstDecl::Fn(f)
             | AstDecl::AsyncFn(f)
-            | AstDecl::UnsafeFn(f)
             | AstDecl::GpuFn(magpie_ast::AstGpuFnDecl { inner: f, .. }) => {
-                insert_fn_symbol(table, module_path, &f.name, decl.span, diag);
+                insert_fn_symbol(table, module_path, &f.name, false, decl.span, diag);
+            }
+            AstDecl::UnsafeFn(f) => {
+                insert_fn_symbol(table, module_path, &f.name, true, decl.span, diag);
             }
             AstDecl::Extern(ext) => {
                 for item in &ext.items {
-                    insert_fn_symbol(table, module_path, &item.name, decl.span, diag);
+                    insert_fn_symbol(table, module_path, &item.name, false, decl.span, diag);
                 }
             }
             AstDecl::HeapStruct(s) => {
@@ -3362,6 +3502,7 @@ fn insert_fn_symbol(
     table: &mut SymbolTable,
     module_path: &str,
     name: &str,
+    is_unsafe: bool,
     span: Span,
     diag: &mut DiagnosticBag,
 ) {
@@ -3387,6 +3528,7 @@ fn insert_fn_symbol(
             sid: generate_sid('F', &fqn),
             params: Vec::new(),
             ret_ty: fixed_type_ids::UNIT,
+            is_unsafe,
         },
     );
 }
@@ -3600,7 +3742,8 @@ fn check_impl_orphan_rule(
     diag: &mut DiagnosticBag,
 ) {
     let trait_is_local = symbol_table.sigs.contains_key(&impl_decl.trait_name);
-    let type_owner = impl_target_owner_module(module_path, &impl_decl.for_type, symbol_table, import_map);
+    let type_owner =
+        impl_target_owner_module(module_path, &impl_decl.for_type, symbol_table, import_map);
     let is_orphan = type_owner
         .as_deref()
         .is_some_and(|owner| owner != module_path)
@@ -3637,7 +3780,9 @@ fn impl_target_owner_module(
                 return Some(module_path.to_string());
             }
             if let Some(imported) = import_map.get(name) {
-                return imported.rsplit_once('.').map(|(module, _)| module.to_string());
+                return imported
+                    .rsplit_once('.')
+                    .map(|(module, _)| module.to_string());
             }
             Some(module_path.to_string())
         }
@@ -3646,10 +3791,14 @@ fn impl_target_owner_module(
     }
 }
 
+fn ast_type_returns_rawptr(ty: &AstType) -> bool {
+    matches!(ty.base, AstBaseType::RawPtr(_))
+}
+
 fn impl_target_display_name(ty: &AstType) -> String {
     match &ty.base {
         AstBaseType::Named { path, name, .. } => match path {
-            Some(path) if !path.segments.is_empty() => format!("{}.{}", path.to_string(), name),
+            Some(path) if !path.segments.is_empty() => format!("{}.{}", path, name),
             _ => name.clone(),
         },
         AstBaseType::Prim(name) => name.clone(),
@@ -3690,6 +3839,8 @@ fn emit_error(diag: &mut DiagnosticBag, code: &str, span: Option<Span>, message:
         explanation_md: None,
         why: None,
         suggested_fixes: Vec::new(),
+        rag_bundle: Vec::new(),
+        related_docs: Vec::new(),
     });
 }
 
@@ -3921,6 +4072,8 @@ pub fn check_trait_impls(
     module: &HirModule,
     type_ctx: &TypeCtx,
     sym: &SymbolTable,
+    impl_decls: &[AstImplDecl],
+    resolved_imports: &[(String, FQN)],
     diag: &mut DiagnosticBag,
 ) -> Result<(), ()> {
     let before = diag.error_count();
@@ -3934,20 +4087,63 @@ pub fn check_trait_impls(
         })
         .collect();
     let fn_names: HashSet<&str> = sym.functions.keys().map(String::as_str).collect();
+    let fn_by_sid: HashMap<String, &HirFunction> = module
+        .functions
+        .iter()
+        .map(|func| (func.sid.0.clone(), func))
+        .collect();
+    let import_map = resolved_imports
+        .iter()
+        .cloned()
+        .collect::<HashMap<String, String>>();
 
     let mut impls: HashSet<(String, String)> = HashSet::new();
     sema_seed_builtin_trait_impls(&mut impls);
 
-    for func in &module.functions {
-        let trait_kind = if let Some(target) = func.name.strip_prefix("hash_") {
-            Some(("hash", target))
-        } else if let Some(target) = func.name.strip_prefix("eq_") {
-            Some(("eq", target))
-        } else if let Some(target) = func.name.strip_prefix("ord_") {
-            Some(("ord", target))
-        } else {
-            None
+    for impl_decl in impl_decls {
+        let trait_name = impl_decl.trait_name.as_str();
+        if !matches!(trait_name, "hash" | "eq" | "ord") {
+            continue;
+        }
+
+        let target_name = impl_trait_target_name(&impl_decl.for_type);
+        let fn_sid = sema_resolve_impl_fn_sid(&impl_decl.fn_ref, &module.path, sym, &import_map);
+        let Some(func) = fn_by_sid.get(&fn_sid.0) else {
+            emit_error(
+                diag,
+                "MPT2032",
+                None,
+                format!(
+                    "impl '{}' for '{}' references unknown local function '{}'.",
+                    trait_name, target_name, impl_decl.fn_ref
+                ),
+            );
+            continue;
         };
+
+        sema_check_trait_sig(
+            func,
+            trait_name,
+            &target_name,
+            &local_type_names,
+            type_ctx,
+            diag,
+        );
+
+        if let Some(key) =
+            sema_trait_key_from_ast_type(&impl_decl.for_type, &local_type_names, type_ctx)
+        {
+            impls.insert((trait_name.to_string(), key));
+        }
+    }
+
+    for func in &module.functions {
+        let trait_kind = func
+            .name
+            .strip_prefix("hash_")
+            .map(|target| ("hash", target))
+            .or_else(|| func.name.strip_prefix("eq_").map(|target| ("eq", target)))
+            .or_else(|| func.name.strip_prefix("ord_").map(|target| ("ord", target)));
 
         let Some((trait_name, target_name)) = trait_kind else {
             continue;
@@ -4608,6 +4804,48 @@ fn sema_trait_key_from_type_name(
     None
 }
 
+fn sema_trait_key_from_ast_type(
+    ty: &AstType,
+    local_type_names: &HashMap<String, Sid>,
+    type_ctx: &TypeCtx,
+) -> Option<String> {
+    match &ty.base {
+        AstBaseType::Named { name, .. } => {
+            sema_trait_key_from_type_name(name, local_type_names, type_ctx)
+        }
+        AstBaseType::Prim(name) => sema_trait_key_from_type_name(name, local_type_names, type_ctx),
+        AstBaseType::Builtin(AstBuiltinType::Str) => Some("str".to_string()),
+        _ => None,
+    }
+}
+
+fn impl_trait_target_name(ty: &AstType) -> String {
+    match &ty.base {
+        AstBaseType::Named { name, .. } => name.clone(),
+        AstBaseType::Prim(name) => name.clone(),
+        AstBaseType::Builtin(AstBuiltinType::Str) => "Str".to_string(),
+        _ => impl_target_display_name(ty),
+    }
+}
+
+fn sema_resolve_impl_fn_sid(
+    fn_ref: &str,
+    module_path: &str,
+    symbol_table: &SymbolTable,
+    import_map: &HashMap<String, String>,
+) -> Sid {
+    if let Some(sym) = symbol_table.functions.get(fn_ref) {
+        return sym.sid.clone();
+    }
+    if let Some(fqn) = import_map.get(fn_ref) {
+        return generate_sid('F', fqn);
+    }
+    if fn_ref.contains('.') {
+        return generate_sid('F', fn_ref);
+    }
+    generate_sid('F', &format!("{}.{}", module_path, fn_ref))
+}
+
 fn sema_trait_key_from_type_id(ty: TypeId, type_ctx: &TypeCtx) -> Option<String> {
     match type_ctx.lookup(ty) {
         Some(TypeKind::Prim(p)) => Some(format!("prim:{}", prim_type_str(*p))),
@@ -4731,12 +4969,74 @@ fn sema_contains_heap_handle(
 mod tests {
     use super::*;
     use magpie_ast::{
-        AstFieldDecl, AstFile, AstFnDecl, AstHeader, AstImplDecl, AstStructDecl, AstType,
-        AstTypeParam, ExportItem, ImportGroup, ImportItem, ModulePath, Span, Spanned,
+        AstBlock, AstConstExpr, AstConstLit, AstDecl, AstExternItem, AstExternModule, AstFieldDecl,
+        AstFile, AstFnDecl, AstHeader, AstImplDecl, AstInstr, AstOp, AstParam, AstStructDecl,
+        AstTerminator, AstType, AstTypeParam, AstValueRef, ExportItem, ImportGroup, ImportItem,
+        ModulePath, Span, Spanned,
     };
 
     fn sp<T>(node: T) -> Spanned<T> {
         Spanned::new(node, Span::dummy())
+    }
+
+    fn i32_ty() -> AstType {
+        AstType {
+            ownership: None,
+            base: AstBaseType::Prim("i32".to_string()),
+        }
+    }
+
+    fn rawptr_i32_ty() -> AstType {
+        AstType {
+            ownership: None,
+            base: AstBaseType::RawPtr(Box::new(i32_ty())),
+        }
+    }
+
+    fn const_i32(v: i128) -> AstConstExpr {
+        AstConstExpr {
+            ty: i32_ty(),
+            lit: AstConstLit::Int(v),
+        }
+    }
+
+    fn mk_fn_decl(
+        name: &str,
+        is_unsafe: bool,
+        instrs: Vec<Spanned<AstInstr>>,
+        terminator: AstTerminator,
+    ) -> Spanned<AstDecl> {
+        let f = AstFnDecl {
+            name: name.to_string(),
+            params: vec![],
+            ret_ty: sp(i32_ty()),
+            meta: None,
+            blocks: vec![sp(AstBlock {
+                label: 0,
+                instrs,
+                terminator: sp(terminator),
+            })],
+            doc: None,
+        };
+        if is_unsafe {
+            sp(AstDecl::UnsafeFn(f))
+        } else {
+            sp(AstDecl::Fn(f))
+        }
+    }
+
+    fn mk_module(decls: Vec<Spanned<AstDecl>>) -> AstFile {
+        AstFile {
+            header: sp(AstHeader {
+                module_path: sp(ModulePath {
+                    segments: vec!["demo".to_string(), "unsafe_checks".to_string()],
+                }),
+                exports: vec![],
+                imports: vec![],
+                digest: sp(String::new()),
+            }),
+            decls,
+        }
     }
 
     #[test]
@@ -4847,6 +5147,449 @@ mod tests {
         assert!(
             diag.diagnostics.iter().any(|d| d.code == "MPT1200"),
             "expected MPT1200 diagnostics, got {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ptr_op_outside_unsafe_context_is_rejected() {
+        let module = mk_module(vec![mk_fn_decl(
+            "main",
+            false,
+            vec![sp(AstInstr::Assign {
+                name: "p".to_string(),
+                ty: sp(rawptr_i32_ty()),
+                op: AstOp::PtrNull { ty: i32_ty() },
+            })],
+            AstTerminator::Ret(Some(AstValueRef::Const(const_i32(0)))),
+        )]);
+
+        let mut diag = DiagnosticBag::new(32);
+        let resolved = resolve_modules(&[module], &mut diag).expect("resolve succeeds");
+        let mut type_ctx = TypeCtx::new();
+        let lower = lower_to_hir(&resolved[0], &mut type_ctx, &mut diag);
+        assert!(
+            lower.is_err(),
+            "lowering should fail outside unsafe context"
+        );
+        assert!(
+            diag.diagnostics.iter().any(|d| d.code == "MPS0024"),
+            "expected MPS0024 diagnostics, got {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ptr_op_inside_unsafe_block_is_allowed() {
+        let module = mk_module(vec![mk_fn_decl(
+            "main",
+            false,
+            vec![sp(AstInstr::UnsafeBlock(vec![sp(AstInstr::Assign {
+                name: "p".to_string(),
+                ty: sp(rawptr_i32_ty()),
+                op: AstOp::PtrNull { ty: i32_ty() },
+            })]))],
+            AstTerminator::Ret(Some(AstValueRef::Const(const_i32(0)))),
+        )]);
+
+        let mut diag = DiagnosticBag::new(32);
+        let resolved = resolve_modules(&[module], &mut diag).expect("resolve succeeds");
+        let mut type_ctx = TypeCtx::new();
+        let lower = lower_to_hir(&resolved[0], &mut type_ctx, &mut diag);
+        assert!(lower.is_ok(), "unsafe block should permit ptr ops");
+        assert!(
+            !diag.diagnostics.iter().any(|d| d.code == "MPS0024"),
+            "unexpected MPS0024 diagnostics: {:?}",
+            diag.diagnostics
+        );
+    }
+
+    #[test]
+    fn unsafe_fn_call_outside_unsafe_context_is_rejected() {
+        let module = mk_module(vec![
+            mk_fn_decl(
+                "dangerous",
+                true,
+                vec![],
+                AstTerminator::Ret(Some(AstValueRef::Const(const_i32(1)))),
+            ),
+            mk_fn_decl(
+                "main",
+                false,
+                vec![sp(AstInstr::Assign {
+                    name: "v".to_string(),
+                    ty: sp(i32_ty()),
+                    op: AstOp::Call {
+                        callee: "dangerous".to_string(),
+                        targs: vec![],
+                        args: vec![],
+                    },
+                })],
+                AstTerminator::Ret(Some(AstValueRef::Local("v".to_string()))),
+            ),
+        ]);
+
+        let mut diag = DiagnosticBag::new(32);
+        let resolved = resolve_modules(&[module], &mut diag).expect("resolve succeeds");
+        let mut type_ctx = TypeCtx::new();
+        let lower = lower_to_hir(&resolved[0], &mut type_ctx, &mut diag);
+        assert!(lower.is_err(), "unsafe call should fail in safe context");
+        assert!(
+            diag.diagnostics.iter().any(|d| d.code == "MPS0025"),
+            "expected MPS0025 diagnostics, got {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unsafe_fn_call_inside_unsafe_block_is_allowed() {
+        let module = mk_module(vec![
+            mk_fn_decl(
+                "dangerous",
+                true,
+                vec![],
+                AstTerminator::Ret(Some(AstValueRef::Const(const_i32(1)))),
+            ),
+            mk_fn_decl(
+                "main",
+                false,
+                vec![sp(AstInstr::UnsafeBlock(vec![sp(AstInstr::Assign {
+                    name: "v".to_string(),
+                    ty: sp(i32_ty()),
+                    op: AstOp::Call {
+                        callee: "dangerous".to_string(),
+                        targs: vec![],
+                        args: vec![],
+                    },
+                })]))],
+                AstTerminator::Ret(Some(AstValueRef::Local("v".to_string()))),
+            ),
+        ]);
+
+        let mut diag = DiagnosticBag::new(32);
+        let resolved = resolve_modules(&[module], &mut diag).expect("resolve succeeds");
+        let mut type_ctx = TypeCtx::new();
+        let lower = lower_to_hir(&resolved[0], &mut type_ctx, &mut diag);
+        assert!(lower.is_ok(), "unsafe block should permit unsafe calls");
+        assert!(
+            !diag.diagnostics.iter().any(|d| d.code == "MPS0025"),
+            "unexpected MPS0025 diagnostics: {:?}",
+            diag.diagnostics
+        );
+    }
+
+    #[test]
+    fn extern_rawptr_return_requires_returns_attr() {
+        let module = mk_module(vec![sp(AstDecl::Extern(AstExternModule {
+            abi: "c".to_string(),
+            name: "ffi".to_string(),
+            items: vec![AstExternItem {
+                name: "open_handle".to_string(),
+                params: vec![],
+                ret_ty: sp(rawptr_i32_ty()),
+                attrs: vec![("link_name".to_string(), "open_handle".to_string())],
+            }],
+            doc: None,
+        }))]);
+
+        let mut diag = DiagnosticBag::new(32);
+        let resolved = resolve_modules(&[module], &mut diag);
+        assert!(
+            resolved.is_err(),
+            "rawptr extern without returns attr should fail"
+        );
+        assert!(
+            diag.diagnostics.iter().any(|d| d.code == "MPF0001"),
+            "expected MPF0001 diagnostics, got {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn extern_rawptr_return_accepts_borrowed_attr() {
+        let module = mk_module(vec![sp(AstDecl::Extern(AstExternModule {
+            abi: "c".to_string(),
+            name: "ffi".to_string(),
+            items: vec![AstExternItem {
+                name: "open_handle".to_string(),
+                params: vec![AstParam {
+                    name: "arg".to_string(),
+                    ty: sp(i32_ty()),
+                }],
+                ret_ty: sp(rawptr_i32_ty()),
+                attrs: vec![
+                    ("link_name".to_string(), "open_handle".to_string()),
+                    ("returns".to_string(), "borrowed".to_string()),
+                ],
+            }],
+            doc: None,
+        }))]);
+
+        let mut diag = DiagnosticBag::new(32);
+        let resolved = resolve_modules(&[module], &mut diag);
+        assert!(resolved.is_ok(), "valid rawptr returns attr should pass");
+        assert!(
+            !diag.diagnostics.iter().any(|d| d.code == "MPF0001"),
+            "unexpected MPF0001 diagnostics: {:?}",
+            diag.diagnostics
+        );
+    }
+
+    #[test]
+    fn trait_impl_decl_bindings_satisfy_map_new_requirements() {
+        let key_sid = generate_sid('T', "pkg.consumer.TKey");
+        let key_unique = TypeId(3000);
+        let key_borrow = TypeId(3001);
+        let map_ty = TypeId(3002);
+        let mut type_ctx = TypeCtx::new();
+        type_ctx.types.push((
+            key_unique,
+            TypeKind::HeapHandle {
+                hk: HandleKind::Unique,
+                base: HeapBase::UserType {
+                    type_sid: key_sid.clone(),
+                    targs: Vec::new(),
+                },
+            },
+        ));
+        type_ctx.types.push((
+            key_borrow,
+            TypeKind::HeapHandle {
+                hk: HandleKind::Borrow,
+                base: HeapBase::UserType {
+                    type_sid: key_sid.clone(),
+                    targs: Vec::new(),
+                },
+            },
+        ));
+        type_ctx.types.push((
+            map_ty,
+            TypeKind::HeapHandle {
+                hk: HandleKind::Unique,
+                base: HeapBase::BuiltinMap {
+                    key: key_unique,
+                    val: fixed_type_ids::I32,
+                },
+            },
+        ));
+
+        let hash_sid = generate_sid('F', "pkg.consumer.my_hash_key");
+        let eq_sid = generate_sid('F', "pkg.consumer.my_eq_key");
+        let main_sid = generate_sid('F', "pkg.consumer.main");
+
+        let module = HirModule {
+            module_id: ModuleId(0),
+            sid: generate_sid('M', "pkg.consumer"),
+            path: "pkg.consumer".to_string(),
+            type_decls: vec![HirTypeDecl::Struct {
+                sid: key_sid.clone(),
+                name: "TKey".to_string(),
+                fields: Vec::new(),
+            }],
+            globals: Vec::new(),
+            functions: vec![
+                HirFunction {
+                    fn_id: FnId(0),
+                    sid: hash_sid.clone(),
+                    name: "my_hash_key".to_string(),
+                    params: vec![(LocalId(0), key_borrow)],
+                    ret_ty: fixed_type_ids::U64,
+                    blocks: vec![HirBlock {
+                        id: BlockId(0),
+                        instrs: Vec::new(),
+                        void_ops: Vec::new(),
+                        terminator: HirTerminator::Ret(Some(HirValue::Const(HirConst {
+                            ty: fixed_type_ids::U64,
+                            lit: HirConstLit::IntLit(1),
+                        }))),
+                    }],
+                    is_async: false,
+                    is_unsafe: false,
+                },
+                HirFunction {
+                    fn_id: FnId(1),
+                    sid: eq_sid.clone(),
+                    name: "my_eq_key".to_string(),
+                    params: vec![(LocalId(0), key_borrow), (LocalId(1), key_borrow)],
+                    ret_ty: fixed_type_ids::BOOL,
+                    blocks: vec![HirBlock {
+                        id: BlockId(0),
+                        instrs: Vec::new(),
+                        void_ops: Vec::new(),
+                        terminator: HirTerminator::Ret(Some(HirValue::Const(HirConst {
+                            ty: fixed_type_ids::BOOL,
+                            lit: HirConstLit::BoolLit(true),
+                        }))),
+                    }],
+                    is_async: false,
+                    is_unsafe: false,
+                },
+                HirFunction {
+                    fn_id: FnId(2),
+                    sid: main_sid.clone(),
+                    name: "main".to_string(),
+                    params: Vec::new(),
+                    ret_ty: fixed_type_ids::I32,
+                    blocks: vec![HirBlock {
+                        id: BlockId(0),
+                        instrs: vec![HirInstr {
+                            dst: LocalId(0),
+                            ty: map_ty,
+                            op: HirOp::MapNew {
+                                key_ty: key_unique,
+                                val_ty: fixed_type_ids::I32,
+                            },
+                        }],
+                        void_ops: Vec::new(),
+                        terminator: HirTerminator::Ret(Some(HirValue::Const(HirConst {
+                            ty: fixed_type_ids::I32,
+                            lit: HirConstLit::IntLit(0),
+                        }))),
+                    }],
+                    is_async: false,
+                    is_unsafe: false,
+                },
+            ],
+        };
+
+        let mut sym = SymbolTable::default();
+        sym.functions.insert(
+            "my_hash_key".to_string(),
+            FnSymbol {
+                name: "my_hash_key".to_string(),
+                fqn: "pkg.consumer.my_hash_key".to_string(),
+                sid: hash_sid,
+                params: vec![key_borrow],
+                ret_ty: fixed_type_ids::U64,
+                is_unsafe: false,
+            },
+        );
+        sym.functions.insert(
+            "my_eq_key".to_string(),
+            FnSymbol {
+                name: "my_eq_key".to_string(),
+                fqn: "pkg.consumer.my_eq_key".to_string(),
+                sid: eq_sid,
+                params: vec![key_borrow, key_borrow],
+                ret_ty: fixed_type_ids::BOOL,
+                is_unsafe: false,
+            },
+        );
+        sym.functions.insert(
+            "main".to_string(),
+            FnSymbol {
+                name: "main".to_string(),
+                fqn: "pkg.consumer.main".to_string(),
+                sid: main_sid,
+                params: Vec::new(),
+                ret_ty: fixed_type_ids::I32,
+                is_unsafe: false,
+            },
+        );
+
+        let impl_decls = vec![
+            AstImplDecl {
+                trait_name: "hash".to_string(),
+                for_type: AstType {
+                    ownership: None,
+                    base: AstBaseType::Named {
+                        path: None,
+                        name: "TKey".to_string(),
+                        targs: Vec::new(),
+                    },
+                },
+                fn_ref: "my_hash_key".to_string(),
+            },
+            AstImplDecl {
+                trait_name: "eq".to_string(),
+                for_type: AstType {
+                    ownership: None,
+                    base: AstBaseType::Named {
+                        path: None,
+                        name: "TKey".to_string(),
+                        targs: Vec::new(),
+                    },
+                },
+                fn_ref: "my_eq_key".to_string(),
+            },
+        ];
+
+        let mut diag = DiagnosticBag::new(64);
+        let check = check_trait_impls(&module, &type_ctx, &sym, &impl_decls, &[], &mut diag);
+        assert!(
+            check.is_ok(),
+            "expected trait check success: {:?}",
+            diag.diagnostics
+        );
+        assert!(
+            !diag.diagnostics.iter().any(|d| d.code == "MPT1023"),
+            "unexpected MPT1023 diagnostics: {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trait_impl_decl_reports_missing_function_binding() {
+        let key_sid = generate_sid('T', "pkg.consumer.TKey");
+        let key_unique = TypeId(3010);
+        let mut type_ctx = TypeCtx::new();
+        type_ctx.types.push((
+            key_unique,
+            TypeKind::HeapHandle {
+                hk: HandleKind::Unique,
+                base: HeapBase::UserType {
+                    type_sid: key_sid.clone(),
+                    targs: Vec::new(),
+                },
+            },
+        ));
+        let module = HirModule {
+            module_id: ModuleId(0),
+            sid: generate_sid('M', "pkg.consumer"),
+            path: "pkg.consumer".to_string(),
+            type_decls: vec![HirTypeDecl::Struct {
+                sid: key_sid,
+                name: "TKey".to_string(),
+                fields: Vec::new(),
+            }],
+            globals: Vec::new(),
+            functions: Vec::new(),
+        };
+        let sym = SymbolTable::default();
+        let impl_decls = vec![AstImplDecl {
+            trait_name: "hash".to_string(),
+            for_type: AstType {
+                ownership: None,
+                base: AstBaseType::Named {
+                    path: None,
+                    name: "TKey".to_string(),
+                    targs: Vec::new(),
+                },
+            },
+            fn_ref: "missing_hash".to_string(),
+        }];
+
+        let mut diag = DiagnosticBag::new(32);
+        let check = check_trait_impls(&module, &type_ctx, &sym, &impl_decls, &[], &mut diag);
+        assert!(check.is_err(), "expected missing impl fn to fail");
+        assert!(
+            diag.diagnostics.iter().any(|d| d.code == "MPT2032"),
+            "expected MPT2032 diagnostics, got {:?}",
             diag.diagnostics
                 .iter()
                 .map(|d| d.code.as_str())

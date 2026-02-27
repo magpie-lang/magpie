@@ -14,6 +14,7 @@ struct InstanceKey {
     type_args: Vec<TypeId>,
 }
 
+#[allow(clippy::result_unit_err)]
 pub fn monomorphize(
     modules: &[HirModule],
     type_ctx: &mut TypeCtx,
@@ -118,6 +119,8 @@ fn emit_excessive_mono(diag: &mut DiagnosticBag, max_instances: u32) {
         explanation_md: None,
         why: None,
         suggested_fixes: vec![],
+        rag_bundle: Vec::new(),
+        related_docs: Vec::new(),
     });
 }
 

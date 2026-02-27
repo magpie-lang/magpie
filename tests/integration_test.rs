@@ -43,8 +43,6 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 
 fn prepare_fixture_for_build(path: &Path) -> PathBuf {
     let source = std::fs::read_to_string(path).expect("fixture source should be readable");
-    // Driver builds a standalone file in this mode; remove external imports for fixture-only e2e.
-    let source = source.replace("imports { std.io::{@println} }", "imports { }");
     let dir = unique_temp_dir("build");
     let entry = dir.join("main.mp");
     std::fs::write(&entry, source).expect("prepared fixture should be written");

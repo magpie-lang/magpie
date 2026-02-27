@@ -1,6 +1,7 @@
 //! Magpie AST types and span infrastructure.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 // ── Span infrastructure (§36.2) ──
 
@@ -116,9 +117,9 @@ pub struct ModulePath {
     pub segments: Vec<String>,
 }
 
-impl ModulePath {
-    pub fn to_string(&self) -> String {
-        self.segments.join(".")
+impl fmt::Display for ModulePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.segments.join("."))
     }
 }
 
@@ -812,7 +813,10 @@ mod tests {
                 assert_eq!(func.name, "add");
                 assert_eq!(func.params.len(), 1);
                 assert_eq!(func.blocks.len(), 1);
-                assert!(matches!(func.blocks[0].node.terminator.node, AstTerminator::Ret(None)));
+                assert!(matches!(
+                    func.blocks[0].node.terminator.node,
+                    AstTerminator::Ret(None)
+                ));
             }
             other => panic!("expected fn declaration, got {other:?}"),
         }
