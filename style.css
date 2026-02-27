@@ -601,17 +601,20 @@ p {
     background-color: var(--bg-tertiary);
     height: 24px;
     border-radius: 4px;
-    overflow: hidden;
+    /* overflow: hidden; Removed to allow small bar text to overflow visibly */
 }
 
 .bar-fill {
     height: 100%;
     display: flex;
     align-items: center;
-    padding-left: 0.75rem;
+    padding: 0 0.75rem;
     font-size: 0.75rem;
     font-weight: 600;
     transition: width 1.5s ease-out;
+    white-space: nowrap;
+    border-radius: 4px;
+    min-width: fit-content;
 }
 
 .bar-fill.primary {
@@ -729,7 +732,9 @@ footer {
     .footer-buttons {
         flex-direction: column;
     }
-}/* FAQ Section */
+}
+
+/* FAQ Section */
 .faq-section {
     padding: 8rem 0;
     background-color: var(--bg-main);
@@ -766,7 +771,9 @@ footer {
     .faq-grid {
         grid-template-columns: 1fr;
     }
-}/* Examples Section */
+}
+
+/* Examples Section */
 .examples-section {
     padding: 8rem 0;
 }
