@@ -240,6 +240,9 @@ pub unsafe extern "C" fn mp_rt_alloc(
 /// `obj` must be a live heap object.
 #[no_mangle]
 pub unsafe extern "C" fn mp_rt_retain_strong(obj: *mut MpRtHeader) {
+    if obj.is_null() {
+        return;
+    }
     (*obj).strong.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -251,6 +254,9 @@ pub unsafe extern "C" fn mp_rt_retain_strong(obj: *mut MpRtHeader) {
 /// `obj` must be a live heap object whose strong count >= 1.
 #[no_mangle]
 pub unsafe extern "C" fn mp_rt_release_strong(obj: *mut MpRtHeader) {
+    if obj.is_null() {
+        return;
+    }
     let prev = (*obj).strong.fetch_sub(1, Ordering::Release);
     if prev == 1 {
         // Acquire fence so we observe all writes before the release.
@@ -315,6 +321,9 @@ unsafe fn builtin_drop(obj: *mut MpRtHeader) {
 /// `obj` must be a live heap object.
 #[no_mangle]
 pub unsafe extern "C" fn mp_rt_retain_weak(obj: *mut MpRtHeader) {
+    if obj.is_null() {
+        return;
+    }
     (*obj).weak.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -324,6 +333,9 @@ pub unsafe extern "C" fn mp_rt_retain_weak(obj: *mut MpRtHeader) {
 /// `obj` must be a live heap object whose weak count >= 1.
 #[no_mangle]
 pub unsafe extern "C" fn mp_rt_release_weak(obj: *mut MpRtHeader) {
+    if obj.is_null() {
+        return;
+    }
     let prev = (*obj).weak.fetch_sub(1, Ordering::Release);
     if prev == 1 {
         std::sync::atomic::fence(Ordering::Acquire);

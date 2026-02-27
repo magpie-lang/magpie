@@ -1047,27 +1047,47 @@ impl<'a> FnBuilder<'a> {
                 self.emit_enum_is(i.dst, i.ty, variant, v)?;
             }
             MpirOp::ArcRetain { v } => {
-                let p = self.ensure_ptr_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_retain_strong(ptr {p})")
-                    .map_err(|e| e.to_string())?;
+                let op = self.value(v)?;
+                if op.ty.starts_with('{') {
+                    self.emit_arc_retain_composite(&op)?;
+                } else {
+                    let p = self.ensure_ptr(op)?;
+                    writeln!(self.out, "  call void @mp_rt_retain_strong(ptr {p})")
+                        .map_err(|e| e.to_string())?;
+                }
                 self.assign_or_copy_value(i.dst, i.ty, v)?;
             }
             MpirOp::ArcRelease { v } => {
-                let p = self.ensure_ptr_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_release_strong(ptr {p})")
-                    .map_err(|e| e.to_string())?;
+                let op = self.value(v)?;
+                if op.ty.starts_with('{') {
+                    self.emit_arc_release_composite(&op)?;
+                } else {
+                    let p = self.ensure_ptr(op)?;
+                    writeln!(self.out, "  call void @mp_rt_release_strong(ptr {p})")
+                        .map_err(|e| e.to_string())?;
+                }
                 self.set_default(i.dst, i.ty)?;
             }
             MpirOp::ArcRetainWeak { v } => {
-                let p = self.ensure_ptr_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_retain_weak(ptr {p})")
-                    .map_err(|e| e.to_string())?;
+                let op = self.value(v)?;
+                if op.ty.starts_with('{') {
+                    self.emit_arc_retain_composite(&op)?;
+                } else {
+                    let p = self.ensure_ptr(op)?;
+                    writeln!(self.out, "  call void @mp_rt_retain_weak(ptr {p})")
+                        .map_err(|e| e.to_string())?;
+                }
                 self.assign_or_copy_value(i.dst, i.ty, v)?;
             }
             MpirOp::ArcReleaseWeak { v } => {
-                let p = self.ensure_ptr_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_release_weak(ptr {p})")
-                    .map_err(|e| e.to_string())?;
+                let op = self.value(v)?;
+                if op.ty.starts_with('{') {
+                    self.emit_arc_release_composite(&op)?;
+                } else {
+                    let p = self.ensure_ptr(op)?;
+                    writeln!(self.out, "  call void @mp_rt_release_weak(ptr {p})")
+                        .map_err(|e| e.to_string())?;
+                }
                 self.set_default(i.dst, i.ty)?;
             }
             MpirOp::ArrNew { elem_ty, cap } => {
@@ -1703,24 +1723,44 @@ impl<'a> FnBuilder<'a> {
                 self.emit_gpu_buffer_store(buf, idx, val)?;
             }
             MpirOpVoid::ArcRetain { v } => {
-                let p = self.ensure_ptr_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_retain_strong(ptr {p})")
-                    .map_err(|e| e.to_string())?;
+                let op = self.value(v)?;
+                if op.ty.starts_with('{') {
+                    self.emit_arc_retain_composite(&op)?;
+                } else {
+                    let p = self.ensure_ptr(op)?;
+                    writeln!(self.out, "  call void @mp_rt_retain_strong(ptr {p})")
+                        .map_err(|e| e.to_string())?;
+                }
             }
             MpirOpVoid::ArcRelease { v } => {
-                let p = self.ensure_ptr_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_release_strong(ptr {p})")
-                    .map_err(|e| e.to_string())?;
+                let op = self.value(v)?;
+                if op.ty.starts_with('{') {
+                    self.emit_arc_release_composite(&op)?;
+                } else {
+                    let p = self.ensure_ptr(op)?;
+                    writeln!(self.out, "  call void @mp_rt_release_strong(ptr {p})")
+                        .map_err(|e| e.to_string())?;
+                }
             }
             MpirOpVoid::ArcRetainWeak { v } => {
-                let p = self.ensure_ptr_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_retain_weak(ptr {p})")
-                    .map_err(|e| e.to_string())?;
+                let op = self.value(v)?;
+                if op.ty.starts_with('{') {
+                    self.emit_arc_retain_composite(&op)?;
+                } else {
+                    let p = self.ensure_ptr(op)?;
+                    writeln!(self.out, "  call void @mp_rt_retain_weak(ptr {p})")
+                        .map_err(|e| e.to_string())?;
+                }
             }
             MpirOpVoid::ArcReleaseWeak { v } => {
-                let p = self.ensure_ptr_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_release_weak(ptr {p})")
-                    .map_err(|e| e.to_string())?;
+                let op = self.value(v)?;
+                if op.ty.starts_with('{') {
+                    self.emit_arc_release_composite(&op)?;
+                } else {
+                    let p = self.ensure_ptr(op)?;
+                    writeln!(self.out, "  call void @mp_rt_release_weak(ptr {p})")
+                        .map_err(|e| e.to_string())?;
+                }
             }
         }
         Ok(())
@@ -3708,9 +3748,56 @@ impl<'a> FnBuilder<'a> {
                 .map_err(|e| e.to_string())?;
             return Ok(tmp);
         }
+        // Aggregate types (structs like TResult/TOption) cannot be bitcast to ptr.
+        // Return null as a sentinel — callers that handle aggregates should use
+        // emit_arc_release_composite / emit_arc_retain_composite instead.
+        if op.ty.starts_with('{') || op.ty.starts_with('[') || op.ty.starts_with('<') {
+            writeln!(self.out, "  ; skip bitcast of aggregate {} to ptr", op.ty)
+                .map_err(|e| e.to_string())?;
+            return Ok("null".to_string());
+        }
         writeln!(self.out, "  {tmp} = bitcast {} {} to ptr", op.ty, op.repr)
             .map_err(|e| e.to_string())?;
         Ok(tmp)
+    }
+
+    /// Extract all `ptr`-typed fields from an aggregate value and emit
+    /// `mp_rt_release_strong` for each.  Inactive variant fields are `null`;
+    /// the runtime null-guard handles them safely.
+    fn emit_arc_release_composite(&mut self, op: &Operand) -> Result<(), String> {
+        for (idx, field_ty) in parse_aggregate_fields(&op.ty).iter().enumerate() {
+            if field_ty == "ptr" {
+                let tmp = self.tmp();
+                writeln!(
+                    self.out,
+                    "  {tmp} = extractvalue {} {}, {idx}",
+                    op.ty, op.repr
+                )
+                .map_err(|e| e.to_string())?;
+                writeln!(self.out, "  call void @mp_rt_release_strong(ptr {tmp})")
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Extract all `ptr`-typed fields from an aggregate value and emit
+    /// `mp_rt_retain_strong` for each.
+    fn emit_arc_retain_composite(&mut self, op: &Operand) -> Result<(), String> {
+        for (idx, field_ty) in parse_aggregate_fields(&op.ty).iter().enumerate() {
+            if field_ty == "ptr" {
+                let tmp = self.tmp();
+                writeln!(
+                    self.out,
+                    "  {tmp} = extractvalue {} {}, {idx}",
+                    op.ty, op.repr
+                )
+                .map_err(|e| e.to_string())?;
+                writeln!(self.out, "  call void @mp_rt_retain_strong(ptr {tmp})")
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     fn stack_slot(&mut self, op: &Operand) -> Result<String, String> {
@@ -3877,6 +3964,20 @@ fn normalize_icmp_pred(pred: &str) -> &str {
         "le" => "sle",
         _ => "eq",
     }
+}
+
+/// Parse the field types of an LLVM aggregate type like `{ i1, i64, ptr }`.
+/// Returns a vec of the field type strings (e.g. `["i1", "i64", "ptr"]`).
+fn parse_aggregate_fields(ty: &str) -> Vec<String> {
+    let trimmed = ty.trim();
+    let inner = match trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        Some(s) => s,
+        None => return vec![],
+    };
+    if inner.trim().is_empty() {
+        return vec![];
+    }
+    inner.split(',').map(|f| f.trim().to_string()).collect()
 }
 
 fn normalize_fcmp_pred(pred: &str) -> &str {
