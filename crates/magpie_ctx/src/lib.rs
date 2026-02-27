@@ -260,7 +260,8 @@ pub fn build_context_pack(chunks: Vec<Chunk>, budget: u32, policy: BudgetPolicy)
         );
     }
 
-    let mut out = Vec::with_capacity(structural_out.len() + problem_out.len() + retrieved_out.len());
+    let mut out =
+        Vec::with_capacity(structural_out.len() + problem_out.len() + retrieved_out.len());
     out.extend(structural_out);
     out.extend(problem_out);
     out.extend(retrieved_out);
@@ -327,7 +328,9 @@ fn pick_variant<'a>(candidate: &'a Candidate, remaining_budget: u32) -> Option<&
 fn compare_candidates(a: &Candidate, b: &Candidate) -> Ordering {
     b.rank_score
         .total_cmp(&a.rank_score)
-        .then_with(|| normalize_token_cost(a.chunk.token_cost).cmp(&normalize_token_cost(b.chunk.token_cost)))
+        .then_with(|| {
+            normalize_token_cost(a.chunk.token_cost).cmp(&normalize_token_cost(b.chunk.token_cost))
+        })
         .then_with(|| a.chunk.chunk_id.cmp(&b.chunk.chunk_id))
 }
 
@@ -346,7 +349,11 @@ fn compute_rank_score(chunk: &Chunk) -> f64 {
 }
 
 fn sanitize_score(score: f64) -> f64 {
-    if score.is_finite() { score } else { 0.0 }
+    if score.is_finite() {
+        score
+    } else {
+        0.0
+    }
 }
 
 fn base_priority(kind: &str) -> i32 {
@@ -367,7 +374,9 @@ fn base_priority(kind: &str) -> i32 {
 
 fn classify_bucket(kind: &str) -> Bucket {
     match kind {
-        "module_header" | "mpd_public_api" | "symgraph_summary" | "deps_summary" => Bucket::Structural,
+        "module_header" | "mpd_public_api" | "symgraph_summary" | "deps_summary" => {
+            Bucket::Structural
+        }
         "diagnostics" | "ownership_trace" | "cfg_summary" => Bucket::Problem,
         "symbol_capsule" | "snippet" => Bucket::Capsule,
         "rag_item" => Bucket::Retrieved,
@@ -571,4 +580,58 @@ fn normalize_token_cost(cost: u32) -> u32 {
 fn estimate_token_cost(text: &str) -> u32 {
     let chars = text.chars().count() as u32;
     chars.saturating_add(3).saturating_div(4).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(id: &str, kind: &str, body: &str, token_cost: u32, score: f64) -> Chunk {
+        Chunk {
+            chunk_id: id.to_string(),
+            kind: kind.to_string(),
+            subject_id: format!("S:{id}"),
+            body: body.to_string(),
+            token_cost,
+            score,
+        }
+    }
+
+    #[test]
+    fn build_context_pack_orders_buckets_structural_problem_retrieved() {
+        let chunks = vec![
+            chunk("retrieved-1", "rag_item", "retrieved detail", 8, 9.0),
+            chunk("problem-1", "diagnostics", "diagnostic detail", 8, 5.0),
+            chunk("struct-1", "module_header", "module demo", 8, 1.0),
+        ];
+
+        let pack = build_context_pack(chunks, 120, BudgetPolicy::Balanced);
+        let ids = pack
+            .chunks
+            .iter()
+            .map(|c| c.chunk_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["struct-1", "problem-1", "retrieved-1"]);
+        assert_eq!(pack.policy, BudgetPolicy::Balanced);
+        assert_eq!(pack.used_budget + pack.remaining_budget, pack.budget);
+    }
+
+    #[test]
+    fn build_context_pack_selects_compressed_variant_when_budget_is_tight() {
+        let original_body = "module demo\nfn heavy_compute() -> i64\nline one\nline two\nline three";
+        let pack = build_context_pack(
+            vec![chunk("struct-compact", "module_header", original_body, 80, 0.0)],
+            25,
+            BudgetPolicy::Balanced,
+        );
+
+        assert_eq!(pack.chunks.len(), 1);
+        assert!(pack.chunks[0].token_cost <= 25);
+        assert!(
+            pack.chunks[0].token_cost < 80,
+            "a lower-cost variant should be selected under budget pressure"
+        );
+        assert_eq!(pack.used_budget + pack.remaining_budget, pack.budget);
+    }
 }

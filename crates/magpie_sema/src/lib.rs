@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use base32::Alphabet;
 use magpie_ast::{
     AstArgListElem, AstArgValue, AstBaseType, AstBuiltinType, AstConstExpr, AstConstLit, AstDecl,
-    AstFile, AstInstr, AstOp, AstOpVoid, AstSigDecl, AstTerminator, AstType, AstValueRef,
+    AstFile, AstImplDecl, AstInstr, AstOp, AstOpVoid, AstSigDecl, AstTerminator, AstType,
+    AstValueRef,
     BinOpKind, ImportItem, ModulePath, OwnershipMod, Span,
 };
 use magpie_diag::{Diagnostic, DiagnosticBag, Severity};
@@ -72,7 +73,10 @@ pub struct ResolvedModule {
     pub resolved_imports: Vec<(String, FQN)>,
 }
 
-pub fn resolve_modules(files: &[AstFile], diag: &mut DiagnosticBag) -> Result<Vec<ResolvedModule>, ()> {
+pub fn resolve_modules(
+    files: &[AstFile],
+    diag: &mut DiagnosticBag,
+) -> Result<Vec<ResolvedModule>, ()> {
     let before = diag.error_count();
 
     let mut seen_modules: HashMap<String, usize> = HashMap::new();
@@ -330,6 +334,15 @@ pub fn resolve_modules(files: &[AstFile], diag: &mut DiagnosticBag) -> Result<Ve
                         sym.ret_ty = ret_ty;
                         sym.digest = digest;
                     }
+                }
+                AstDecl::Impl(impl_decl) => {
+                    check_impl_orphan_rule(
+                        &module_path,
+                        impl_decl,
+                        &module.symbol_table,
+                        &import_map,
+                        diag,
+                    );
                 }
                 _ => {}
             }
@@ -2084,18 +2097,28 @@ fn lower_op_void(
                 diag,
             ),
         },
-        AstOpVoid::CallVoidIndirect { .. } => {
-            emit_error(
+        AstOpVoid::CallVoidIndirect { callee, args } => HirOpVoid::CallVoidIndirect {
+            callee: lower_value_ref(
+                callee,
+                module_path,
+                &resolved.symbol_table,
+                import_map,
+                value_types,
+                locals,
+                type_ctx,
                 diag,
-                "MPS0018",
-                None,
-                "HIR has no void-indirect-call opcode in HirOpVoid; lowered as panic placeholder."
-                    .to_string(),
-            );
-            HirOpVoid::Panic {
-                msg: unit_hir_value(),
-            }
-        }
+            ),
+            args: lower_call_args(
+                args,
+                module_path,
+                &resolved.symbol_table,
+                import_map,
+                value_types,
+                locals,
+                type_ctx,
+                diag,
+            ),
+        },
         AstOpVoid::SetField { obj, field, val } => HirOpVoid::SetField {
             obj: lower_value_ref(
                 obj,
@@ -3569,6 +3592,86 @@ fn collect_local_value_types(ast: &AstFile) -> HashSet<String> {
     out
 }
 
+fn check_impl_orphan_rule(
+    module_path: &str,
+    impl_decl: &AstImplDecl,
+    symbol_table: &SymbolTable,
+    import_map: &HashMap<String, String>,
+    diag: &mut DiagnosticBag,
+) {
+    let trait_is_local = symbol_table.sigs.contains_key(&impl_decl.trait_name);
+    let type_owner = impl_target_owner_module(module_path, &impl_decl.for_type, symbol_table, import_map);
+    let is_orphan = type_owner
+        .as_deref()
+        .is_some_and(|owner| owner != module_path)
+        && !trait_is_local;
+
+    if is_orphan {
+        let target = impl_target_display_name(&impl_decl.for_type);
+        emit_error(
+            diag,
+            "MPT1200",
+            None,
+            format!(
+                "orphan impl: trait '{}' for foreign type '{}'. Impl must be in module '{}' or define the trait locally.",
+                impl_decl.trait_name,
+                target,
+                type_owner.unwrap_or_else(|| "<unknown>".to_string())
+            ),
+        );
+    }
+}
+
+fn impl_target_owner_module(
+    module_path: &str,
+    ty: &AstType,
+    symbol_table: &SymbolTable,
+    import_map: &HashMap<String, String>,
+) -> Option<String> {
+    match &ty.base {
+        AstBaseType::Named { path, name, .. } => {
+            if let Some(path) = path {
+                return Some(path.to_string());
+            }
+            if symbol_table.types.contains_key(name) {
+                return Some(module_path.to_string());
+            }
+            if let Some(imported) = import_map.get(name) {
+                return imported.rsplit_once('.').map(|(module, _)| module.to_string());
+            }
+            Some(module_path.to_string())
+        }
+        AstBaseType::Prim(_) | AstBaseType::Builtin(_) | AstBaseType::Callable { .. } => None,
+        AstBaseType::RawPtr(_) => None,
+    }
+}
+
+fn impl_target_display_name(ty: &AstType) -> String {
+    match &ty.base {
+        AstBaseType::Named { path, name, .. } => match path {
+            Some(path) if !path.segments.is_empty() => format!("{}.{}", path.to_string(), name),
+            _ => name.clone(),
+        },
+        AstBaseType::Prim(name) => name.clone(),
+        AstBaseType::Builtin(builtin) => match builtin {
+            AstBuiltinType::Str => "Str".to_string(),
+            AstBuiltinType::Array(_) => "Array".to_string(),
+            AstBuiltinType::Map(_, _) => "Map".to_string(),
+            AstBuiltinType::TOption(_) => "TOption".to_string(),
+            AstBuiltinType::TResult(_, _) => "TResult".to_string(),
+            AstBuiltinType::TStrBuilder => "TStrBuilder".to_string(),
+            AstBuiltinType::TMutex(_) => "TMutex".to_string(),
+            AstBuiltinType::TRwLock(_) => "TRwLock".to_string(),
+            AstBuiltinType::TCell(_) => "TCell".to_string(),
+            AstBuiltinType::TFuture(_) => "TFuture".to_string(),
+            AstBuiltinType::TChannelSend(_) => "TChannelSend".to_string(),
+            AstBuiltinType::TChannelRecv(_) => "TChannelRecv".to_string(),
+        },
+        AstBaseType::Callable { sig_ref } => format!("TCallable<{}>", sig_ref),
+        AstBaseType::RawPtr(_) => "rawptr".to_string(),
+    }
+}
+
 fn unit_hir_value() -> HirValue {
     HirValue::Const(HirConst {
         ty: fixed_type_ids::UNIT,
@@ -3631,14 +3734,9 @@ pub fn typecheck_module(
                     | HirOp::IShl { lhs, rhs }
                     | HirOp::ILshr { lhs, rhs }
                     | HirOp::IAshr { lhs, rhs }
-                    | HirOp::ICmp { lhs, rhs, .. } => sema_check_binary_numeric(
-                        "integer",
-                        lhs,
-                        rhs,
-                        &local_types,
-                        type_ctx,
-                        diag,
-                    ),
+                    | HirOp::ICmp { lhs, rhs, .. } => {
+                        sema_check_binary_numeric("integer", lhs, rhs, &local_types, type_ctx, diag)
+                    }
                     HirOp::FAdd { lhs, rhs }
                     | HirOp::FSub { lhs, rhs }
                     | HirOp::FMul { lhs, rhs }
@@ -3648,14 +3746,9 @@ pub fn typecheck_module(
                     | HirOp::FSubFast { lhs, rhs }
                     | HirOp::FMulFast { lhs, rhs }
                     | HirOp::FDivFast { lhs, rhs }
-                    | HirOp::FCmp { lhs, rhs, .. } => sema_check_binary_numeric(
-                        "float",
-                        lhs,
-                        rhs,
-                        &local_types,
-                        type_ctx,
-                        diag,
-                    ),
+                    | HirOp::FCmp { lhs, rhs, .. } => {
+                        sema_check_binary_numeric("float", lhs, rhs, &local_types, type_ctx, diag)
+                    }
                     HirOp::Call {
                         callee_sid,
                         inst,
@@ -3751,10 +3844,7 @@ pub fn typecheck_module(
                                 diag,
                                 "MPT2008",
                                 None,
-                                format!(
-                                    "getfield target type '{}' is not a struct.",
-                                    struct_sid
-                                ),
+                                format!("getfield target type '{}' is not a struct.", struct_sid),
                             );
                             continue;
                         };
@@ -3764,10 +3854,7 @@ pub fn typecheck_module(
                                 diag,
                                 "MPT2009",
                                 None,
-                                format!(
-                                    "struct '{}' has no field '{}'.",
-                                    struct_sid, field
-                                ),
+                                format!("struct '{}' has no field '{}'.", struct_sid, field),
                             );
                         }
                     }
@@ -3873,7 +3960,14 @@ pub fn check_trait_impls(
             continue;
         }
 
-        sema_check_trait_sig(func, trait_name, target_name, &local_type_names, type_ctx, diag);
+        sema_check_trait_sig(
+            func,
+            trait_name,
+            target_name,
+            &local_type_names,
+            type_ctx,
+            diag,
+        );
 
         if !local_type_names.contains_key(target_name) && !sema_is_lang_owned_type_name(target_name)
         {
@@ -4182,10 +4276,7 @@ fn sema_check_field_arg_list(
                 diag,
                 "MPT2017",
                 None,
-                format!(
-                    "{} '{}' has no field '{}'.",
-                    kind_name, owner_name, field
-                ),
+                format!("{} '{}' has no field '{}'.", kind_name, owner_name, field),
             );
             continue;
         };
@@ -4273,7 +4364,15 @@ fn sema_check_new_struct(
         return;
     };
 
-    sema_check_field_arg_list("struct", &sid, fields, expected, local_types, type_ctx, diag);
+    sema_check_field_arg_list(
+        "struct",
+        &sid,
+        fields,
+        expected,
+        local_types,
+        type_ctx,
+        diag,
+    );
 }
 
 fn sema_check_enum_new(
@@ -4478,8 +4577,8 @@ fn sema_is_borrow_for_trait_target(
 
 fn sema_seed_builtin_trait_impls(impls: &mut HashSet<(String, String)>) {
     let prims = [
-        "bool", "i8", "i16", "i32", "i64", "i128", "u1", "u8", "u16", "u32", "u64", "u128",
-        "f16", "f32", "f64",
+        "bool", "i8", "i16", "i32", "i64", "i128", "u1", "u8", "u16", "u32", "u64", "u128", "f16",
+        "f32", "f64",
     ];
     for p in prims {
         let key = format!("prim:{}", p);
@@ -4545,8 +4644,7 @@ fn sema_require_trait_impl(
     impls: &HashSet<(String, String)>,
     diag: &mut DiagnosticBag,
 ) {
-    let key = sema_trait_key_from_type_id(ty, type_ctx)
-        .unwrap_or_else(|| format!("type#{}", ty.0));
+    let key = sema_trait_key_from_type_id(ty, type_ctx).unwrap_or_else(|| format!("type#{}", ty.0));
     if !impls.contains(&(trait_name.to_string(), key.clone())) {
         emit_error(
             diag,
@@ -4610,7 +4708,9 @@ fn sema_contains_heap_handle(
     }
     let out = match type_ctx.lookup(ty) {
         Some(TypeKind::HeapHandle { .. }) => true,
-        Some(TypeKind::BuiltinOption { inner }) => sema_contains_heap_handle(*inner, type_ctx, visiting),
+        Some(TypeKind::BuiltinOption { inner }) => {
+            sema_contains_heap_handle(*inner, type_ctx, visiting)
+        }
         Some(TypeKind::BuiltinResult { ok, err }) => {
             sema_contains_heap_handle(*ok, type_ctx, visiting)
                 || sema_contains_heap_handle(*err, type_ctx, visiting)
@@ -4630,7 +4730,10 @@ fn sema_contains_heap_handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magpie_ast::{AstFile, AstFnDecl, AstHeader, AstType, ExportItem, ModulePath, Span, Spanned};
+    use magpie_ast::{
+        AstFieldDecl, AstFile, AstFnDecl, AstHeader, AstImplDecl, AstStructDecl, AstType,
+        AstTypeParam, ExportItem, ImportGroup, ImportItem, ModulePath, Span, Spanned,
+    };
 
     fn sp<T>(node: T) -> Spanned<T> {
         Spanned::new(node, Span::dummy())
@@ -4642,11 +4745,9 @@ mod tests {
         assert_eq!(sid.0.len(), 12);
         assert!(sid.0.starts_with("M:"));
         assert!(sid.is_valid());
-        assert!(
-            sid.0[2..]
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-        );
+        assert!(sid.0[2..]
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()));
     }
 
     #[test]
@@ -4678,11 +4779,78 @@ mod tests {
         let mut diag = DiagnosticBag::new(16);
         let resolved = resolve_modules(&[ast], &mut diag).expect("module should resolve");
 
-        assert!(!diag.has_errors(), "unexpected diagnostics: {:?}", diag.diagnostics);
+        assert!(
+            !diag.has_errors(),
+            "unexpected diagnostics: {:?}",
+            diag.diagnostics
+        );
         assert_eq!(resolved.len(), 1);
         assert!(
             resolved[0].symbol_table.functions.contains_key("main"),
             "expected function symbol table entry for 'main'"
+        );
+    }
+
+    #[test]
+    fn test_orphan_impl_decl_rejected() {
+        let local_struct = AstFile {
+            header: sp(AstHeader {
+                module_path: sp(ModulePath {
+                    segments: vec!["pkg".to_string(), "types".to_string()],
+                }),
+                exports: vec![],
+                imports: vec![],
+                digest: sp(String::new()),
+            }),
+            decls: vec![sp(AstDecl::HeapStruct(AstStructDecl {
+                name: "TForeign".to_string(),
+                type_params: Vec::<AstTypeParam>::new(),
+                fields: Vec::<AstFieldDecl>::new(),
+                doc: None,
+            }))],
+        };
+
+        let importer = AstFile {
+            header: sp(AstHeader {
+                module_path: sp(ModulePath {
+                    segments: vec!["pkg".to_string(), "consumer".to_string()],
+                }),
+                exports: vec![],
+                imports: vec![sp(ImportGroup {
+                    module_path: ModulePath {
+                        segments: vec!["pkg".to_string(), "types".to_string()],
+                    },
+                    items: vec![ImportItem::Type("TForeign".to_string())],
+                })],
+                digest: sp(String::new()),
+            }),
+            decls: vec![sp(AstDecl::Impl(AstImplDecl {
+                trait_name: "hash".to_string(),
+                for_type: AstType {
+                    ownership: None,
+                    base: AstBaseType::Named {
+                        path: None,
+                        name: "TForeign".to_string(),
+                        targs: Vec::new(),
+                    },
+                },
+                fn_ref: "pkg.consumer.hash_foreign".to_string(),
+            }))],
+        };
+
+        let mut diag = DiagnosticBag::new(32);
+        let resolved = resolve_modules(&[local_struct, importer], &mut diag);
+        assert!(
+            resolved.is_err(),
+            "expected orphan impl rule to reject module set"
+        );
+        assert!(
+            diag.diagnostics.iter().any(|d| d.code == "MPT1200"),
+            "expected MPT1200 diagnostics, got {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
         );
     }
 }

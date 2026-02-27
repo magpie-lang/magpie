@@ -4,5 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+magpie_ast = { path = "../magpie_ast" }
 magpie_codegen_llvm = { path = "../magpie_codegen_llvm" }
 magpie_diag = { path = "../magpie_diag" }
+magpie_driver = { path = "../magpie_driver" }
+magpie_lex = { path = "../magpie_lex" }
+magpie_mpir = { path = "../magpie_mpir" }
+magpie_parse = { path = "../magpie_parse" }
+magpie_sema = { path = "../magpie_sema" }
+magpie_types = { path = "../magpie_types" }

@@ -2,14 +2,11 @@
 
 use magpie_diag::{codes, Diagnostic, DiagnosticBag, Severity};
 use magpie_hir::{
-    FnId, HirBlock, HirConst, HirFunction, HirInstr, HirModule, HirOp, HirOpVoid,
-    HirTerminator, HirValue, Sid, TypeCtx, TypeId, TypeKind,
+    FnId, HirBlock, HirConst, HirFunction, HirInstr, HirModule, HirOp, HirOpVoid, HirTerminator,
+    HirValue, Sid, TypeCtx, TypeId, TypeKind,
 };
 use magpie_types::HeapBase;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct InstanceKey {
@@ -49,15 +46,18 @@ pub fn monomorphize(
             .filter(|key| !instance_sid_map.contains_key(key))
             .collect::<Vec<_>>();
         new_keys.sort_by(|a, b| {
-            a.callee_sid
-                .0
-                .cmp(&b.callee_sid.0)
-                .then_with(|| a.type_args.iter().map(|t| t.0).cmp(b.type_args.iter().map(|t| t.0)))
+            a.callee_sid.0.cmp(&b.callee_sid.0).then_with(|| {
+                a.type_args
+                    .iter()
+                    .map(|t| t.0)
+                    .cmp(b.type_args.iter().map(|t| t.0))
+            })
         });
 
         let mut created_any = false;
         for key in new_keys {
-            let Some((owner_module_idx, template)) = template_by_sid.get(&key.callee_sid.0).cloned()
+            let Some((owner_module_idx, template)) =
+                template_by_sid.get(&key.callee_sid.0).cloned()
             else {
                 // External/unknown callee: leave call as-is.
                 continue;
@@ -72,7 +72,9 @@ pub fn monomorphize(
             specialized.fn_id = next_fn_id(&out_modules[owner_module_idx]);
 
             let new_sid = specialized.sid.clone();
-            out_modules[owner_module_idx].functions.push(specialized.clone());
+            out_modules[owner_module_idx]
+                .functions
+                .push(specialized.clone());
             template_by_sid.insert(new_sid.0.clone(), (owner_module_idx, specialized));
             instance_sid_map.insert(key, new_sid);
 
@@ -410,7 +412,9 @@ fn canonical_type_str(ty: TypeId, type_ctx: &TypeCtx) -> String {
 fn canonical_heap_base_str(base: &HeapBase, type_ctx: &TypeCtx) -> String {
     match base {
         HeapBase::BuiltinStr => "Str".to_string(),
-        HeapBase::BuiltinArray { elem } => format!("Array<{}>", canonical_type_str(*elem, type_ctx)),
+        HeapBase::BuiltinArray { elem } => {
+            format!("Array<{}>", canonical_type_str(*elem, type_ctx))
+        }
         HeapBase::BuiltinMap { key, val } => format!(
             "Map<{},{}>",
             canonical_type_str(*key, type_ctx),
@@ -452,52 +456,8 @@ fn canonical_heap_base_str(base: &HeapBase, type_ctx: &TypeCtx) -> String {
 }
 
 fn blake3_hex_best_effort(payload: &str) -> String {
-    if let Some(real) = try_b3sum(payload) {
-        return real;
-    }
-    stable_fallback_hex(payload)
-}
-
-fn try_b3sum(payload: &str) -> Option<String> {
-    let mut child = Command::new("b3sum")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(payload.as_bytes()).ok()?;
-    } else {
-        return None;
-    }
-
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let text = String::from_utf8(output.stdout).ok()?;
-    let token = text.split_whitespace().next()?;
-    if token.len() < 64 || !token.chars().take(64).all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    Some(token.chars().take(64).collect::<String>().to_ascii_lowercase())
-}
-
-fn stable_fallback_hex(payload: &str) -> String {
-    let mut h1 = std::collections::hash_map::DefaultHasher::new();
-    payload.hash(&mut h1);
-    let a = h1.finish();
-
-    let mut h2 = std::collections::hash_map::DefaultHasher::new();
-    payload.len().hash(&mut h2);
-    payload.as_bytes().iter().rev().for_each(|b| b.hash(&mut h2));
-    let b = h2.finish();
-
-    let c = a.rotate_left(17) ^ b.rotate_right(11);
-    let d = a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_mul(0xC2B2_AE35_79B9_83AB);
-    format!("{a:016x}{b:016x}{c:016x}{d:016x}")
+    let hash = blake3::hash(payload.as_bytes());
+    hash.to_hex().to_string()
 }
 
 fn substitute_function_types(
@@ -538,17 +498,29 @@ fn substitute_instr_types(
     substitute_op_types(&mut instr.op, param_map, type_ctx);
 }
 
-fn substitute_value_types(v: &mut HirValue, param_map: &HashMap<TypeId, TypeId>, type_ctx: &mut TypeCtx) {
+fn substitute_value_types(
+    v: &mut HirValue,
+    param_map: &HashMap<TypeId, TypeId>,
+    type_ctx: &mut TypeCtx,
+) {
     if let HirValue::Const(c) = v {
         substitute_const_types(c, param_map, type_ctx);
     }
 }
 
-fn substitute_const_types(c: &mut HirConst, param_map: &HashMap<TypeId, TypeId>, type_ctx: &mut TypeCtx) {
+fn substitute_const_types(
+    c: &mut HirConst,
+    param_map: &HashMap<TypeId, TypeId>,
+    type_ctx: &mut TypeCtx,
+) {
     c.ty = substitute_type(c.ty, param_map, type_ctx);
 }
 
-fn substitute_op_types(op: &mut HirOp, param_map: &HashMap<TypeId, TypeId>, type_ctx: &mut TypeCtx) {
+fn substitute_op_types(
+    op: &mut HirOp,
+    param_map: &HashMap<TypeId, TypeId>,
+    type_ctx: &mut TypeCtx,
+) {
     match op {
         HirOp::Const(c) => substitute_const_types(c, param_map, type_ctx),
         HirOp::Move { v }
@@ -696,7 +668,9 @@ fn substitute_op_types(op: &mut HirOp, param_map: &HashMap<TypeId, TypeId>, type
             substitute_value_types(start, param_map, type_ctx);
             substitute_value_types(end, param_map, type_ctx);
         }
-        HirOp::ArrMap { arr, func } | HirOp::ArrFilter { arr, func } | HirOp::ArrForeach { arr, func } => {
+        HirOp::ArrMap { arr, func }
+        | HirOp::ArrFilter { arr, func }
+        | HirOp::ArrForeach { arr, func } => {
             substitute_value_types(arr, param_map, type_ctx);
             substitute_value_types(func, param_map, type_ctx);
         }
@@ -751,7 +725,10 @@ fn substitute_op_types(op: &mut HirOp, param_map: &HashMap<TypeId, TypeId>, type
             *ty = substitute_type(*ty, param_map, type_ctx);
             substitute_value_types(s, param_map, type_ctx);
         }
-        HirOp::GpuThreadId | HirOp::GpuWorkgroupId | HirOp::GpuWorkgroupSize | HirOp::GpuGlobalId => {}
+        HirOp::GpuThreadId
+        | HirOp::GpuWorkgroupId
+        | HirOp::GpuWorkgroupSize
+        | HirOp::GpuGlobalId => {}
         HirOp::GpuBufferLoad { buf, idx } => {
             substitute_value_types(buf, param_map, type_ctx);
             substitute_value_types(idx, param_map, type_ctx);
@@ -797,6 +774,12 @@ fn substitute_void_op_types(
             for ty in inst {
                 *ty = substitute_type(*ty, param_map, type_ctx);
             }
+            for arg in args {
+                substitute_value_types(arg, param_map, type_ctx);
+            }
+        }
+        HirOpVoid::CallVoidIndirect { callee, args } => {
+            substitute_value_types(callee, param_map, type_ctx);
             for arg in args {
                 substitute_value_types(arg, param_map, type_ctx);
             }
@@ -982,5 +965,118 @@ fn substitute_heap_base(
                 .map(|t| substitute_type(t, param_map, type_ctx))
                 .collect(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magpie_types::fixed_type_ids;
+
+    #[test]
+    fn collect_generic_call_keys_captures_all_generic_call_sites() {
+        let generic_call_key = InstanceKey {
+            callee_sid: Sid("F:callee".to_string()),
+            type_args: vec![fixed_type_ids::I32],
+        };
+        let suspend_key = InstanceKey {
+            callee_sid: Sid("F:async_callee".to_string()),
+            type_args: vec![fixed_type_ids::I64, fixed_type_ids::U64],
+        };
+        let void_key = InstanceKey {
+            callee_sid: Sid("F:void_callee".to_string()),
+            type_args: vec![fixed_type_ids::BOOL],
+        };
+
+        let func = HirFunction {
+            fn_id: FnId(0),
+            sid: Sid("F:test".to_string()),
+            name: "test".to_string(),
+            params: Vec::new(),
+            ret_ty: fixed_type_ids::UNIT,
+            blocks: vec![HirBlock {
+                id: magpie_hir::BlockId(0),
+                instrs: vec![
+                    HirInstr {
+                        dst: magpie_hir::LocalId(1),
+                        ty: fixed_type_ids::I32,
+                        op: HirOp::Call {
+                            callee_sid: generic_call_key.callee_sid.clone(),
+                            inst: generic_call_key.type_args.clone(),
+                            args: Vec::new(),
+                        },
+                    },
+                    HirInstr {
+                        dst: magpie_hir::LocalId(2),
+                        ty: fixed_type_ids::I32,
+                        op: HirOp::Call {
+                            callee_sid: generic_call_key.callee_sid.clone(),
+                            inst: generic_call_key.type_args.clone(),
+                            args: Vec::new(),
+                        },
+                    },
+                    HirInstr {
+                        dst: magpie_hir::LocalId(3),
+                        ty: fixed_type_ids::UNIT,
+                        op: HirOp::SuspendCall {
+                            callee_sid: suspend_key.callee_sid.clone(),
+                            inst: suspend_key.type_args.clone(),
+                            args: Vec::new(),
+                        },
+                    },
+                    HirInstr {
+                        dst: magpie_hir::LocalId(4),
+                        ty: fixed_type_ids::I32,
+                        op: HirOp::Call {
+                            callee_sid: Sid("F:non_generic".to_string()),
+                            inst: Vec::new(),
+                            args: Vec::new(),
+                        },
+                    },
+                ],
+                void_ops: vec![HirOpVoid::CallVoid {
+                    callee_sid: void_key.callee_sid.clone(),
+                    inst: void_key.type_args.clone(),
+                    args: Vec::new(),
+                }],
+                terminator: HirTerminator::Ret(None),
+            }],
+            is_async: false,
+            is_unsafe: false,
+        };
+
+        let mut out = HashSet::new();
+        collect_generic_call_keys(&func, &mut out);
+
+        assert_eq!(out.len(), 3, "duplicate call keys should collapse");
+        assert!(out.contains(&generic_call_key));
+        assert!(out.contains(&suspend_key));
+        assert!(out.contains(&void_key));
+    }
+
+    #[test]
+    fn instance_id_and_specialized_ids_are_deterministic() {
+        let type_ctx = TypeCtx::new();
+        let sid = Sid("F:generic.add".to_string());
+
+        let inst_a = instance_id(&sid, &[fixed_type_ids::I32], &type_ctx);
+        let inst_a_again = instance_id(&sid, &[fixed_type_ids::I32], &type_ctx);
+        let inst_b = instance_id(&sid, &[fixed_type_ids::I64], &type_ctx);
+
+        assert_eq!(inst_a, inst_a_again);
+        assert_ne!(inst_a, inst_b);
+        assert!(inst_a.starts_with("I:"));
+        assert_eq!(inst_a.len(), 18);
+
+        let specialized_sid_value = specialized_sid(&sid, &inst_a);
+        let specialized_name_value = specialized_name("generic.add", &inst_a);
+        assert_eq!(
+            specialized_sid_value.0,
+            format!("{}$I${}", sid.0, inst_a.trim_start_matches("I:"))
+        );
+        assert_eq!(
+            specialized_name_value,
+            format!("generic.add$I${}", inst_a.trim_start_matches("I:"))
+        );
     }
 }

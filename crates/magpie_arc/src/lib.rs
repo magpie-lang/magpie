@@ -2,8 +2,8 @@
 
 use magpie_diag::{Diagnostic, DiagnosticBag, Severity};
 use magpie_mpir::{
-    HandleKind, HeapBase, LocalId, MpirBlock, MpirFn, MpirInstr, MpirLocalDecl, MpirModule,
-    MpirOp, MpirOpVoid, MpirTerminator, MpirValue, TypeCtx, TypeId, TypeKind,
+    HandleKind, HeapBase, LocalId, MpirBlock, MpirFn, MpirInstr, MpirLocalDecl, MpirModule, MpirOp,
+    MpirOpVoid, MpirTerminator, MpirValue, TypeCtx, TypeId, TypeKind,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -20,12 +20,6 @@ struct LivenessAnalysis {
     live_in: Vec<HashSet<LocalId>>,
     live_out: Vec<HashSet<LocalId>>,
     block_defs: Vec<HashSet<LocalId>>,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum DropKind {
-    Strong,
-    Weak,
 }
 
 pub fn insert_arc_ops(
@@ -149,7 +143,7 @@ fn insert_arc_ops_for_fn(
     let track_move_locals: HashSet<LocalId> = local_types
         .iter()
         .filter_map(|(l, ty)| {
-            if drop_kind_for_type(*ty, type_ctx, module_types).is_some() {
+            if type_contains_heap_handles(*ty, type_ctx, module_types) {
                 Some(*l)
             } else {
                 None
@@ -173,7 +167,7 @@ fn insert_arc_ops_for_fn(
             match op {
                 MpirOpVoid::SetField { obj, field, value } => {
                     if let Some(field_ty) = value_type(&value, &local_types) {
-                        if drop_kind_for_type(field_ty, type_ctx, module_types).is_some() {
+                        if type_contains_heap_handles(field_ty, type_ctx, module_types) {
                             let old_local = LocalId(next_local);
                             next_local += 1;
 
@@ -213,6 +207,107 @@ fn insert_arc_ops_for_fn(
                     }
 
                     new_void_ops.push(MpirOpVoid::SetField { obj, field, value });
+                }
+                MpirOpVoid::ArrSet { arr, idx, val } => {
+                    if let Some(elem_ty) = value_type(&val, &local_types) {
+                        if type_contains_heap_handles(elem_ty, type_ctx, module_types) {
+                            let old_local = LocalId(next_local);
+                            next_local += 1;
+
+                            func.locals.push(MpirLocalDecl {
+                                id: old_local,
+                                ty: elem_ty,
+                                name: format!("__arc_old_{}", old_local.0),
+                            });
+                            local_types.insert(old_local, elem_ty);
+
+                            generated_instrs.push(MpirInstr {
+                                dst: old_local,
+                                ty: elem_ty,
+                                op: MpirOp::ArrGet {
+                                    arr: arr.clone(),
+                                    idx: idx.clone(),
+                                },
+                            });
+
+                            emit_drop_for_value(
+                                MpirValue::Local(old_local),
+                                elem_ty,
+                                type_ctx,
+                                module_types,
+                                &mut new_void_ops,
+                            );
+                        }
+                    } else {
+                        emit_error(
+                            diag,
+                            "MPA0005",
+                            &format!(
+                                "ARC insertion: cannot resolve arr.set value type in fn '{}', bb{}",
+                                func.name, block.id.0
+                            ),
+                        );
+                    }
+
+                    new_void_ops.push(MpirOpVoid::ArrSet { arr, idx, val });
+                }
+                MpirOpVoid::MapSet { map, key, val } => {
+                    if let Some(val_ty) = value_type(&val, &local_types) {
+                        if type_contains_heap_handles(val_ty, type_ctx, module_types) {
+                            let Some(opt_val_ty) =
+                                find_option_type_id(val_ty, type_ctx, module_types)
+                            else {
+                                emit_error(
+                                    diag,
+                                    "MPA0006",
+                                    &format!(
+                                        "ARC insertion: cannot resolve TOption<{}> for map.set overwrite in fn '{}', bb{}",
+                                        val_ty.0, func.name, block.id.0
+                                    ),
+                                );
+                                new_void_ops.push(MpirOpVoid::MapSet { map, key, val });
+                                continue;
+                            };
+
+                            let old_local = LocalId(next_local);
+                            next_local += 1;
+
+                            func.locals.push(MpirLocalDecl {
+                                id: old_local,
+                                ty: opt_val_ty,
+                                name: format!("__arc_old_{}", old_local.0),
+                            });
+                            local_types.insert(old_local, opt_val_ty);
+
+                            generated_instrs.push(MpirInstr {
+                                dst: old_local,
+                                ty: opt_val_ty,
+                                op: MpirOp::MapDelete {
+                                    map: map.clone(),
+                                    key: key.clone(),
+                                },
+                            });
+
+                            emit_drop_for_value(
+                                MpirValue::Local(old_local),
+                                opt_val_ty,
+                                type_ctx,
+                                module_types,
+                                &mut new_void_ops,
+                            );
+                        }
+                    } else {
+                        emit_error(
+                            diag,
+                            "MPA0007",
+                            &format!(
+                                "ARC insertion: cannot resolve map.set value type in fn '{}', bb{}",
+                                func.name, block.id.0
+                            ),
+                        );
+                    }
+
+                    new_void_ops.push(MpirOpVoid::MapSet { map, key, val });
                 }
                 _ => new_void_ops.push(op),
             }
@@ -266,10 +361,9 @@ fn optimize_arc_void_ops(void_ops: &mut Vec<MpirOpVoid>) {
             (MpirOpVoid::ArcRelease { v: vr }, Some(MpirOpVoid::ArcRetain { v: vt })) => {
                 same_value(vr, vt)
             }
-            (
-                MpirOpVoid::ArcReleaseWeak { v: vr },
-                Some(MpirOpVoid::ArcRetainWeak { v: vt }),
-            ) => same_value(vr, vt),
+            (MpirOpVoid::ArcReleaseWeak { v: vr }, Some(MpirOpVoid::ArcRetainWeak { v: vt })) => {
+                same_value(vr, vt)
+            }
             _ => false,
         };
 
@@ -505,9 +599,12 @@ fn lookup_type_kind<'a>(
     type_ctx: &'a TypeCtx,
     module_types: &'a [(TypeId, TypeKind)],
 ) -> Option<&'a TypeKind> {
-    type_ctx
-        .lookup(ty)
-        .or_else(|| module_types.iter().find(|(id, _)| *id == ty).map(|(_, kind)| kind))
+    type_ctx.lookup(ty).or_else(|| {
+        module_types
+            .iter()
+            .find(|(id, _)| *id == ty)
+            .map(|(_, kind)| kind)
+    })
 }
 
 fn ensure_shared_type_id(
@@ -534,24 +631,23 @@ fn ensure_shared_type_id(
     None
 }
 
-fn drop_kind_for_type(
-    ty: TypeId,
+fn find_option_type_id(
+    inner_ty: TypeId,
     type_ctx: &TypeCtx,
     module_types: &[(TypeId, TypeKind)],
-) -> Option<DropKind> {
-    let kind = lookup_type_kind(ty, type_ctx, module_types)?;
-    match kind {
-        TypeKind::HeapHandle {
-            hk: HandleKind::Unique | HandleKind::Shared,
-            ..
-        } => Some(DropKind::Strong),
-        TypeKind::HeapHandle {
-            hk: HandleKind::Weak,
-            ..
-        } => Some(DropKind::Weak),
-        TypeKind::BuiltinOption { inner } => drop_kind_for_type(*inner, type_ctx, module_types),
-        _ => None,
+) -> Option<TypeId> {
+    if let Some((id, _)) = module_types.iter().find(|(_, kind)| {
+        matches!(kind, TypeKind::BuiltinOption { inner } if *inner == inner_ty)
+    }) {
+        return Some(*id);
     }
+    type_ctx.types.iter().find_map(|(id, kind)| {
+        if matches!(kind, TypeKind::BuiltinOption { inner } if *inner == inner_ty) {
+            Some(*id)
+        } else {
+            None
+        }
+    })
 }
 
 fn emit_drop_for_value(
@@ -561,11 +657,82 @@ fn emit_drop_for_value(
     module_types: &[(TypeId, TypeKind)],
     out: &mut Vec<MpirOpVoid>,
 ) {
-    match drop_kind_for_type(ty, type_ctx, module_types) {
-        Some(DropKind::Strong) => out.push(MpirOpVoid::ArcRelease { v }),
-        Some(DropKind::Weak) => out.push(MpirOpVoid::ArcReleaseWeak { v }),
-        None => {}
+    let mut needs = DropNeeds::default();
+    collect_drop_needs(
+        ty,
+        type_ctx,
+        module_types,
+        &mut HashSet::new(),
+        &mut needs,
+    );
+
+    if needs.strong {
+        out.push(MpirOpVoid::ArcRelease { v: v.clone() });
     }
+    if needs.weak {
+        out.push(MpirOpVoid::ArcReleaseWeak { v });
+    }
+}
+
+fn type_contains_heap_handles(ty: TypeId, type_ctx: &TypeCtx, module_types: &[(TypeId, TypeKind)]) -> bool {
+    let mut needs = DropNeeds::default();
+    collect_drop_needs(
+        ty,
+        type_ctx,
+        module_types,
+        &mut HashSet::new(),
+        &mut needs,
+    );
+    needs.strong || needs.weak
+}
+
+#[derive(Default)]
+struct DropNeeds {
+    strong: bool,
+    weak: bool,
+}
+
+fn collect_drop_needs(
+    ty: TypeId,
+    type_ctx: &TypeCtx,
+    module_types: &[(TypeId, TypeKind)],
+    visiting: &mut HashSet<TypeId>,
+    out: &mut DropNeeds,
+) {
+    if !visiting.insert(ty) {
+        return;
+    }
+
+    if let Some(kind) = lookup_type_kind(ty, type_ctx, module_types) {
+        match kind {
+            TypeKind::HeapHandle {
+                hk: HandleKind::Unique | HandleKind::Shared | HandleKind::Borrow | HandleKind::MutBorrow,
+                ..
+            } => out.strong = true,
+            TypeKind::HeapHandle {
+                hk: HandleKind::Weak,
+                ..
+            } => out.weak = true,
+            TypeKind::BuiltinOption { inner } => {
+                collect_drop_needs(*inner, type_ctx, module_types, visiting, out);
+            }
+            TypeKind::BuiltinResult { ok, err } => {
+                collect_drop_needs(*ok, type_ctx, module_types, visiting, out);
+                collect_drop_needs(*err, type_ctx, module_types, visiting, out);
+            }
+            TypeKind::Arr { elem, .. } | TypeKind::Vec { elem, .. } => {
+                collect_drop_needs(*elem, type_ctx, module_types, visiting, out);
+            }
+            TypeKind::Tuple { elems } => {
+                for elem in elems {
+                    collect_drop_needs(*elem, type_ctx, module_types, visiting, out);
+                }
+            }
+            TypeKind::Prim(_) | TypeKind::RawPtr { .. } | TypeKind::ValueStruct { .. } => {}
+        }
+    }
+
+    visiting.remove(&ty);
 }
 
 fn next_local_id(func: &MpirFn) -> u32 {
@@ -828,7 +995,7 @@ fn op_void_consumed_locals(op: &MpirOpVoid) -> Vec<LocalId> {
     };
 
     match op {
-        MpirOpVoid::CallVoid { args, .. } => {
+        MpirOpVoid::CallVoid { args, .. } | MpirOpVoid::CallVoidIndirect { args, .. } => {
             for v in args {
                 push(v, &mut out);
             }
@@ -1077,6 +1244,12 @@ fn for_each_value_in_void_op(op: &MpirOpVoid, mut f: impl FnMut(&MpirValue)) {
                 f(arg);
             }
         }
+        MpirOpVoid::CallVoidIndirect { callee, args } => {
+            f(callee);
+            for arg in args {
+                f(arg);
+            }
+        }
         MpirOpVoid::SetField { obj, value, .. } => {
             f(obj);
             f(value);
@@ -1161,7 +1334,7 @@ fn emit_error(diag: &mut DiagnosticBag, code: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magpie_types::{BlockId, Sid};
+    use magpie_types::{fixed_type_ids, BlockId, Sid};
 
     #[test]
     fn test_arc_insertion_on_clone_shared() {
@@ -1261,6 +1434,156 @@ mod tests {
         assert!(
             module.functions[0].blocks[0].void_ops.is_empty(),
             "expected retain/release pair to be removed"
+        );
+    }
+
+    #[test]
+    fn test_arc_overwrite_inserts_release_before_writes() {
+        let mut type_ctx = TypeCtx::new();
+        let obj_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::MutBorrow,
+            base: HeapBase::UserType {
+                type_sid: Sid("T:ARCOVRW000".to_string()),
+                targs: vec![],
+            },
+        });
+        let arr_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::MutBorrow,
+            base: HeapBase::BuiltinArray {
+                elem: fixed_type_ids::STR,
+            },
+        });
+        let map_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::MutBorrow,
+            base: HeapBase::BuiltinMap {
+                key: fixed_type_ids::I32,
+                val: fixed_type_ids::STR,
+            },
+        });
+        let option_str = type_ctx.intern(TypeKind::BuiltinOption {
+            inner: fixed_type_ids::STR,
+        });
+        let zero = MpirValue::Const(magpie_mpir::HirConst {
+            ty: fixed_type_ids::I32,
+            lit: magpie_mpir::HirConstLit::IntLit(0),
+        });
+
+        let mut module = MpirModule {
+            sid: Sid("M:ARCOVRW000".to_string()),
+            path: "test.arc".to_string(),
+            type_table: magpie_mpir::MpirTypeTable {
+                types: vec![
+                    (
+                        option_str,
+                        TypeKind::BuiltinOption {
+                            inner: fixed_type_ids::STR,
+                        },
+                    ),
+                ],
+            },
+            functions: vec![MpirFn {
+                sid: Sid("F:ARCOVRW000".to_string()),
+                name: "overwrite".to_string(),
+                params: vec![
+                    (LocalId(0), obj_ty),
+                    (LocalId(1), arr_ty),
+                    (LocalId(2), map_ty),
+                    (LocalId(3), fixed_type_ids::STR),
+                    (LocalId(4), fixed_type_ids::STR),
+                    (LocalId(5), fixed_type_ids::STR),
+                ],
+                ret_ty: fixed_type_ids::UNIT,
+                blocks: vec![MpirBlock {
+                    id: BlockId(0),
+                    instrs: vec![],
+                    void_ops: vec![
+                        MpirOpVoid::SetField {
+                            obj: MpirValue::Local(LocalId(0)),
+                            field: "value".to_string(),
+                            value: MpirValue::Local(LocalId(3)),
+                        },
+                        MpirOpVoid::ArrSet {
+                            arr: MpirValue::Local(LocalId(1)),
+                            idx: zero.clone(),
+                            val: MpirValue::Local(LocalId(4)),
+                        },
+                        MpirOpVoid::MapSet {
+                            map: MpirValue::Local(LocalId(2)),
+                            key: zero,
+                            val: MpirValue::Local(LocalId(5)),
+                        },
+                    ],
+                    terminator: MpirTerminator::Ret(None),
+                }],
+                locals: vec![],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let mut diag = DiagnosticBag::new(32);
+        let _ = insert_arc_ops(&mut module, &type_ctx, &mut diag);
+        assert!(
+            !diag.has_errors(),
+            "unexpected diagnostics during ARC insertion: {:?}",
+            diag.diagnostics
+        );
+
+        let block = &module.functions[0].blocks[0];
+        let mut old_field_local = None;
+        let mut old_arr_local = None;
+        let mut old_map_local = None;
+        for instr in &block.instrs {
+            match &instr.op {
+                MpirOp::GetField { field, .. } if field == "value" => old_field_local = Some(instr.dst),
+                MpirOp::ArrGet { .. } => old_arr_local = Some(instr.dst),
+                MpirOp::MapDelete { .. } => old_map_local = Some(instr.dst),
+                _ => {}
+            }
+        }
+
+        let old_field_local = old_field_local.expect("missing temp local for SetField overwrite");
+        let old_arr_local = old_arr_local.expect("missing temp local for ArrSet overwrite");
+        let old_map_local = old_map_local.expect("missing temp local for MapSet overwrite");
+
+        let set_idx = block
+            .void_ops
+            .iter()
+            .position(|op| matches!(op, MpirOpVoid::SetField { field, .. } if field == "value"))
+            .expect("missing SetField op");
+        let arr_idx = block
+            .void_ops
+            .iter()
+            .position(|op| matches!(op, MpirOpVoid::ArrSet { .. }))
+            .expect("missing ArrSet op");
+        let map_idx = block
+            .void_ops
+            .iter()
+            .position(|op| matches!(op, MpirOpVoid::MapSet { .. }))
+            .expect("missing MapSet op");
+
+        let has_release_before = |idx: usize, local: LocalId| {
+            block.void_ops[..idx].iter().any(|op| {
+                matches!(
+                    op,
+                    MpirOpVoid::ArcRelease {
+                        v: MpirValue::Local(l)
+                    } if *l == local
+                )
+            })
+        };
+
+        assert!(
+            has_release_before(set_idx, old_field_local),
+            "missing ArcRelease(old field) before SetField"
+        );
+        assert!(
+            has_release_before(arr_idx, old_arr_local),
+            "missing ArcRelease(old element) before ArrSet"
+        );
+        assert!(
+            has_release_before(map_idx, old_map_local),
+            "missing ArcRelease(old map value) before MapSet"
         );
     }
 }

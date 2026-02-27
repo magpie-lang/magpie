@@ -224,7 +224,13 @@ struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     fn new(file_id: FileId, source: &'a str, diag: &'a mut DiagnosticBag) -> Self {
-        Self { file_id, source, bytes: source.as_bytes(), pos: 0, diag }
+        Self {
+            file_id,
+            source,
+            bytes: source.as_bytes(),
+            pos: 0,
+            diag,
+        }
     }
 
     fn lex_all(mut self) -> Vec<Token> {
@@ -357,7 +363,11 @@ impl<'a> Lexer<'a> {
                 }
             }
             if self.pos == hex_start {
-                self.emit_mpp0001(start, self.pos, "Hex literal requires at least one digit.".into());
+                self.emit_mpp0001(
+                    start,
+                    self.pos,
+                    "Hex literal requires at least one digit.".into(),
+                );
             }
             let text = self.source[start..self.pos].to_string();
             return Token::new(TokenKind::IntLit, self.span(start, self.pos), text);
@@ -372,7 +382,9 @@ impl<'a> Lexer<'a> {
         }
 
         let mut kind = TokenKind::IntLit;
-        if self.peek_byte() == Some(b'.') && self.peek_next_byte().is_some_and(|b| b.is_ascii_digit()) {
+        if self.peek_byte() == Some(b'.')
+            && self.peek_next_byte().is_some_and(|b| b.is_ascii_digit())
+        {
             kind = TokenKind::FloatLit;
             self.pos += 1;
             while let Some(b) = self.peek_byte() {
@@ -434,7 +446,11 @@ impl<'a> Lexer<'a> {
             '"' => Some('"'),
             'u' => self.lex_unicode_escape(esc_start),
             _ => {
-                self.emit_mpp0001(esc_start, self.pos, format!("Unknown escape sequence `\\{}`.", ch));
+                self.emit_mpp0001(
+                    esc_start,
+                    self.pos,
+                    format!("Unknown escape sequence `\\{}`.", ch),
+                );
                 None
             }
         }
@@ -458,18 +474,29 @@ impl<'a> Lexer<'a> {
         let digits_end = self.pos;
 
         if self.peek_byte() != Some(b'}') {
-            self.emit_mpp0001(esc_start, self.pos, "Expected `}` to close unicode escape.".into());
+            self.emit_mpp0001(
+                esc_start,
+                self.pos,
+                "Expected `}` to close unicode escape.".into(),
+            );
             return None;
         }
         self.pos += 1; // }
 
         if digits_start == digits_end {
-            self.emit_mpp0001(esc_start, self.pos, "Unicode escape requires digits.".into());
+            self.emit_mpp0001(
+                esc_start,
+                self.pos,
+                "Unicode escape requires digits.".into(),
+            );
             return None;
         }
 
         let digits = &self.source[digits_start..digits_end];
-        match u32::from_str_radix(digits, 16).ok().and_then(char::from_u32) {
+        match u32::from_str_radix(digits, 16)
+            .ok()
+            .and_then(char::from_u32)
+        {
             Some(ch) => Some(ch),
             None => {
                 self.emit_mpp0001(esc_start, self.pos, "Invalid unicode scalar value.".into());
@@ -501,7 +528,11 @@ impl<'a> Lexer<'a> {
                 }
                 if dotted.starts_with("const.") {
                     self.pos = dotted_end;
-                    return Token::new(TokenKind::ConstOp, self.span(start, self.pos), String::new());
+                    return Token::new(
+                        TokenKind::ConstOp,
+                        self.span(start, self.pos),
+                        String::new(),
+                    );
                 }
             }
         }
@@ -511,14 +542,26 @@ impl<'a> Lexer<'a> {
         }
 
         if plain.starts_with('T') && plain.len() > 1 && is_ident_start(plain.as_bytes()[1]) {
-            return Token::new(TokenKind::TypeName, self.span(start, plain_end), plain.to_string());
+            return Token::new(
+                TokenKind::TypeName,
+                self.span(start, plain_end),
+                plain.to_string(),
+            );
         }
 
         if is_block_label(plain) {
-            return Token::new(TokenKind::BlockLabel, self.span(start, plain_end), plain.to_string());
+            return Token::new(
+                TokenKind::BlockLabel,
+                self.span(start, plain_end),
+                plain.to_string(),
+            );
         }
 
-        Token::new(TokenKind::Ident, self.span(start, plain_end), plain.to_string())
+        Token::new(
+            TokenKind::Ident,
+            self.span(start, plain_end),
+            plain.to_string(),
+        )
     }
 
     fn scan_dotted_end(&self, mut end: usize) -> usize {
@@ -611,7 +654,10 @@ fn is_ident_continue(b: u8) -> bool {
 
 fn is_block_label(text: &str) -> bool {
     let bytes = text.as_bytes();
-    bytes.len() >= 3 && bytes[0] == b'b' && bytes[1] == b'b' && bytes[2..].iter().all(|b| b.is_ascii_digit())
+    bytes.len() >= 3
+        && bytes[0] == b'b'
+        && bytes[1] == b'b'
+        && bytes[2..].iter().all(|b| b.is_ascii_digit())
 }
 
 fn keyword_kind(text: &str) -> Option<TokenKind> {
@@ -778,4 +824,65 @@ fn op_keyword_kind(text: &str) -> Option<TokenKind> {
         "panic" => TokenKind::Panic,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magpie_diag::DiagnosticBag;
+
+    #[test]
+    fn lexes_simple_program_into_expected_tokens() {
+        let source = "module demo\nfn @main(%x: TNum) -> TNum { bb0: true }";
+        let mut diag = DiagnosticBag::new(16);
+
+        let tokens = lex(FileId(1), source, &mut diag);
+        let kinds: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Module,
+                TokenKind::Ident,
+                TokenKind::Fn,
+                TokenKind::FnName,
+                TokenKind::LParen,
+                TokenKind::SsaName,
+                TokenKind::Colon,
+                TokenKind::TypeName,
+                TokenKind::RParen,
+                TokenKind::Arrow,
+                TokenKind::TypeName,
+                TokenKind::LBrace,
+                TokenKind::BlockLabel,
+                TokenKind::Colon,
+                TokenKind::True,
+                TokenKind::RBrace,
+                TokenKind::Eof,
+            ]
+        );
+
+        assert_eq!(tokens[1].text, "demo");
+        assert_eq!(tokens[3].text, "@main");
+        assert_eq!(tokens[5].text, "%x");
+        assert_eq!(tokens[7].text, "TNum");
+        assert_eq!(tokens[14].text, "true");
+        assert_eq!(diag.error_count(), 0, "valid source should lex without errors");
+    }
+
+    #[test]
+    fn lexes_doc_comments_and_skips_line_comments() {
+        let source = ";;; top level doc\n; plain comment\nmodule demo";
+        let mut diag = DiagnosticBag::new(8);
+
+        let tokens = lex(FileId(2), source, &mut diag);
+
+        assert_eq!(tokens[0].kind, TokenKind::DocComment);
+        assert_eq!(tokens[0].text, "top level doc");
+        assert_eq!(tokens[1].kind, TokenKind::Module);
+        assert_eq!(tokens[2].kind, TokenKind::Ident);
+        assert_eq!(tokens[2].text, "demo");
+        assert_eq!(tokens[3].kind, TokenKind::Eof);
+        assert_eq!(diag.error_count(), 0);
+    }
 }

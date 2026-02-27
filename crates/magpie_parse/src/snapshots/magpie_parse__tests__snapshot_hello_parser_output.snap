@@ -1,0 +1,16 @@
+---
+source: crates/magpie_parse/src/lib.rs
+assertion_line: 2798
+expression: "canonical_fixture(\"../../tests/fixtures/hello.mp\")"
+---
+module hello.main
+exports { @main }
+imports { std.io::{@println} }
+digest "0000000000000000"
+
+fn @main() -> i32 {
+  bb0:
+    %msg: Str = const.Str "Hello, world!"
+    call_void std.io.@println { args=[%msg] }
+    ret const.i64 0
+}

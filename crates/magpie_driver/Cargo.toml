@@ -3,6 +3,10 @@ name = "magpie_driver"
 version.workspace = true
 edition.workspace = true
 
+[[test]]
+name = "integration_test"
+path = "../../tests/integration_test.rs"
+
 [dependencies]
 magpie_ast = { path = "../magpie_ast" }
 magpie_lex = { path = "../magpie_lex" }
@@ -17,5 +21,7 @@ magpie_mpir = { path = "../magpie_mpir" }
 magpie_arc = { path = "../magpie_arc" }
 magpie_diag = { path = "../magpie_diag" }
 magpie_pkg = { path = "../magpie_pkg" }
+magpie_memory = { path = "../magpie_memory" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+regex = "1"

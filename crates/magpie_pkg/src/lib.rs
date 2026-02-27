@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -229,29 +230,37 @@ pub fn resolve_deps(manifest: &Manifest, offline: bool) -> Result<LockFile, Stri
                     ));
                 }
                 return Err(format!(
-                    "dependency '{}' is not a path dependency; only path dependencies are supported in v0.1",
+                    "dependency '{}' must use a detailed spec with either `path` or `git` in v0.1",
                     dep_name
                 ));
             }
         };
 
-        let dep_path = match dep.path.as_ref() {
-            Some(path) => path.clone(),
-            None => {
-                if offline {
-                    return Err(format!(
-                        "offline mode cannot resolve non-path dependency '{}'",
-                        dep_name
-                    ));
-                }
+        let (dep_path, source_kind, source_url, source_rev) = if let Some(path) = dep.path.as_ref()
+        {
+            (PathBuf::from(path), "path".to_string(), None, None)
+        } else if let Some(git_url) = dep.git.as_ref() {
+            let rev = dep
+                .rev
+                .clone()
+                .or_else(|| dep.version.clone())
+                .unwrap_or_else(|| "main".to_string());
+            let cloned_dir = resolve_git_dependency(&dep_name, git_url, &rev, offline)?;
+            (cloned_dir, "git".to_string(), Some(git_url.clone()), Some(rev))
+        } else {
+            if offline {
                 return Err(format!(
-                    "dependency '{}' is not a path dependency; only path dependencies are supported in v0.1",
+                    "offline mode cannot resolve non-path dependency '{}'",
                     dep_name
                 ));
             }
+            return Err(format!(
+                "dependency '{}' must set either `path` or `git` in v0.1",
+                dep_name
+            ));
         };
 
-        let dep_manifest_path = PathBuf::from(&dep_path).join("Magpie.toml");
+        let dep_manifest_path = dep_path.join("Magpie.toml");
         let (resolved_name, resolved_version) = if dep_manifest_path.is_file() {
             match parse_manifest(&dep_manifest_path) {
                 Ok(m) => (m.package.name, m.package.version),
@@ -269,18 +278,20 @@ pub fn resolve_deps(manifest: &Manifest, offline: bool) -> Result<LockFile, Stri
 
         let content_hash = stable_hash_hex(&format!(
             "{}|{}|{}",
-            resolved_name, resolved_version, dep_path
+            resolved_name,
+            resolved_version,
+            dep_path.to_string_lossy()
         ));
 
         packages.push(LockPackage {
             name: resolved_name,
             version: resolved_version,
             source: LockSource {
-                kind: "path".to_string(),
+                kind: source_kind,
                 registry: None,
-                url: None,
-                path: Some(dep_path),
-                rev: None,
+                url: source_url,
+                path: Some(dep_path.to_string_lossy().to_string()),
+                rev: source_rev,
             },
             content_hash,
             deps: Vec::new(),
@@ -297,6 +308,57 @@ pub fn resolve_deps(manifest: &Manifest, offline: bool) -> Result<LockFile, Stri
         },
         packages,
     })
+}
+
+fn resolve_git_dependency(
+    dep_name: &str,
+    git_url: &str,
+    rev: &str,
+    offline: bool,
+) -> Result<PathBuf, String> {
+    if offline {
+        return Err(format!(
+            "offline mode cannot resolve git dependency '{}'",
+            dep_name
+        ));
+    }
+
+    let hash = stable_hash_hex(&format!("{dep_name}|{git_url}|{rev}"));
+    let cache_dir = PathBuf::from(".magpie").join("deps");
+    let target_dir = cache_dir.join(format!("{dep_name}-{hash}"));
+
+    if target_dir.is_dir() {
+        return Ok(target_dir);
+    }
+    if target_dir.exists() {
+        return Err(format!(
+            "dependency cache path '{}' exists but is not a directory",
+            target_dir.display()
+        ));
+    }
+
+    fs::create_dir_all(&cache_dir)
+        .map_err(|e| format!("failed to create cache directory '{}': {}", cache_dir.display(), e))?;
+
+    let status = Command::new("git")
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg("--branch")
+        .arg(rev)
+        .arg(git_url)
+        .arg(&target_dir)
+        .status()
+        .map_err(|e| format!("failed to run git clone for dependency '{}': {}", dep_name, e))?;
+
+    if !status.success() {
+        return Err(format!(
+            "git clone failed for dependency '{}' from '{}' at '{}' with status {}",
+            dep_name, git_url, rev, status
+        ));
+    }
+
+    Ok(target_dir)
 }
 
 pub fn resolve_features(manifest: &Manifest, active: &[String]) -> Vec<String> {
@@ -378,4 +440,82 @@ fn stable_hash_hex(input: &str) -> String {
         hash = hash.wrapping_mul(PRIME);
     }
     format!("{:016x}", hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_temp_manifest(contents: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "magpie_pkg_manifest_{}_{}.toml",
+            std::process::id(),
+            unique
+        ));
+        fs::write(&path, contents).expect("failed to write temporary manifest");
+        path
+    }
+
+    #[test]
+    fn parse_manifest_reads_core_sections_and_dependencies() {
+        let manifest_text = r#"
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024"
+
+[build]
+entry = "src/main.mp"
+profile_default = "dev"
+max_mono_instances = 128
+
+[dependencies]
+util = { path = "../util", version = "1.2.3", features = ["serde"], optional = true }
+
+[features]
+default = { modules = ["core.main", "core.util"] }
+"#;
+        let path = write_temp_manifest(manifest_text);
+        let parsed = parse_manifest(&path).expect("manifest should parse");
+
+        assert_eq!(parsed.package.name, "demo");
+        assert_eq!(parsed.package.version, "0.1.0");
+        assert_eq!(parsed.build.entry, "src/main.mp");
+        assert_eq!(parsed.build.max_mono_instances, Some(128));
+        assert!(parsed.dependencies.contains_key("util"));
+
+        match parsed.dependencies.get("util") {
+            Some(DependencySpec::Detail(dep)) => {
+                assert_eq!(dep.path.as_deref(), Some("../util"));
+                assert_eq!(dep.version.as_deref(), Some("1.2.3"));
+                assert_eq!(dep.features, vec!["serde".to_string()]);
+                assert!(dep.optional);
+            }
+            _ => panic!("expected detailed dependency spec for util"),
+        }
+
+        let enabled_modules = resolve_features(&parsed, &[String::from("default")]);
+        assert_eq!(enabled_modules, vec!["core.main", "core.util"]);
+
+        fs::remove_file(path).expect("failed to remove temporary manifest");
+    }
+
+    #[test]
+    fn parse_manifest_reports_invalid_toml() {
+        let path = write_temp_manifest("[package]\nname = 42\n");
+        let err = parse_manifest(&path).expect_err("invalid manifest should fail");
+
+        assert!(err.contains("failed to parse manifest"));
+        assert!(
+            err.contains(&path.display().to_string()),
+            "error should include the manifest path"
+        );
+
+        fs::remove_file(path).expect("failed to remove temporary manifest");
+    }
 }

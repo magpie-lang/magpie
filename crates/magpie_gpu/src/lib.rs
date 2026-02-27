@@ -46,7 +46,11 @@ pub struct KernelEntry {
 }
 
 /// Enforce `gpu fn` restrictions from §31.3.
-pub fn validate_kernel(func: &MpirFn, type_ctx: &TypeCtx, diag: &mut DiagnosticBag) -> Result<(), ()> {
+pub fn validate_kernel(
+    func: &MpirFn,
+    type_ctx: &TypeCtx,
+    diag: &mut DiagnosticBag,
+) -> Result<(), ()> {
     let before = diag.error_count();
 
     check_kernel_type(func.ret_ty, type_ctx, diag, "kernel return type");
@@ -124,6 +128,13 @@ pub fn validate_kernel(func: &MpirFn, type_ctx: &TypeCtx, diag: &mut DiagnosticB
                         emit_kernel_error(diag, "MPG1103", "recursive kernel calls are forbidden");
                     }
                 }
+                MpirOpVoid::CallVoidIndirect { .. } => {
+                    emit_kernel_error(
+                        diag,
+                        "MPG1102",
+                        "TCallable/dynamic dispatch is forbidden in gpu kernels",
+                    );
+                }
                 MpirOpVoid::ArcRetain { .. }
                 | MpirOpVoid::ArcRelease { .. }
                 | MpirOpVoid::ArcRetainWeak { .. }
@@ -136,7 +147,6 @@ pub fn validate_kernel(func: &MpirFn, type_ctx: &TypeCtx, diag: &mut DiagnosticB
                 }
                 _ => {}
             }
-
         }
 
         if let MpirTerminator::Switch { arms, .. } = &block.terminator {
@@ -257,18 +267,18 @@ fn scalar_size_bytes_inner(ty: TypeId, type_ctx: &TypeCtx, seen: &mut HashSet<Ty
     let size = match type_ctx.lookup(ty) {
         Some(TypeKind::Prim(p)) => prim_size_bytes(*p),
         Some(TypeKind::HeapHandle { .. }) | Some(TypeKind::RawPtr { .. }) => 8,
-        Some(TypeKind::BuiltinOption { inner }) => scalar_size_bytes_inner(*inner, type_ctx, seen).saturating_add(1),
-        Some(TypeKind::BuiltinResult { ok, err }) => {
-            1_u32
-                .saturating_add(scalar_size_bytes_inner(*ok, type_ctx, seen))
-                .saturating_add(scalar_size_bytes_inner(*err, type_ctx, seen))
+        Some(TypeKind::BuiltinOption { inner }) => {
+            scalar_size_bytes_inner(*inner, type_ctx, seen).saturating_add(1)
         }
+        Some(TypeKind::BuiltinResult { ok, err }) => 1_u32
+            .saturating_add(scalar_size_bytes_inner(*ok, type_ctx, seen))
+            .saturating_add(scalar_size_bytes_inner(*err, type_ctx, seen)),
         Some(TypeKind::Arr { n, elem }) | Some(TypeKind::Vec { n, elem }) => {
             n.saturating_mul(scalar_size_bytes_inner(*elem, type_ctx, seen))
         }
-        Some(TypeKind::Tuple { elems }) => elems
-            .iter()
-            .fold(0_u32, |acc, e| acc.saturating_add(scalar_size_bytes_inner(*e, type_ctx, seen))),
+        Some(TypeKind::Tuple { elems }) => elems.iter().fold(0_u32, |acc, e| {
+            acc.saturating_add(scalar_size_bytes_inner(*e, type_ctx, seen))
+        }),
         Some(TypeKind::ValueStruct { .. }) | None => 0,
     };
 
@@ -290,12 +300,26 @@ fn prim_size_bytes(prim: PrimType) -> u32 {
 
 fn check_kernel_type(ty: TypeId, type_ctx: &TypeCtx, diag: &mut DiagnosticBag, where_: &str) {
     match forbidden_kernel_type(ty, type_ctx, &mut HashSet::new()) {
-        Some("Str") => emit_kernel_error(diag, "MPG1104", &format!("{where_}: Str is not allowed in gpu kernels")),
-        Some("Array") => emit_kernel_error(diag, "MPG1105", &format!("{where_}: Array is not allowed in gpu kernels")),
-        Some("Map") => emit_kernel_error(diag, "MPG1106", &format!("{where_}: Map is not allowed in gpu kernels")),
-        Some("TCallable") => {
-            emit_kernel_error(diag, "MPG1107", &format!("{where_}: TCallable is not allowed in gpu kernels"))
-        }
+        Some("Str") => emit_kernel_error(
+            diag,
+            "MPG1104",
+            &format!("{where_}: Str is not allowed in gpu kernels"),
+        ),
+        Some("Array") => emit_kernel_error(
+            diag,
+            "MPG1105",
+            &format!("{where_}: Array is not allowed in gpu kernels"),
+        ),
+        Some("Map") => emit_kernel_error(
+            diag,
+            "MPG1106",
+            &format!("{where_}: Map is not allowed in gpu kernels"),
+        ),
+        Some("TCallable") => emit_kernel_error(
+            diag,
+            "MPG1107",
+            &format!("{where_}: TCallable is not allowed in gpu kernels"),
+        ),
         _ => {}
     }
 }
@@ -320,18 +344,21 @@ fn forbidden_kernel_type<'a>(
             | HeapBase::BuiltinCell { inner }
             | HeapBase::BuiltinFuture { result: inner }
             | HeapBase::BuiltinChannelSend { elem: inner }
-            | HeapBase::BuiltinChannelRecv { elem: inner } => forbidden_kernel_type(*inner, type_ctx, seen),
+            | HeapBase::BuiltinChannelRecv { elem: inner } => {
+                forbidden_kernel_type(*inner, type_ctx, seen)
+            }
             HeapBase::BuiltinStrBuilder | HeapBase::UserType { .. } => None,
         },
         Some(TypeKind::BuiltinOption { inner }) => forbidden_kernel_type(*inner, type_ctx, seen),
-        Some(TypeKind::BuiltinResult { ok, err }) => {
-            forbidden_kernel_type(*ok, type_ctx, seen).or_else(|| forbidden_kernel_type(*err, type_ctx, seen))
-        }
+        Some(TypeKind::BuiltinResult { ok, err }) => forbidden_kernel_type(*ok, type_ctx, seen)
+            .or_else(|| forbidden_kernel_type(*err, type_ctx, seen)),
         Some(TypeKind::RawPtr { to }) => forbidden_kernel_type(*to, type_ctx, seen),
         Some(TypeKind::Arr { elem, .. }) | Some(TypeKind::Vec { elem, .. }) => {
             forbidden_kernel_type(*elem, type_ctx, seen)
         }
-        Some(TypeKind::Tuple { elems }) => elems.iter().find_map(|t| forbidden_kernel_type(*t, type_ctx, seen)),
+        Some(TypeKind::Tuple { elems }) => elems
+            .iter()
+            .find_map(|t| forbidden_kernel_type(*t, type_ctx, seen)),
         Some(TypeKind::Prim(_)) | Some(TypeKind::ValueStruct { .. }) | None => None,
     };
 
@@ -350,7 +377,9 @@ fn check_op_types(op: &MpirOp, type_ctx: &TypeCtx, diag: &mut DiagnosticBag) {
         | MpirOp::JsonEncode { ty, .. }
         | MpirOp::JsonDecode { ty, .. }
         | MpirOp::Phi { ty, .. } => check_kernel_type(*ty, type_ctx, diag, "kernel op type"),
-        MpirOp::ArrNew { elem_ty, .. } => check_kernel_type(*elem_ty, type_ctx, diag, "kernel array element type"),
+        MpirOp::ArrNew { elem_ty, .. } => {
+            check_kernel_type(*elem_ty, type_ctx, diag, "kernel array element type")
+        }
         MpirOp::MapNew { key_ty, val_ty } => {
             check_kernel_type(*key_ty, type_ctx, diag, "kernel map key type");
             check_kernel_type(*val_ty, type_ctx, diag, "kernel map value type");
@@ -366,7 +395,9 @@ fn check_op_types(op: &MpirOp, type_ctx: &TypeCtx, diag: &mut DiagnosticBag) {
 
 fn check_void_op_types(op: &MpirOpVoid, type_ctx: &TypeCtx, diag: &mut DiagnosticBag) {
     match op {
-        MpirOpVoid::PtrStore { to, .. } => check_kernel_type(*to, type_ctx, diag, "kernel void op type"),
+        MpirOpVoid::PtrStore { to, .. } => {
+            check_kernel_type(*to, type_ctx, diag, "kernel void op type")
+        }
         MpirOpVoid::CallVoid { inst, .. } => {
             for ty in inst {
                 check_kernel_type(*ty, type_ctx, diag, "kernel call instantiation type");
@@ -493,10 +524,12 @@ impl SpirvBuilder {
     const OP_BITWISE_OR: u16 = 197;
     const OP_BITWISE_XOR: u16 = 198;
     const OP_BITWISE_AND: u16 = 199;
+    const OP_PHI: u16 = 245;
     const OP_LABEL: u16 = 248;
     const OP_BRANCH: u16 = 249;
     const OP_BRANCH_CONDITIONAL: u16 = 250;
     const OP_RETURN: u16 = 253;
+    const OP_RETURN_VALUE: u16 = 254;
 
     const CAPABILITY_SHADER: u32 = 1;
     const ADDRESSING_MODEL_LOGICAL: u32 = 0;
@@ -529,10 +562,7 @@ impl SpirvBuilder {
     fn emit_kernel_module(&mut self, func: &MpirFn) {
         self.emit_header(Self::SPIRV_VERSION_1_6, 0);
         self.emit_capability(Self::CAPABILITY_SHADER);
-        self.emit_memory_model(
-            Self::ADDRESSING_MODEL_LOGICAL,
-            Self::MEMORY_MODEL_GLSL450,
-        );
+        self.emit_memory_model(Self::ADDRESSING_MODEL_LOGICAL, Self::MEMORY_MODEL_GLSL450);
 
         let mut state = SpirvKernelState::default();
         state.local_types = Self::collect_local_types(func);
@@ -658,7 +688,11 @@ impl SpirvBuilder {
         ids.ptr_input_vec3_int_ty = self.new_id();
         self.emit_inst(
             Self::OP_TYPE_POINTER,
-            &[ids.ptr_input_vec3_int_ty, Self::STORAGE_CLASS_INPUT, ids.vec3_int_ty],
+            &[
+                ids.ptr_input_vec3_int_ty,
+                Self::STORAGE_CLASS_INPUT,
+                ids.vec3_int_ty,
+            ],
         );
 
         ids.ptr_input_int_ty = self.new_id();
@@ -721,7 +755,10 @@ impl SpirvBuilder {
         );
 
         ids.const_bool_false = self.new_id();
-        self.emit_inst(Self::OP_CONSTANT_FALSE, &[ids.bool_ty, ids.const_bool_false]);
+        self.emit_inst(
+            Self::OP_CONSTANT_FALSE,
+            &[ids.bool_ty, ids.const_bool_false],
+        );
 
         ids.const_bool_true = self.new_id();
         self.emit_inst(Self::OP_CONSTANT_TRUE, &[ids.bool_ty, ids.const_bool_true]);
@@ -736,12 +773,7 @@ impl SpirvBuilder {
         );
         self.emit_inst(
             Self::OP_MEMBER_DECORATE,
-            &[
-                ids.storage_buffer_struct_ty,
-                0,
-                Self::DECORATION_OFFSET,
-                0,
-            ],
+            &[ids.storage_buffer_struct_ty, 0, Self::DECORATION_OFFSET, 0],
         );
 
         ids.global_invocation_id_var = self.new_id();
@@ -832,7 +864,7 @@ impl SpirvBuilder {
             self.emit_inst(Self::OP_LABEL, &[label]);
 
             for instr in &block.instrs {
-                self.emit_kernel_instr(instr, ids, state);
+                self.emit_kernel_instr(instr, ids, state, label);
             }
             for op in &block.void_ops {
                 self.emit_kernel_void_op(op, ids, state);
@@ -848,6 +880,7 @@ impl SpirvBuilder {
         instr: &magpie_mpir::MpirInstr,
         ids: &SpirvKernelIds,
         state: &mut SpirvKernelState,
+        current_label: u32,
     ) {
         match &instr.op {
             MpirOp::Const(c) => {
@@ -1097,6 +1130,27 @@ impl SpirvBuilder {
                     self.set_local_value(instr.dst.0, value_id, dst_ty, state);
                 }
             }
+            MpirOp::Phi { ty, incomings } => {
+                let phi_ty = self.spirv_scalar_for_type_id(*ty, ids);
+                let result_id = self.new_id();
+                let mut operands = Vec::with_capacity(2 + incomings.len() * 2);
+                operands.push(phi_ty);
+                operands.push(result_id);
+
+                for (pred_bb, incoming) in incomings {
+                    let incoming_id = self.resolve_value(incoming, phi_ty, ids, state);
+                    let pred_label = state
+                        .block_labels
+                        .get(&pred_bb.0)
+                        .copied()
+                        .unwrap_or(current_label);
+                    operands.push(incoming_id);
+                    operands.push(pred_label);
+                }
+
+                self.emit_inst(Self::OP_PHI, &operands);
+                self.set_local_value(instr.dst.0, result_id, phi_ty, state);
+            }
 
             _ => {
                 if !Self::is_buffer_type(instr.ty) {
@@ -1162,7 +1216,12 @@ impl SpirvBuilder {
         current_label: u32,
     ) {
         match term {
-            MpirTerminator::Ret(_) => {
+            MpirTerminator::Ret(Some(v)) => {
+                let ret_ty = self.infer_value_type(v, ids, state);
+                let ret_id = self.resolve_value(v, ret_ty, ids, state);
+                self.emit_inst(Self::OP_RETURN_VALUE, &[ret_id]);
+            }
+            MpirTerminator::Ret(None) => {
                 self.emit_inst(Self::OP_RETURN, &[]);
             }
             MpirTerminator::Br(bb) => {
@@ -1245,6 +1304,29 @@ impl SpirvBuilder {
                 self.cast_value(default_id, inferred_ty, expected_ty, ids)
             }
             MpirValue::Const(c) => self.constant_from_literal(&c.lit, expected_ty, ids),
+        }
+    }
+
+    fn infer_value_type(
+        &self,
+        value: &MpirValue,
+        ids: &SpirvKernelIds,
+        state: &SpirvKernelState,
+    ) -> u32 {
+        match value {
+            MpirValue::Local(local) => state
+                .value_types
+                .get(&local.0)
+                .copied()
+                .or_else(|| {
+                    state
+                        .local_types
+                        .get(&local.0)
+                        .copied()
+                        .map(|ty| self.spirv_scalar_for_type_id(ty, ids))
+                })
+                .unwrap_or(ids.int_ty),
+            MpirValue::Const(c) => self.spirv_scalar_for_type_id(c.ty, ids),
         }
     }
 
@@ -1387,7 +1469,9 @@ impl SpirvBuilder {
                     ids.const_int_0
                 }
             }
-            HirConstLit::StringLit(_) | HirConstLit::Unit => self.default_value_for_type(expected_ty, ids),
+            HirConstLit::StringLit(_) | HirConstLit::Unit => {
+                self.default_value_for_type(expected_ty, ids)
+            }
         }
     }
 
@@ -1576,7 +1660,11 @@ pub fn generate_kernel_registry_ir(kernels: &[(String, KernelLayout, Vec<u8>)]) 
     writeln!(out, "declare void @mp_rt_gpu_register_kernels(ptr, i32)").unwrap();
     writeln!(out).unwrap();
 
-    writeln!(out, "define internal void @mp_gpu_register_all_kernels() {{").unwrap();
+    writeln!(
+        out,
+        "define internal void @mp_gpu_register_all_kernels() {{"
+    )
+    .unwrap();
     writeln!(out, "entry:").unwrap();
     if !kernels.is_empty() {
         writeln!(
@@ -1631,9 +1719,6 @@ fn sanitize_llvm_symbol(symbol_name: &str) -> String {
 fn llvm_kernel_param_const(param: &KernelParam) -> String {
     format!(
         "%MpRtGpuParam {{ i8 {}, i32 {}, i32 {}, i32 {} }}",
-        param.kind as u8,
-        param.type_id,
-        param.offset_or_binding,
-        param.size
+        param.kind as u8, param.type_id, param.offset_or_binding, param.size
     )
 }

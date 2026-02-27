@@ -147,7 +147,9 @@ pub fn parse_route_pattern(pattern: &str) -> Result<RoutePattern, String> {
             return Err(format!("invalid literal segment '{seg}'"));
         }
 
-        parsed.segments.push(RouteSegment::Literal((*seg).to_string()));
+        parsed
+            .segments
+            .push(RouteSegment::Literal((*seg).to_string()));
     }
 
     Ok(parsed)
@@ -415,7 +417,10 @@ mod tests {
 
         let resp = dispatch(&service, &req, &ctx);
         assert_eq!(resp.status, 200);
-        assert_eq!(resp.headers.get("x-request-id").map(String::as_str), Some("req-123"));
+        assert_eq!(
+            resp.headers.get("x-request-id").map(String::as_str),
+            Some("req-123")
+        );
     }
 
     #[test]
@@ -432,7 +437,10 @@ mod tests {
             }],
         };
 
-        assert_eq!(render_html(&node), "<div data-x=\"a&amp;b\">&lt;hello&gt;</div>");
+        assert_eq!(
+            render_html(&node),
+            "<div data-x=\"a&amp;b\">&lt;hello&gt;</div>"
+        );
     }
 }
 
@@ -666,6 +674,60 @@ fn mcp_error_response(
     }
 }
 
+fn mcp_driver_config(params: Option<&serde_json::Value>) -> magpie_driver::DriverConfig {
+    let mut config = magpie_driver::DriverConfig::default();
+    let Some(params) = params else {
+        return config;
+    };
+
+    if let Some(entry_path) = params.get("entry_path").and_then(|v| v.as_str()) {
+        config.entry_path = entry_path.to_string();
+    }
+    if let Some(target_triple) = params.get("target").and_then(|v| v.as_str()) {
+        config.target_triple = target_triple.to_string();
+    }
+    if let Some(profile) = params.get("profile").and_then(|v| v.as_str()) {
+        config.profile = match profile {
+            "release" => magpie_driver::BuildProfile::Release,
+            _ => magpie_driver::BuildProfile::Dev,
+        };
+    }
+    if let Some(max_errors) = params.get("max_errors").and_then(|v| v.as_u64()) {
+        config.max_errors = max_errors as usize;
+    }
+    if let Some(token_budget) = params.get("token_budget").and_then(|v| v.as_u64()) {
+        config.token_budget = Some(token_budget as u32);
+    }
+    if let Some(llm_mode) = params.get("llm_mode").and_then(|v| v.as_bool()) {
+        config.llm_mode = llm_mode;
+    }
+    if let Some(shared_generics) = params.get("shared_generics").and_then(|v| v.as_bool()) {
+        config.shared_generics = shared_generics;
+    }
+    if let Some(emit) = params.get("emit") {
+        let emit_values = if let Some(single) = emit.as_str() {
+            vec![single.to_string()]
+        } else if let Some(list) = emit.as_array() {
+            list.iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if !emit_values.is_empty() {
+            config.emit = emit_values;
+        }
+    }
+    if let Some(features) = params.get("features").and_then(|v| v.as_array()) {
+        config.features = features
+            .iter()
+            .filter_map(|value| value.as_str().map(ToString::to_string))
+            .collect::<Vec<_>>();
+    }
+
+    config
+}
+
 pub fn handle_mcp_request(server: &McpServer, request: &McpRequest) -> McpResponse {
     if request.jsonrpc != "2.0" {
         return mcp_error_response(
@@ -700,7 +762,7 @@ pub fn handle_mcp_request(server: &McpServer, request: &McpRequest) -> McpRespon
         };
     }
 
-    let Some(tool) = server.tools.get(&request.method) else {
+    let Some(_tool) = server.tools.get(&request.method) else {
         return mcp_error_response(
             request.id.clone(),
             -32601,
@@ -717,13 +779,56 @@ pub fn handle_mcp_request(server: &McpServer, request: &McpRequest) -> McpRespon
         .and_then(|params| params.get("llm"))
         .cloned();
 
+    let result = match request.method.as_str() {
+        "magpie.build" => {
+            let config = mcp_driver_config(request.params.as_ref());
+            let build = magpie_driver::build(&config);
+            serde_json::json!({
+                "tool": "magpie.build",
+                "status": if build.success { "ok" } else { "failed" },
+                "build": build,
+                "config": config,
+                "llm": llm,
+            })
+        }
+        "magpie.explain" => {
+            let code = request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("code"))
+                .and_then(|value| value.as_str());
+
+            let Some(code) = code else {
+                return mcp_error_response(
+                    request.id.clone(),
+                    -32602,
+                    "invalid params: 'code' is required",
+                    request.params.clone(),
+                );
+            };
+
+            let explanation = magpie_driver::explain_code(code);
+            serde_json::json!({
+                "tool": "magpie.explain",
+                "status": if explanation.is_some() { "ok" } else { "unknown_code" },
+                "code": code,
+                "explanation": explanation,
+                "llm": llm,
+            })
+        }
+        // TODO(G62): wire remaining MCP tools to their real subsystems.
+        other => serde_json::json!({
+            "tool": other,
+            "status": "stub",
+            "message": "Tool registered but backend execution is not implemented yet.",
+            "todo": "TODO(G62): connect this MCP tool to a concrete Magpie subsystem.",
+            "llm": llm,
+        }),
+    };
+
     McpResponse {
         jsonrpc: "2.0".to_string(),
-        result: Some(serde_json::json!({
-            "tool": tool.name,
-            "status": "ok",
-            "llm": llm,
-        })),
+        result: Some(result),
         error: None,
         id: request.id.clone(),
     }
@@ -766,8 +871,86 @@ pub fn run_mcp_stdio(server: &McpServer) {
     }
 }
 
+#[cfg(test)]
+mod mcp_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_entry_path() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "magpie_web_mcp_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir should exist");
+        let entry = dir.join("main.mp");
+        std::fs::write(
+            &entry,
+            r#"module test.main
+exports { @main }
+imports { }
+digest "0000000000000000"
+
+fn @main() -> i32 {
+bb0:
+  ret const.i32 0
+}
+"#,
+        )
+        .expect("entry fixture should be written");
+        entry
+    }
+
+    #[test]
+    fn mcp_build_calls_driver_build() {
+        let server = create_mcp_server();
+        let entry = temp_entry_path();
+        let request = McpRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "magpie.build".to_string(),
+            params: Some(serde_json::json!({
+                "entry_path": entry.to_string_lossy().to_string(),
+                "emit": ["mpir"],
+            })),
+            id: Some(serde_json::json!(1)),
+        };
+        let response = handle_mcp_request(&server, &request);
+        assert!(response.error.is_none(), "response error: {:?}", response.error);
+        let result = response.result.expect("result should be present");
+        assert_eq!(result["tool"], "magpie.build");
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["build"]["success"], true);
+    }
+
+    #[test]
+    fn mcp_explain_calls_driver_explain() {
+        let server = create_mcp_server();
+        let request = McpRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "magpie.explain".to_string(),
+            params: Some(serde_json::json!({
+                "code": "MPO0003",
+            })),
+            id: Some(serde_json::json!(2)),
+        };
+        let response = handle_mcp_request(&server, &request);
+        assert!(response.error.is_none(), "response error: {:?}", response.error);
+        let result = response.result.expect("result should be present");
+        assert_eq!(result["tool"], "magpie.explain");
+        assert_eq!(result["status"], "ok");
+        assert!(result["explanation"].is_string());
+    }
+}
+
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -843,9 +1026,9 @@ fn scan_webapp_routes_recursive(
     for entry in std::fs::read_dir(current_dir)
         .map_err(|err| format!("failed to read '{}': {err}", current_dir.display()))?
     {
-        entries.push(
-            entry.map_err(|err| format!("failed to read entry in '{}': {err}", current_dir.display()))?,
-        );
+        entries.push(entry.map_err(|err| {
+            format!("failed to read entry in '{}': {err}", current_dir.display())
+        })?);
     }
     entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
@@ -1019,6 +1202,7 @@ fn join_prefix_and_pattern(prefix: &str, pattern: &str) -> String {
 }
 
 pub fn generate_openapi(service: &TService) -> String {
+    // TODO(G63): enrich OpenAPI with request/response schemas inferred from typed handlers.
     let mut paths: BTreeMap<String, serde_json::Map<String, serde_json::Value>> = BTreeMap::new();
 
     for route in &service.routes {
@@ -1038,7 +1222,10 @@ pub fn generate_openapi(service: &TService) -> String {
             }),
         );
         if !parameters.is_empty() {
-            operation.insert("parameters".to_string(), serde_json::Value::Array(parameters));
+            operation.insert(
+                "parameters".to_string(),
+                serde_json::Value::Array(parameters),
+            );
         }
         operation.insert(
             "x-magpie-route-pattern".to_string(),
@@ -1071,6 +1258,11 @@ pub fn generate_openapi(service: &TService) -> String {
     .unwrap_or_else(|_| {
         "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"Magpie Web Service\",\"version\":\"0.1.0\"},\"paths\":{}}".to_string()
     })
+}
+
+fn generate_openapi_build_artifact(service: &TService) -> String {
+    // TODO(G63): split this into a full spec generator once handler-level schema metadata exists.
+    generate_openapi(service)
 }
 
 pub fn generate_routes_json(service: &TService) -> String {
@@ -1138,7 +1330,10 @@ pub enum WebCommand {
 }
 
 fn write_generated_routes(manifest_dir: &Path, generated_routes: &str) -> Result<(), String> {
-    let output_path = manifest_dir.join(".magpie").join("gen").join("webapp_routes.mp");
+    let output_path = manifest_dir
+        .join(".magpie")
+        .join("gen")
+        .join("webapp_routes.mp");
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create '{}': {err}", parent.display()))?;
@@ -1173,6 +1368,64 @@ fn compile_project(manifest_dir: &Path, release: bool) -> Result<(), String> {
     }
 }
 
+fn dev_server_port() -> u16 {
+    std::env::var("MAGPIE_WEB_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(3000)
+}
+
+fn respond_dev_placeholder(stream: &mut TcpStream) -> Result<(), String> {
+    let mut request_buf = [0_u8; 4096];
+    let _ = stream.read(&mut request_buf);
+
+    let body = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Magpie Dev</title></head><body><h1>Magpie dev server</h1><p>Placeholder page from magpie web dev.</p></body></html>";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|err| format!("failed to write HTTP response: {err}"))?;
+    stream
+        .flush()
+        .map_err(|err| format!("failed to flush HTTP response: {err}"))?;
+    Ok(())
+}
+
+fn run_dev_server(app_dir: &Path) -> Result<(), String> {
+    let port = dev_server_port();
+    let bind_addr = format!("127.0.0.1:{port}");
+    let listener = TcpListener::bind(&bind_addr)
+        .map_err(|err| format!("failed to bind dev server on {bind_addr}: {err}"))?;
+
+    println!("magpie web dev: server started on {bind_addr}");
+    println!(
+        "magpie web dev: watching '{}' and '{}'",
+        app_dir.join("routes").display(),
+        app_dir.join("assets").display()
+    );
+    // TODO(G67): replace placeholder loop with file-watcher based hot reload + restart.
+    println!("magpie web dev: hot reload stub enabled");
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                if let Err(err) = respond_dev_placeholder(&mut stream) {
+                    eprintln!("magpie web dev: request handling error: {err}");
+                }
+            }
+            Err(err) => {
+                eprintln!("magpie web dev: accept error: {err}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     if !src.is_dir() {
         return Ok(());
@@ -1181,19 +1434,24 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         .map_err(|err| format!("failed to create '{}': {err}", dst.display()))?;
 
     let mut entries = Vec::new();
-    for entry in
-        std::fs::read_dir(src).map_err(|err| format!("failed to read '{}': {err}", src.display()))?
+    for entry in std::fs::read_dir(src)
+        .map_err(|err| format!("failed to read '{}': {err}", src.display()))?
     {
-        entries.push(entry.map_err(|err| format!("failed to read entry in '{}': {err}", src.display()))?);
+        entries.push(
+            entry.map_err(|err| format!("failed to read entry in '{}': {err}", src.display()))?,
+        );
     }
     entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
     for entry in entries {
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        let file_type = entry
-            .file_type()
-            .map_err(|err| format!("failed to read metadata for '{}': {err}", src_path.display()))?;
+        let file_type = entry.file_type().map_err(|err| {
+            format!(
+                "failed to read metadata for '{}': {err}",
+                src_path.display()
+            )
+        })?;
         if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else if file_type.is_file() {
@@ -1317,7 +1575,9 @@ fn discover_server_binary(manifest_dir: &Path) -> Result<PathBuf, String> {
         .map_err(|err| format!("failed to read '{}': {err}", server_dir.display()))?
     {
         entries.push(
-            entry.map_err(|err| format!("failed to read entry in '{}': {err}", server_dir.display()))?,
+            entry.map_err(|err| {
+                format!("failed to read entry in '{}': {err}", server_dir.display())
+            })?,
         );
     }
     entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
@@ -1344,13 +1604,7 @@ pub fn handle_web_command(cmd: WebCommand, manifest_dir: &Path) -> Result<(), St
     match cmd {
         WebCommand::Dev => {
             compile_project(manifest_dir, false)?;
-            println!("magpie web dev: server stub started on 127.0.0.1:3000");
-            println!(
-                "magpie web dev: watching '{}' and '{}'",
-                app_dir.join("routes").display(),
-                app_dir.join("assets").display()
-            );
-            Ok(())
+            run_dev_server(&app_dir)
         }
         WebCommand::Build => {
             compile_project(manifest_dir, true)?;
@@ -1363,7 +1617,7 @@ pub fn handle_web_command(cmd: WebCommand, manifest_dir: &Path) -> Result<(), St
             std::fs::create_dir_all(&dist_dir)
                 .map_err(|err| format!("failed to create '{}': {err}", dist_dir.display()))?;
 
-            let openapi_json = generate_openapi(&TService::default());
+            let openapi_json = generate_openapi_build_artifact(&TService::default());
             std::fs::write(dist_dir.join("openapi.json"), openapi_json).map_err(|err| {
                 format!(
                     "failed to write '{}': {err}",

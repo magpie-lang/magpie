@@ -7,3 +7,4 @@ edition.workspace = true
 magpie_hir = { path = "../magpie_hir" }
 magpie_types = { path = "../magpie_types" }
 magpie_diag = { path = "../magpie_diag" }
+blake3 = { workspace = true }

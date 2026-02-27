@@ -185,9 +185,9 @@ fn format_imports(imports: &[Spanned<ImportGroup>]) -> String {
         return "{ }".to_string();
     }
 
-    let groups = grouped.into_iter().map(|(module, items)| {
-        format!("{}::{{{}}}", module, join_comma(items))
-    });
+    let groups = grouped
+        .into_iter()
+        .map(|(module, items)| format!("{}::{{{}}}", module, join_comma(items)));
 
     format!("{{ {} }}", join_comma(groups))
 }
@@ -242,7 +242,10 @@ fn print_blocks(blocks: &[&AstBlock]) -> String {
         }
 
         out.push_str(INSTR_INDENT);
-        out.push_str(&print_terminator_with_label_map(&block.terminator.node, &label_map));
+        out.push_str(&print_terminator_with_label_map(
+            &block.terminator.node,
+            &label_map,
+        ));
 
         if idx + 1 != blocks.len() {
             out.push_str("\n\n");
@@ -352,16 +355,42 @@ fn print_op_with_label_map(op: &AstOp, label_map: &HashMap<u32, u32>) -> String 
                 vec![("lhs", print_value_ref(lhs)), ("rhs", print_value_ref(rhs))],
             )
         }
-        AstOp::Call { callee, targs, args } => {
-            format!("call {}{} {}", callee, print_type_args(targs), print_arg_pairs(args))
+        AstOp::Call {
+            callee,
+            targs,
+            args,
+        } => {
+            format!(
+                "call {}{} {}",
+                callee,
+                print_type_args(targs),
+                print_arg_pairs(args)
+            )
         }
         AstOp::CallIndirect { callee, args } => {
-            format!("call.indirect {} {}", print_value_ref(callee), print_arg_pairs(args))
+            format!(
+                "call.indirect {} {}",
+                print_value_ref(callee),
+                print_arg_pairs(args)
+            )
         }
-        AstOp::Try { callee, targs, args } => {
-            format!("try {}{} {}", callee, print_type_args(targs), print_arg_pairs(args))
+        AstOp::Try {
+            callee,
+            targs,
+            args,
+        } => {
+            format!(
+                "try {}{} {}",
+                callee,
+                print_type_args(targs),
+                print_arg_pairs(args)
+            )
         }
-        AstOp::SuspendCall { callee, targs, args } => format!(
+        AstOp::SuspendCall {
+            callee,
+            targs,
+            args,
+        } => format!(
             "suspend.call {}{} {}",
             callee,
             print_type_args(targs),
@@ -370,7 +399,9 @@ fn print_op_with_label_map(op: &AstOp, label_map: &HashMap<u32, u32>) -> String 
         AstOp::SuspendAwait { fut } => {
             print_op_with_pairs("suspend.await", vec![("fut", print_value_ref(fut))])
         }
-        AstOp::New { ty, fields } => format!("new {} {}", print_type(ty), print_value_pairs(fields)),
+        AstOp::New { ty, fields } => {
+            format!("new {} {}", print_type(ty), print_value_pairs(fields))
+        }
         AstOp::GetField { obj, field } => print_op_with_pairs(
             "getfield",
             vec![("obj", print_value_ref(obj)), ("field", field.clone())],
@@ -406,13 +437,19 @@ fn print_op_with_label_map(op: &AstOp, label_map: &HashMap<u32, u32>) -> String 
             format_pairs(vec![("v", print_value_ref(v))])
         ),
         AstOp::EnumIs { variant, v } => {
-            format!("enum.is<{}> {}", variant, format_pairs(vec![("v", print_value_ref(v))]))
+            format!(
+                "enum.is<{}> {}",
+                variant,
+                format_pairs(vec![("v", print_value_ref(v))])
+            )
         }
         AstOp::Share { v } => print_op_with_pairs("share", vec![("v", print_value_ref(v))]),
         AstOp::CloneShared { v } => {
             print_op_with_pairs("clone.shared", vec![("v", print_value_ref(v))])
         }
-        AstOp::CloneWeak { v } => print_op_with_pairs("clone.weak", vec![("v", print_value_ref(v))]),
+        AstOp::CloneWeak { v } => {
+            print_op_with_pairs("clone.weak", vec![("v", print_value_ref(v))])
+        }
         AstOp::WeakDowngrade { v } => {
             print_op_with_pairs("weak.downgrade", vec![("v", print_value_ref(v))])
         }
@@ -428,7 +465,9 @@ fn print_op_with_label_map(op: &AstOp, label_map: &HashMap<u32, u32>) -> String 
         AstOp::BorrowShared { v } => {
             print_op_with_pairs("borrow.shared", vec![("v", print_value_ref(v))])
         }
-        AstOp::BorrowMut { v } => print_op_with_pairs("borrow.mut", vec![("v", print_value_ref(v))]),
+        AstOp::BorrowMut { v } => {
+            print_op_with_pairs("borrow.mut", vec![("v", print_value_ref(v))])
+        }
         AstOp::PtrNull { ty } => format!("ptr.null<{}>", print_type(ty)),
         AstOp::PtrAddr { ty, p } => format!(
             "ptr.addr<{}> {}",
@@ -443,7 +482,10 @@ fn print_op_with_label_map(op: &AstOp, label_map: &HashMap<u32, u32>) -> String 
         AstOp::PtrAdd { ty, p, count } => format!(
             "ptr.add<{}> {}",
             print_type(ty),
-            format_pairs(vec![("p", print_value_ref(p)), ("count", print_value_ref(count))])
+            format_pairs(vec![
+                ("p", print_value_ref(p)),
+                ("count", print_value_ref(count))
+            ])
         ),
         AstOp::PtrLoad { ty, p } => format!(
             "ptr.load<{}> {}",
@@ -451,19 +493,27 @@ fn print_op_with_label_map(op: &AstOp, label_map: &HashMap<u32, u32>) -> String 
             format_pairs(vec![("p", print_value_ref(p))])
         ),
         AstOp::CallableCapture { fn_ref, captures } => {
-            format!("callable.capture {} {}", fn_ref, print_value_pairs(captures))
+            format!(
+                "callable.capture {} {}",
+                fn_ref,
+                print_value_pairs(captures)
+            )
         }
         AstOp::ArrNew { elem_ty, cap } => format!(
             "arr.new<{}> {}",
             print_type(elem_ty),
             format_pairs(vec![("cap", print_value_ref(cap))])
         ),
-        AstOp::ArrLen { arr } => print_op_with_pairs("arr.len", vec![("arr", print_value_ref(arr))]),
+        AstOp::ArrLen { arr } => {
+            print_op_with_pairs("arr.len", vec![("arr", print_value_ref(arr))])
+        }
         AstOp::ArrGet { arr, idx } => print_op_with_pairs(
             "arr.get",
             vec![("arr", print_value_ref(arr)), ("idx", print_value_ref(idx))],
         ),
-        AstOp::ArrPop { arr } => print_op_with_pairs("arr.pop", vec![("arr", print_value_ref(arr))]),
+        AstOp::ArrPop { arr } => {
+            print_op_with_pairs("arr.pop", vec![("arr", print_value_ref(arr))])
+        }
         AstOp::ArrSlice { arr, start, end } => print_op_with_pairs(
             "arr.slice",
             vec![
@@ -493,9 +543,15 @@ fn print_op_with_label_map(op: &AstOp, label_map: &HashMap<u32, u32>) -> String 
             ],
         ),
         AstOp::MapNew { key_ty, val_ty } => {
-            format!("map.new<{}, {}> {{ }}", print_type(key_ty), print_type(val_ty))
+            format!(
+                "map.new<{}, {}> {{ }}",
+                print_type(key_ty),
+                print_type(val_ty)
+            )
         }
-        AstOp::MapLen { map } => print_op_with_pairs("map.len", vec![("map", print_value_ref(map))]),
+        AstOp::MapLen { map } => {
+            print_op_with_pairs("map.len", vec![("map", print_value_ref(map))])
+        }
         AstOp::MapGet { map, key } => print_op_with_pairs(
             "map.get",
             vec![("map", print_value_ref(map)), ("key", print_value_ref(key))],
@@ -512,7 +568,9 @@ fn print_op_with_label_map(op: &AstOp, label_map: &HashMap<u32, u32>) -> String 
             "map.contains_key",
             vec![("map", print_value_ref(map)), ("key", print_value_ref(key))],
         ),
-        AstOp::MapKeys { map } => print_op_with_pairs("map.keys", vec![("map", print_value_ref(map))]),
+        AstOp::MapKeys { map } => {
+            print_op_with_pairs("map.keys", vec![("map", print_value_ref(map))])
+        }
         AstOp::MapValues { map } => {
             print_op_with_pairs("map.values", vec![("map", print_value_ref(map))])
         }
@@ -521,9 +579,10 @@ fn print_op_with_label_map(op: &AstOp, label_map: &HashMap<u32, u32>) -> String 
             vec![("a", print_value_ref(a)), ("b", print_value_ref(b))],
         ),
         AstOp::StrLen { s } => print_op_with_pairs("str.len", vec![("s", print_value_ref(s))]),
-        AstOp::StrEq { a, b } => {
-            print_op_with_pairs("str.eq", vec![("a", print_value_ref(a)), ("b", print_value_ref(b))])
-        }
+        AstOp::StrEq { a, b } => print_op_with_pairs(
+            "str.eq",
+            vec![("a", print_value_ref(a)), ("b", print_value_ref(b))],
+        ),
         AstOp::StrSlice { s, start, end } => print_op_with_pairs(
             "str.slice",
             vec![
@@ -574,7 +633,10 @@ fn print_op_with_label_map(op: &AstOp, label_map: &HashMap<u32, u32>) -> String 
         AstOp::GpuBufferLoad { ty, buf, idx } => format!(
             "gpu.buffer_load<{}> {}",
             print_type(ty),
-            format_pairs(vec![("buf", print_value_ref(buf)), ("idx", print_value_ref(idx))])
+            format_pairs(vec![
+                ("buf", print_value_ref(buf)),
+                ("idx", print_value_ref(idx))
+            ])
         ),
         AstOp::GpuBufferLen { ty, buf } => format!(
             "gpu.buffer_len<{}> {}",
@@ -619,7 +681,11 @@ fn print_op_with_label_map(op: &AstOp, label_map: &HashMap<u32, u32>) -> String 
 
 fn print_op_void_with_label_map(op: &AstOpVoid, _label_map: &HashMap<u32, u32>) -> String {
     match op {
-        AstOpVoid::CallVoid { callee, targs, args } => format!(
+        AstOpVoid::CallVoid {
+            callee,
+            targs,
+            args,
+        } => format!(
             "call_void {}{} {}",
             callee,
             print_type_args(targs),
@@ -638,7 +704,9 @@ fn print_op_void_with_label_map(op: &AstOpVoid, _label_map: &HashMap<u32, u32>) 
                 ("val", print_value_ref(val)),
             ],
         ),
-        AstOpVoid::Panic { msg } => print_op_with_pairs("panic", vec![("msg", print_value_ref(msg))]),
+        AstOpVoid::Panic { msg } => {
+            print_op_with_pairs("panic", vec![("msg", print_value_ref(msg))])
+        }
         AstOpVoid::PtrStore { ty, p, v } => format!(
             "ptr.store<{}> {}",
             print_type(ty),
@@ -733,7 +801,9 @@ fn print_builtin_type(builtin: &AstBuiltinType) -> String {
         AstBuiltinType::Array(elem) => format!("Array<{}>", print_type(elem)),
         AstBuiltinType::Map(k, v) => format!("Map<{}, {}>", print_type(k), print_type(v)),
         AstBuiltinType::TOption(t) => format!("TOption<{}>", print_type(t)),
-        AstBuiltinType::TResult(ok, err) => format!("TResult<{}, {}>", print_type(ok), print_type(err)),
+        AstBuiltinType::TResult(ok, err) => {
+            format!("TResult<{}, {}>", print_type(ok), print_type(err))
+        }
         AstBuiltinType::TStrBuilder => "TStrBuilder".to_string(),
         AstBuiltinType::TMutex(t) => format!("TMutex<{}>", print_type(t)),
         AstBuiltinType::TRwLock(t) => format!("TRwLock<{}>", print_type(t)),
@@ -1118,4 +1188,84 @@ fn ensure_single_trailing_newline(source: &str) -> String {
     let mut out = trimmed.to_string();
     out.push('\n');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magpie_ast::{AstHeader, FileId, ModulePath, Span};
+
+    fn spanned<T>(node: T) -> Spanned<T> {
+        Spanned::new(node, Span::new(FileId(0), 0, 0))
+    }
+
+    #[test]
+    fn format_csnf_sorts_and_deduplicates_header_items() {
+        let ast = AstFile {
+            header: spanned(AstHeader {
+                module_path: spanned(ModulePath {
+                    segments: vec!["demo".to_string(), "core".to_string()],
+                }),
+                exports: vec![
+                    spanned(ExportItem::Fn("beta".to_string())),
+                    spanned(ExportItem::Type("Alpha".to_string())),
+                    spanned(ExportItem::Fn("beta".to_string())),
+                ],
+                imports: vec![
+                    spanned(ImportGroup {
+                        module_path: ModulePath {
+                            segments: vec!["dep".to_string(), "beta".to_string()],
+                        },
+                        items: vec![
+                            ImportItem::Fn("run".to_string()),
+                            ImportItem::Type("Other".to_string()),
+                        ],
+                    }),
+                    spanned(ImportGroup {
+                        module_path: ModulePath {
+                            segments: vec!["dep".to_string(), "alpha".to_string()],
+                        },
+                        items: vec![
+                            ImportItem::Fn("make".to_string()),
+                            ImportItem::Type("Thing".to_string()),
+                            ImportItem::Fn("make".to_string()),
+                        ],
+                    }),
+                ],
+                digest: spanned("placeholder".to_string()),
+            }),
+            decls: Vec::new(),
+        };
+
+        let formatted = format_csnf(&ast);
+        let expected = concat!(
+            "module demo.core\n",
+            "exports { Alpha, beta }\n",
+            "imports { dep.alpha::{Thing, make}, dep.beta::{Other, run} }\n",
+            "digest \"placeholder\"\n"
+        );
+
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn update_digest_inserts_and_stabilizes_digest_line() {
+        let source = "module demo\nexports { }\nimports { }\n";
+
+        let updated_once = update_digest(source);
+        let updated_twice = update_digest(&updated_once);
+        assert_eq!(updated_once, updated_twice, "digest update should be idempotent");
+
+        let digest_line = updated_once
+            .lines()
+            .find(|line| line.starts_with("digest "))
+            .expect("digest line should exist");
+
+        let digest = digest_line
+            .strip_prefix("digest \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("digest line should be quoted");
+        assert_eq!(digest.len(), 64, "blake3 hex digest should be 64 chars");
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 }

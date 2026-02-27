@@ -1,10 +1,11 @@
 //! Ownership and borrow checking for HIR (§10).
 
-use magpie_diag::{codes, Diagnostic, DiagnosticBag, Severity};
+use magpie_diag::{codes, Diagnostic, DiagnosticBag, Severity, WhyEvent, WhyTrace};
 use magpie_hir::{
-    HirBlock, HirFunction, HirInstr, HirModule, HirOp, HirOpVoid, HirTerminator, HirValue,
+    HirBlock, HirFunction, HirInstr, HirModule, HirOp, HirOpVoid, HirTerminator, HirTypeDecl,
+    HirValue,
 };
-use magpie_types::{BlockId, HandleKind, LocalId, TypeCtx, TypeId, TypeKind};
+use magpie_types::{BlockId, HandleKind, HeapBase, LocalId, TypeCtx, TypeId, TypeKind};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -33,6 +34,8 @@ pub fn check_ownership(
     diag: &mut DiagnosticBag,
 ) -> Result<(), ()> {
     let before = diag.error_count();
+    let fn_param_types = collect_fn_param_types(module);
+    let struct_fields = collect_struct_fields(module);
 
     for global in &module.globals {
         if is_borrow_type(global.ty, type_ctx) || is_borrow_type(global.init.ty, type_ctx) {
@@ -48,7 +51,7 @@ pub fn check_ownership(
     }
 
     for func in &module.functions {
-        check_function(func, type_ctx, diag);
+        check_function(func, type_ctx, &fn_param_types, &struct_fields, diag);
     }
 
     if diag.error_count() > before {
@@ -89,11 +92,24 @@ pub fn is_move_only(type_id: TypeId, type_ctx: &TypeCtx) -> bool {
     go(type_id, type_ctx, &mut HashSet::new())
 }
 
-fn check_function(func: &HirFunction, type_ctx: &TypeCtx, diag: &mut DiagnosticBag) {
+fn check_function(
+    func: &HirFunction,
+    type_ctx: &TypeCtx,
+    fn_param_types: &HashMap<String, Vec<TypeId>>,
+    struct_fields: &HashMap<String, HashMap<String, TypeId>>,
+    diag: &mut DiagnosticBag,
+) {
     let local_types = collect_local_types(func);
+    let callable_captures = collect_callable_capture_types(func, &local_types);
     let move_only_locals: HashSet<LocalId> = local_types
         .iter()
-        .filter_map(|(l, ty)| if is_move_only(*ty, type_ctx) { Some(*l) } else { None })
+        .filter_map(|(l, ty)| {
+            if is_move_only(*ty, type_ctx) {
+                Some(*l)
+            } else {
+                None
+            }
+        })
         .collect();
 
     let block_index = build_block_index(func);
@@ -104,7 +120,15 @@ fn check_function(func: &HirFunction, type_ctx: &TypeCtx, diag: &mut DiagnosticB
         .collect();
     let preds = build_predecessors(successors.len(), &successors);
 
-    let moved = analyze_moved_sets(func, &move_only_locals, &block_index, &preds);
+    let moved = analyze_moved_sets(
+        func,
+        &move_only_locals,
+        &block_index,
+        &preds,
+        &local_types,
+        type_ctx,
+        fn_param_types,
+    );
     let def_block = collect_def_blocks(func, &block_index);
 
     for (blk_idx, block) in func.blocks.iter().enumerate() {
@@ -190,6 +214,30 @@ fn check_function(func: &HirFunction, type_ctx: &TypeCtx, diag: &mut DiagnosticB
 
             check_store_constraints_instr(instr, &local_types, type_ctx, diag);
             check_collection_constraints_instr(instr, &local_types, type_ctx, diag);
+            check_projection_constraints_instr(
+                func,
+                instr,
+                &local_types,
+                type_ctx,
+                struct_fields,
+                diag,
+            );
+            check_call_argument_modes_instr(
+                func,
+                &instr.op,
+                &local_types,
+                type_ctx,
+                fn_param_types,
+                diag,
+            );
+            check_spawn_send_constraints_instr(
+                func,
+                &instr.op,
+                &local_types,
+                &callable_captures,
+                type_ctx,
+                diag,
+            );
 
             if let Some((owner, flavor)) = borrow_creation(&instr.op) {
                 if move_only_locals.contains(&owner) {
@@ -236,7 +284,7 @@ fn check_function(func: &HirFunction, type_ctx: &TypeCtx, diag: &mut DiagnosticB
             consume_locals(
                 func,
                 block,
-                op_consumed_locals(&instr.op),
+                op_consumed_locals(&instr.op, &local_types, type_ctx, fn_param_types),
                 &move_only_locals,
                 &mut shared_count,
                 &mut mut_active,
@@ -275,11 +323,27 @@ fn check_function(func: &HirFunction, type_ctx: &TypeCtx, diag: &mut DiagnosticB
 
             check_store_constraints_void(vop, &local_types, type_ctx, diag);
             check_collection_constraints_void(vop, &local_types, type_ctx, diag);
+            check_call_argument_modes_void(
+                func,
+                vop,
+                &local_types,
+                type_ctx,
+                fn_param_types,
+                diag,
+            );
+            check_spawn_send_constraints_void(
+                func,
+                vop,
+                &local_types,
+                &callable_captures,
+                type_ctx,
+                diag,
+            );
 
             consume_locals(
                 func,
                 block,
-                op_void_consumed_locals(vop),
+                op_void_consumed_locals(vop, &local_types, type_ctx, fn_param_types),
                 &move_only_locals,
                 &mut shared_count,
                 &mut mut_active,
@@ -627,11 +691,731 @@ fn check_read_target(
     }
 }
 
+fn collect_fn_param_types(module: &HirModule) -> HashMap<String, Vec<TypeId>> {
+    module
+        .functions
+        .iter()
+        .map(|f| {
+            (
+                f.sid.0.clone(),
+                f.params.iter().map(|(_, ty)| *ty).collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+fn collect_struct_fields(module: &HirModule) -> HashMap<String, HashMap<String, TypeId>> {
+    let mut out = HashMap::new();
+    for decl in &module.type_decls {
+        if let HirTypeDecl::Struct { sid, fields, .. } = decl {
+            out.insert(sid.0.clone(), fields.iter().cloned().collect());
+        }
+    }
+    out
+}
+
+fn collect_callable_capture_types(
+    func: &HirFunction,
+    local_types: &HashMap<LocalId, TypeId>,
+) -> HashMap<LocalId, Vec<TypeId>> {
+    let mut captures = HashMap::new();
+    for block in &func.blocks {
+        for instr in &block.instrs {
+            if let HirOp::CallableCapture {
+                captures: cap_values, ..
+            } = &instr.op
+            {
+                let captured_types = cap_values
+                    .iter()
+                    .filter_map(|(_, value)| value_type(value, local_types))
+                    .collect::<Vec<_>>();
+                captures.insert(instr.dst, captured_types);
+            }
+        }
+    }
+    captures
+}
+
+fn check_spawn_send_constraints_instr(
+    func: &HirFunction,
+    op: &HirOp,
+    local_types: &HashMap<LocalId, TypeId>,
+    callable_captures: &HashMap<LocalId, Vec<TypeId>>,
+    type_ctx: &TypeCtx,
+    diag: &mut DiagnosticBag,
+) {
+    match op {
+        HirOp::Call {
+            callee_sid, args, ..
+        }
+        | HirOp::SuspendCall {
+            callee_sid, args, ..
+        } => check_spawn_send_constraints(
+            func,
+            &callee_sid.0,
+            args,
+            local_types,
+            callable_captures,
+            type_ctx,
+            diag,
+        ),
+        _ => {}
+    }
+}
+
+fn check_spawn_send_constraints_void(
+    func: &HirFunction,
+    op: &HirOpVoid,
+    local_types: &HashMap<LocalId, TypeId>,
+    callable_captures: &HashMap<LocalId, Vec<TypeId>>,
+    type_ctx: &TypeCtx,
+    diag: &mut DiagnosticBag,
+) {
+    if let HirOpVoid::CallVoid {
+        callee_sid, args, ..
+    } = op
+    {
+        check_spawn_send_constraints(
+            func,
+            &callee_sid.0,
+            args,
+            local_types,
+            callable_captures,
+            type_ctx,
+            diag,
+        );
+    }
+}
+
+fn check_spawn_send_constraints(
+    func: &HirFunction,
+    callee_sid: &str,
+    args: &[HirValue],
+    local_types: &HashMap<LocalId, TypeId>,
+    callable_captures: &HashMap<LocalId, Vec<TypeId>>,
+    type_ctx: &TypeCtx,
+    diag: &mut DiagnosticBag,
+) {
+    if !is_spawn_callee(callee_sid) {
+        return;
+    }
+    let Some(HirValue::Local(callable_local)) = args.first() else {
+        emit_error(
+            diag,
+            "MPO0201",
+            &format!(
+                "fn '{}': spawn-like call '{}' requires first argument TCallable",
+                func.name, callee_sid
+            ),
+        );
+        return;
+    };
+    let Some(callable_ty) = local_types.get(callable_local).copied() else {
+        return;
+    };
+    if !is_callable_type(callable_ty, type_ctx) {
+        emit_error(
+            diag,
+            "MPO0201",
+            &format!(
+                "fn '{}': spawn-like call '{}' requires first argument TCallable, got {}",
+                func.name,
+                callee_sid,
+                type_ctx.type_str(callable_ty)
+            ),
+        );
+        return;
+    }
+    let Some(captured_types) = callable_captures.get(callable_local) else {
+        return;
+    };
+    for captured_ty in captured_types {
+        if !is_send_type(*captured_ty, type_ctx, &mut HashSet::new()) {
+            emit_error(
+                diag,
+                "MPO0201",
+                &format!(
+                    "fn '{}': spawn-like callable captures non-send value of type {}",
+                    func.name,
+                    type_ctx.type_str(*captured_ty)
+                ),
+            );
+        }
+    }
+}
+
+fn is_spawn_callee(callee_sid: &str) -> bool {
+    let lower = callee_sid.to_ascii_lowercase();
+    lower.contains("spawn")
+}
+
+fn is_callable_type(type_id: TypeId, type_ctx: &TypeCtx) -> bool {
+    matches!(
+        type_ctx.lookup(type_id),
+        Some(TypeKind::HeapHandle {
+            base: HeapBase::Callable { .. },
+            ..
+        })
+    )
+}
+
+fn is_send_type(type_id: TypeId, type_ctx: &TypeCtx, visiting: &mut HashSet<TypeId>) -> bool {
+    if !visiting.insert(type_id) {
+        return true;
+    }
+
+    let send = match type_ctx.lookup(type_id) {
+        Some(TypeKind::Prim(_)) => true,
+        Some(TypeKind::RawPtr { .. }) => false,
+        Some(TypeKind::HeapHandle { hk, base }) => match hk {
+            HandleKind::Borrow | HandleKind::MutBorrow | HandleKind::Weak => false,
+            HandleKind::Unique | HandleKind::Shared => match base {
+                HeapBase::BuiltinStr => true,
+                HeapBase::BuiltinArray { elem } => is_send_type(*elem, type_ctx, visiting),
+                HeapBase::BuiltinMap { key, val } => {
+                    is_send_type(*key, type_ctx, visiting) && is_send_type(*val, type_ctx, visiting)
+                }
+                HeapBase::BuiltinFuture { result } => is_send_type(*result, type_ctx, visiting),
+                HeapBase::BuiltinChannelSend { elem } | HeapBase::BuiltinChannelRecv { elem } => {
+                    is_send_type(*elem, type_ctx, visiting)
+                }
+                HeapBase::Callable { .. } => true,
+                HeapBase::BuiltinMutex { inner } | HeapBase::BuiltinRwLock { inner } => {
+                    is_send_type(*inner, type_ctx, visiting)
+                }
+                HeapBase::BuiltinStrBuilder | HeapBase::BuiltinCell { .. } => false,
+                HeapBase::UserType { .. } => false,
+            },
+        },
+        Some(TypeKind::BuiltinOption { inner }) => is_send_type(*inner, type_ctx, visiting),
+        Some(TypeKind::BuiltinResult { ok, err }) => {
+            is_send_type(*ok, type_ctx, visiting) && is_send_type(*err, type_ctx, visiting)
+        }
+        Some(TypeKind::Arr { elem, .. }) | Some(TypeKind::Vec { elem, .. }) => {
+            is_send_type(*elem, type_ctx, visiting)
+        }
+        Some(TypeKind::Tuple { elems }) => elems
+            .iter()
+            .all(|elem| is_send_type(*elem, type_ctx, visiting)),
+        Some(TypeKind::ValueStruct { .. }) => false,
+        None => false,
+    };
+
+    visiting.remove(&type_id);
+    send
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ProjectionOwnerMode {
+    Shared,
+    Mut,
+}
+
+fn check_projection_constraints_instr(
+    func: &HirFunction,
+    instr: &HirInstr,
+    local_types: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+    struct_fields: &HashMap<String, HashMap<String, TypeId>>,
+    diag: &mut DiagnosticBag,
+) {
+    match &instr.op {
+        HirOp::GetField { obj, field } => {
+            let Some(obj_ty) = value_type(obj, local_types) else {
+                return;
+            };
+            let Some((field_ty, owner_mode)) =
+                projected_field_type(obj_ty, field, type_ctx, struct_fields)
+            else {
+                emit_error(
+                    diag,
+                    codes::MPO0004,
+                    &format!(
+                        "fn '{}': getfield requires borrow/mutborrow struct operand with known field '{}'",
+                        func.name, field
+                    ),
+                );
+                return;
+            };
+            check_projection_result_type(
+                func,
+                "getfield",
+                instr.ty,
+                field_ty,
+                owner_mode,
+                type_ctx,
+                diag,
+            );
+        }
+        HirOp::ArrGet { arr, .. } => {
+            let Some(arr_ty) = value_type(arr, local_types) else {
+                return;
+            };
+            let Some((elem_ty, owner_mode)) = projected_array_elem_type(arr_ty, type_ctx) else {
+                emit_error(
+                    diag,
+                    codes::MPO0004,
+                    &format!(
+                        "fn '{}': arr.get requires borrow/mutborrow Array<T> operand",
+                        func.name
+                    ),
+                );
+                return;
+            };
+            check_projection_result_type(
+                func,
+                "arr.get",
+                instr.ty,
+                elem_ty,
+                owner_mode,
+                type_ctx,
+                diag,
+            );
+        }
+        HirOp::MapGetRef { map, .. } => {
+            let Some(map_ty) = value_type(map, local_types) else {
+                return;
+            };
+            let Some((val_ty, owner_mode)) = projected_map_val_type(map_ty, type_ctx) else {
+                emit_error(
+                    diag,
+                    codes::MPO0004,
+                    &format!(
+                        "fn '{}': map.get_ref requires borrow/mutborrow Map<K,V> operand",
+                        func.name
+                    ),
+                );
+                return;
+            };
+            check_projection_result_type(
+                func,
+                "map.get_ref",
+                instr.ty,
+                val_ty,
+                owner_mode,
+                type_ctx,
+                diag,
+            );
+        }
+        HirOp::MapGet { map, .. } => {
+            let Some(map_ty) = value_type(map, local_types) else {
+                return;
+            };
+            let Some((val_ty, _)) = projected_map_val_type(map_ty, type_ctx) else {
+                emit_error(
+                    diag,
+                    codes::MPO0004,
+                    &format!(
+                        "fn '{}': map.get requires borrow/mutborrow Map<K,V> operand",
+                        func.name
+                    ),
+                );
+                return;
+            };
+
+            if !is_dupable_type(val_ty, type_ctx) {
+                emit_error(
+                    diag,
+                    codes::MPO0103,
+                    &format!(
+                        "fn '{}': map.get requires Dupable map value type; got {} (MPO0103)",
+                        func.name,
+                        type_ctx.type_str(val_ty)
+                    ),
+                );
+                return;
+            }
+
+            if !is_option_of(instr.ty, val_ty, type_ctx) {
+                emit_error(
+                    diag,
+                    codes::MPO0004,
+                    &format!(
+                        "fn '{}': map.get result type must be TOption<{}>",
+                        func.name,
+                        type_ctx.type_str(val_ty)
+                    ),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn projected_field_type(
+    obj_ty: TypeId,
+    field: &str,
+    type_ctx: &TypeCtx,
+    struct_fields: &HashMap<String, HashMap<String, TypeId>>,
+) -> Option<(TypeId, ProjectionOwnerMode)> {
+    match type_ctx.lookup(obj_ty) {
+        Some(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::UserType { type_sid, .. },
+        }) => struct_fields
+            .get(&type_sid.0)
+            .and_then(|fields| fields.get(field).copied())
+            .map(|ty| (ty, ProjectionOwnerMode::Shared)),
+        Some(TypeKind::HeapHandle {
+            hk: HandleKind::MutBorrow,
+            base: HeapBase::UserType { type_sid, .. },
+        }) => struct_fields
+            .get(&type_sid.0)
+            .and_then(|fields| fields.get(field).copied())
+            .map(|ty| (ty, ProjectionOwnerMode::Mut)),
+        _ => None,
+    }
+}
+
+fn projected_array_elem_type(
+    arr_ty: TypeId,
+    type_ctx: &TypeCtx,
+) -> Option<(TypeId, ProjectionOwnerMode)> {
+    match type_ctx.lookup(arr_ty) {
+        Some(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::BuiltinArray { elem },
+        }) => Some((*elem, ProjectionOwnerMode::Shared)),
+        Some(TypeKind::HeapHandle {
+            hk: HandleKind::MutBorrow,
+            base: HeapBase::BuiltinArray { elem },
+        }) => Some((*elem, ProjectionOwnerMode::Mut)),
+        _ => None,
+    }
+}
+
+fn projected_map_val_type(
+    map_ty: TypeId,
+    type_ctx: &TypeCtx,
+) -> Option<(TypeId, ProjectionOwnerMode)> {
+    match type_ctx.lookup(map_ty) {
+        Some(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::BuiltinMap { val, .. },
+        }) => Some((*val, ProjectionOwnerMode::Shared)),
+        Some(TypeKind::HeapHandle {
+            hk: HandleKind::MutBorrow,
+            base: HeapBase::BuiltinMap { val, .. },
+        }) => Some((*val, ProjectionOwnerMode::Mut)),
+        _ => None,
+    }
+}
+
+fn check_projection_result_type(
+    func: &HirFunction,
+    op_name: &str,
+    result_ty: TypeId,
+    stored_ty: TypeId,
+    owner_mode: ProjectionOwnerMode,
+    type_ctx: &TypeCtx,
+    diag: &mut DiagnosticBag,
+) {
+    if !is_move_only(stored_ty, type_ctx) {
+        if result_ty != stored_ty {
+            emit_error(
+                diag,
+                codes::MPO0004,
+                &format!(
+                    "fn '{}': {} on Copy type must return by-value {}",
+                    func.name,
+                    op_name,
+                    type_ctx.type_str(stored_ty)
+                ),
+            );
+        }
+        return;
+    }
+
+    match type_ctx.lookup(stored_ty) {
+        Some(TypeKind::HeapHandle {
+            hk: HandleKind::Weak,
+            base,
+        }) => {
+            if !matches_handle_type(result_ty, HandleKind::Weak, base, type_ctx) {
+                emit_error(
+                    diag,
+                    codes::MPO0004,
+                    &format!(
+                        "fn '{}': {} on weak field/element must return weak clone {}",
+                        func.name,
+                        op_name,
+                        type_ctx.type_str(stored_ty)
+                    ),
+                );
+            }
+        }
+        Some(TypeKind::HeapHandle {
+            hk: HandleKind::Unique,
+            base,
+        }) => {
+            let expected_hk = if owner_mode == ProjectionOwnerMode::Mut {
+                HandleKind::MutBorrow
+            } else {
+                HandleKind::Borrow
+            };
+            if !matches_handle_type(result_ty, expected_hk, base, type_ctx) {
+                emit_error(
+                    diag,
+                    codes::MPO0004,
+                    &format!(
+                        "fn '{}': {} on strong handle must return {} {}",
+                        func.name,
+                        op_name,
+                        if expected_hk == HandleKind::MutBorrow {
+                            "mutborrow"
+                        } else {
+                            "borrow"
+                        },
+                        heap_base_name(base, type_ctx)
+                    ),
+                );
+            }
+        }
+        Some(TypeKind::HeapHandle {
+            hk: HandleKind::Shared,
+            base,
+        }) => {
+            if !matches_handle_type(result_ty, HandleKind::Borrow, base, type_ctx) {
+                emit_error(
+                    diag,
+                    codes::MPO0004,
+                    &format!(
+                        "fn '{}': {} on shared handle must return borrow {}",
+                        func.name,
+                        op_name,
+                        heap_base_name(base, type_ctx)
+                    ),
+                );
+            }
+        }
+        _ => {
+            let expected = if owner_mode == ProjectionOwnerMode::Mut {
+                HandleKind::MutBorrow
+            } else {
+                HandleKind::Borrow
+            };
+            if !matches!(handle_kind(result_ty, type_ctx), Some(hk) if hk == expected) {
+                emit_error(
+                    diag,
+                    codes::MPO0004,
+                    &format!(
+                        "fn '{}': {} on move-only value type must return {} projection",
+                        func.name,
+                        op_name,
+                        if expected == HandleKind::MutBorrow {
+                            "mutborrow"
+                        } else {
+                            "borrow"
+                        }
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn matches_handle_type(
+    ty: TypeId,
+    expected_hk: HandleKind,
+    expected_base: &HeapBase,
+    type_ctx: &TypeCtx,
+) -> bool {
+    matches!(
+        type_ctx.lookup(ty),
+        Some(TypeKind::HeapHandle { hk, base }) if *hk == expected_hk && base == expected_base
+    )
+}
+
+fn heap_base_name(base: &HeapBase, type_ctx: &TypeCtx) -> String {
+    type_ctx
+        .types
+        .iter()
+        .find_map(|(id, kind)| match kind {
+            TypeKind::HeapHandle {
+                hk: HandleKind::Unique,
+                base: candidate,
+            } if candidate == base => Some(type_ctx.type_str(*id)),
+            _ => None,
+        })
+        .unwrap_or_else(|| format!("{:?}", base))
+}
+
+fn is_option_of(option_ty: TypeId, inner_ty: TypeId, type_ctx: &TypeCtx) -> bool {
+    matches!(
+        type_ctx.lookup(option_ty),
+        Some(TypeKind::BuiltinOption { inner }) if *inner == inner_ty
+    )
+}
+
+fn is_dupable_type(ty: TypeId, type_ctx: &TypeCtx) -> bool {
+    if !is_move_only(ty, type_ctx) {
+        return true;
+    }
+    matches!(
+        type_ctx.lookup(ty),
+        Some(TypeKind::HeapHandle {
+            hk: HandleKind::Shared | HandleKind::Weak,
+            ..
+        })
+    )
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ParamMode {
+    ByValueCopy,
+    ByValueMove,
+    Borrow,
+    MutBorrow,
+}
+
+fn param_mode(ty: TypeId, type_ctx: &TypeCtx) -> ParamMode {
+    match handle_kind(ty, type_ctx) {
+        Some(HandleKind::Borrow) => ParamMode::Borrow,
+        Some(HandleKind::MutBorrow) => ParamMode::MutBorrow,
+        _ => {
+            if is_move_only(ty, type_ctx) {
+                ParamMode::ByValueMove
+            } else {
+                ParamMode::ByValueCopy
+            }
+        }
+    }
+}
+
+fn check_call_argument_modes_instr(
+    func: &HirFunction,
+    op: &HirOp,
+    local_types: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+    fn_param_types: &HashMap<String, Vec<TypeId>>,
+    diag: &mut DiagnosticBag,
+) {
+    match op {
+        HirOp::Call {
+            callee_sid, args, ..
+        }
+        | HirOp::SuspendCall {
+            callee_sid, args, ..
+        } => check_call_argument_modes(
+            func,
+            &callee_sid.0,
+            args,
+            fn_param_types.get(&callee_sid.0),
+            local_types,
+            type_ctx,
+            diag,
+        ),
+        _ => {}
+    }
+}
+
+fn check_call_argument_modes_void(
+    func: &HirFunction,
+    op: &HirOpVoid,
+    local_types: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+    fn_param_types: &HashMap<String, Vec<TypeId>>,
+    diag: &mut DiagnosticBag,
+) {
+    if let HirOpVoid::CallVoid {
+        callee_sid, args, ..
+    } = op
+    {
+        check_call_argument_modes(
+            func,
+            &callee_sid.0,
+            args,
+            fn_param_types.get(&callee_sid.0),
+            local_types,
+            type_ctx,
+            diag,
+        );
+    }
+}
+
+fn check_call_argument_modes(
+    func: &HirFunction,
+    callee_sid: &str,
+    args: &[HirValue],
+    param_types: Option<&Vec<TypeId>>,
+    local_types: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+    diag: &mut DiagnosticBag,
+) {
+    let Some(param_types) = param_types else {
+        return;
+    };
+
+    for (idx, arg) in args.iter().enumerate() {
+        let Some(param_ty) = param_types.get(idx).copied() else {
+            continue;
+        };
+        let Some(arg_ty) = value_type(arg, local_types) else {
+            continue;
+        };
+
+        let ok = match param_mode(param_ty, type_ctx) {
+            ParamMode::Borrow => matches!(
+                handle_kind(arg_ty, type_ctx),
+                Some(HandleKind::Borrow | HandleKind::MutBorrow)
+            ),
+            ParamMode::MutBorrow => matches!(handle_kind(arg_ty, type_ctx), Some(HandleKind::MutBorrow)),
+            ParamMode::ByValueCopy | ParamMode::ByValueMove => {
+                !matches!(
+                    handle_kind(arg_ty, type_ctx),
+                    Some(HandleKind::Borrow | HandleKind::MutBorrow)
+                )
+            }
+        };
+
+        if !ok {
+            emit_error(
+                diag,
+                codes::MPO0004,
+                &format!(
+                    "fn '{}': call argument {} does not match parameter ownership mode for callee '{}'",
+                    func.name, idx, callee_sid
+                ),
+            );
+        }
+    }
+}
+
+fn consumed_call_args(
+    args: &[HirValue],
+    param_types: Option<&Vec<TypeId>>,
+    local_types: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+) -> Vec<LocalId> {
+    let mut out = Vec::new();
+    for (idx, arg) in args.iter().enumerate() {
+        let Some(local) = as_local(arg) else {
+            continue;
+        };
+
+        let expected = param_types.and_then(|ps| ps.get(idx)).copied();
+        let consume = match expected {
+            Some(param_ty) => matches!(param_mode(param_ty, type_ctx), ParamMode::ByValueMove),
+            None => value_type(arg, local_types)
+                .map(|ty| is_move_only(ty, type_ctx) && !is_borrow_type(ty, type_ctx))
+                .unwrap_or(false),
+        };
+
+        if consume {
+            out.push(local);
+        }
+    }
+    out
+}
+
 fn analyze_moved_sets(
     func: &HirFunction,
     move_only_locals: &HashSet<LocalId>,
     block_index: &HashMap<u32, usize>,
     preds: &[Vec<usize>],
+    local_types: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+    fn_param_types: &HashMap<String, Vec<TypeId>>,
 ) -> MovedAnalysis {
     let n = func.blocks.len();
     let mut analysis = MovedAnalysis {
@@ -677,14 +1461,15 @@ fn analyze_moved_sets(
 
             let mut cur = new_in.clone();
             for instr in &block.instrs {
-                for local in op_consumed_locals(&instr.op) {
+                for local in op_consumed_locals(&instr.op, local_types, type_ctx, fn_param_types)
+                {
                     if move_only_locals.contains(&local) {
                         cur.insert(local);
                     }
                 }
             }
             for vop in &block.void_ops {
-                for local in op_void_consumed_locals(vop) {
+                for local in op_void_consumed_locals(vop, local_types, type_ctx, fn_param_types) {
                     if move_only_locals.contains(&local) {
                         cur.insert(local);
                     }
@@ -792,7 +1577,10 @@ fn collect_local_types(func: &HirFunction) -> HashMap<LocalId, TypeId> {
     out
 }
 
-fn collect_def_blocks(func: &HirFunction, block_index: &HashMap<u32, usize>) -> HashMap<LocalId, usize> {
+fn collect_def_blocks(
+    func: &HirFunction,
+    block_index: &HashMap<u32, usize>,
+) -> HashMap<LocalId, usize> {
     let mut out = HashMap::new();
     for (local, _) in &func.params {
         out.insert(*local, 0);
@@ -870,7 +1658,11 @@ fn as_local(v: &HirValue) -> Option<LocalId> {
     }
 }
 
-fn is_borrow_value(v: &HirValue, local_types: &HashMap<LocalId, TypeId>, type_ctx: &TypeCtx) -> bool {
+fn is_borrow_value(
+    v: &HirValue,
+    local_types: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+) -> bool {
     value_type(v, local_types)
         .map(|ty| is_borrow_type(ty, type_ctx))
         .unwrap_or(false)
@@ -934,7 +1726,12 @@ fn terminator_used_locals(term: &HirTerminator) -> Vec<LocalId> {
     out
 }
 
-fn op_consumed_locals(op: &HirOp) -> Vec<LocalId> {
+fn op_consumed_locals(
+    op: &HirOp,
+    local_types: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+    fn_param_types: &HashMap<String, Vec<TypeId>>,
+) -> Vec<LocalId> {
     let mut out = Vec::new();
     let push = |v: &HirValue, out: &mut Vec<LocalId>| {
         if let Some(l) = as_local(v) {
@@ -1042,16 +1839,20 @@ fn op_consumed_locals(op: &HirOp) -> Vec<LocalId> {
         | HirOp::Phi { .. } => {}
 
         HirOp::PtrStore { v, .. } => push(v, &mut out),
-        HirOp::Call { args, .. } | HirOp::SuspendCall { args, .. } => {
-            for v in args {
-                push(v, &mut out);
-            }
+        HirOp::Call {
+            callee_sid, args, ..
         }
-        HirOp::CallIndirect { args, .. } | HirOp::CallVoidIndirect { args, .. } => {
-            for v in args {
-                push(v, &mut out);
-            }
-        }
+        | HirOp::SuspendCall {
+            callee_sid, args, ..
+        } => out.extend(consumed_call_args(
+            args,
+            fn_param_types.get(&callee_sid.0),
+            local_types,
+            type_ctx,
+        )),
+        HirOp::CallIndirect { args, .. } | HirOp::CallVoidIndirect { args, .. } => out.extend(
+            consumed_call_args(args, None, local_types, type_ctx),
+        ),
         HirOp::Share { v } => push(v, &mut out),
         HirOp::EnumNew { args, .. } => {
             for (_, v) in args {
@@ -1084,7 +1885,35 @@ fn op_consumed_locals(op: &HirOp) -> Vec<LocalId> {
     out
 }
 
-fn op_void_consumed_locals(op: &HirOpVoid) -> Vec<LocalId> {
+fn op_void_consumed_locals(
+    op: &HirOpVoid,
+    local_types: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+    fn_param_types: &HashMap<String, Vec<TypeId>>,
+) -> Vec<LocalId> {
+    let mut out = Vec::new();
+    match op {
+        HirOpVoid::CallVoid {
+            callee_sid, args, ..
+        } => out.extend(consumed_call_args(
+            args,
+            fn_param_types.get(&callee_sid.0),
+            local_types,
+            type_ctx,
+        )),
+        HirOpVoid::CallVoidIndirect { args, .. } => out.extend(consumed_call_args(
+            args,
+            None,
+            local_types,
+            type_ctx,
+        )),
+        _ => out.extend(op_void_non_call_consumed_locals(op)),
+    }
+
+    out
+}
+
+fn op_void_non_call_consumed_locals(op: &HirOpVoid) -> Vec<LocalId> {
     let mut out = Vec::new();
     let push = |v: &HirValue, out: &mut Vec<LocalId>| {
         if let Some(l) = as_local(v) {
@@ -1093,11 +1922,6 @@ fn op_void_consumed_locals(op: &HirOpVoid) -> Vec<LocalId> {
     };
 
     match op {
-        HirOpVoid::CallVoid { args, .. } => {
-            for v in args {
-                push(v, &mut out);
-            }
-        }
         HirOpVoid::SetField { value, .. } => push(value, &mut out),
         HirOpVoid::ArrSet { val, .. } | HirOpVoid::ArrPush { val, .. } => push(val, &mut out),
         HirOpVoid::MapSet { key, val, .. } => {
@@ -1116,7 +1940,9 @@ fn op_void_consumed_locals(op: &HirOpVoid) -> Vec<LocalId> {
         | HirOpVoid::StrBuilderAppendF64 { .. }
         | HirOpVoid::StrBuilderAppendBool { .. }
         | HirOpVoid::Panic { .. }
-        | HirOpVoid::GpuBarrier => {}
+        | HirOpVoid::GpuBarrier
+        | HirOpVoid::CallVoid { .. }
+        | HirOpVoid::CallVoidIndirect { .. } => {}
     }
 
     out
@@ -1334,6 +2160,12 @@ fn for_each_value_in_void_op(op: &HirOpVoid, mut f: impl FnMut(&HirValue)) {
                 f(arg);
             }
         }
+        HirOpVoid::CallVoidIndirect { callee, args } => {
+            f(callee);
+            for arg in args {
+                f(arg);
+            }
+        }
         HirOpVoid::SetField { obj, value, .. } => {
             f(obj);
             f(value);
@@ -1389,11 +2221,38 @@ fn for_each_value_in_void_op(op: &HirOpVoid, mut f: impl FnMut(&HirValue)) {
 fn for_each_value_in_terminator(term: &HirTerminator, mut f: impl FnMut(&HirValue)) {
     match term {
         HirTerminator::Ret(Some(v)) => f(v),
-        HirTerminator::Ret(None)
-        | HirTerminator::Br(_)
-        | HirTerminator::Unreachable => {}
+        HirTerminator::Ret(None) | HirTerminator::Br(_) | HirTerminator::Unreachable => {}
         HirTerminator::Cbr { cond, .. } => f(cond),
         HirTerminator::Switch { val, .. } => f(val),
+    }
+}
+
+fn ownership_why_trace(code: &str, message: &str) -> Option<WhyTrace> {
+    match code {
+        codes::MPO0003 => Some(WhyTrace::ownership(vec![
+            WhyEvent::new("Definition site: borrow value is introduced (borrow op or borrowed parameter)."),
+            WhyEvent::new(format!("Conflicting use site: {message}")),
+        ])),
+        codes::MPO0004 => Some(WhyTrace::ownership(vec![
+            WhyEvent::new("Definition site: reference ownership mode is established for the receiver value."),
+            WhyEvent::new(format!("Conflicting use site: {message}")),
+        ])),
+        codes::MPO0011 => Some(WhyTrace::ownership(vec![
+            WhyEvent::new("Definition site: move-only value is defined and later borrowed."),
+            WhyEvent::new("Borrow chain: an active shared/mut borrow is still live when move is attempted."),
+            WhyEvent::new(format!("Conflicting use site: {message}")),
+        ])),
+        codes::MPO0101 => Some(WhyTrace::ownership(vec![
+            WhyEvent::new("Definition site: borrow is created in a predecessor/source block."),
+            WhyEvent::new("Control-flow conflict: borrow is consumed in a different block."),
+            WhyEvent::new(format!("Conflicting use site: {message}")),
+        ])),
+        codes::MPO0102 => Some(WhyTrace::ownership(vec![
+            WhyEvent::new("Definition site: borrow appears in phi result or phi incoming value."),
+            WhyEvent::new("Merge-point conflict: borrows are not allowed to flow through phi nodes."),
+            WhyEvent::new(format!("Conflicting use site: {message}")),
+        ])),
+        _ => None,
     }
 }
 
@@ -1406,7 +2265,7 @@ fn emit_error(diag: &mut DiagnosticBag, code: &str, message: &str) {
         secondary_spans: vec![],
         message: message.to_string(),
         explanation_md: None,
-        why: None,
+        why: ownership_why_trace(code, message),
         suggested_fixes: vec![],
     });
 }
@@ -1477,6 +2336,306 @@ mod tests {
         assert!(
             diag.diagnostics.iter().any(|d| d.code == codes::MPO0102),
             "expected MPO0102 diagnostics, got: {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
+        );
+        let phi_diag = diag
+            .diagnostics
+            .iter()
+            .find(|d| d.code == codes::MPO0102)
+            .expect("missing MPO0102 diagnostic");
+        assert!(
+            phi_diag
+                .why
+                .as_ref()
+                .map(|why| why.trace.len() >= 2)
+                .unwrap_or(false),
+            "expected MPO0102 diagnostic to include why.trace with definition/conflict events"
+        );
+    }
+
+    #[test]
+    fn test_projection_rules_and_map_get_dupable_enforced() {
+        let mut type_ctx = TypeCtx::new();
+        let user_sid = Sid("T:OWNPROJ0000".to_string());
+        let weak_str = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Weak,
+            base: HeapBase::BuiltinStr,
+        });
+        let borrow_str = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::BuiltinStr,
+        });
+        let obj_borrow = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::UserType {
+                type_sid: user_sid.clone(),
+                targs: vec![],
+            },
+        });
+        let arr_borrow_unique = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::BuiltinArray {
+                elem: fixed_type_ids::STR,
+            },
+        });
+        let map_borrow_weak = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::BuiltinMap {
+                key: fixed_type_ids::I32,
+                val: weak_str,
+            },
+        });
+        let map_borrow_unique = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::BuiltinMap {
+                key: fixed_type_ids::I32,
+                val: fixed_type_ids::STR,
+            },
+        });
+        let option_str = type_ctx.intern(TypeKind::BuiltinOption {
+            inner: fixed_type_ids::STR,
+        });
+
+        let zero = HirValue::Const(magpie_hir::HirConst {
+            ty: fixed_type_ids::I32,
+            lit: magpie_hir::HirConstLit::IntLit(0),
+        });
+
+        let module = HirModule {
+            module_id: ModuleId(0),
+            sid: Sid("M:OWNPROJ0000".to_string()),
+            path: "test.own".to_string(),
+            functions: vec![HirFunction {
+                fn_id: FnId(0),
+                sid: Sid("F:OWNPROJ0000".to_string()),
+                name: "projection_bad".to_string(),
+                params: vec![
+                    (LocalId(0), obj_borrow),
+                    (LocalId(1), arr_borrow_unique),
+                    (LocalId(2), map_borrow_weak),
+                    (LocalId(3), map_borrow_unique),
+                ],
+                ret_ty: fixed_type_ids::UNIT,
+                blocks: vec![HirBlock {
+                    id: BlockId(0),
+                    instrs: vec![
+                        HirInstr {
+                            dst: LocalId(10),
+                            ty: borrow_str,
+                            op: HirOp::GetField {
+                                obj: HirValue::Local(LocalId(0)),
+                                field: "copy_i32".to_string(),
+                            },
+                        },
+                        HirInstr {
+                            dst: LocalId(11),
+                            ty: fixed_type_ids::STR,
+                            op: HirOp::ArrGet {
+                                arr: HirValue::Local(LocalId(1)),
+                                idx: zero.clone(),
+                            },
+                        },
+                        HirInstr {
+                            dst: LocalId(12),
+                            ty: borrow_str,
+                            op: HirOp::MapGetRef {
+                                map: HirValue::Local(LocalId(2)),
+                                key: zero.clone(),
+                            },
+                        },
+                        HirInstr {
+                            dst: LocalId(13),
+                            ty: option_str,
+                            op: HirOp::MapGet {
+                                map: HirValue::Local(LocalId(3)),
+                                key: zero,
+                            },
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: HirTerminator::Ret(None),
+                }],
+                is_async: false,
+                is_unsafe: false,
+            }],
+            globals: vec![],
+            type_decls: vec![magpie_hir::HirTypeDecl::Struct {
+                sid: user_sid,
+                name: "TProj".to_string(),
+                fields: vec![
+                    ("copy_i32".to_string(), fixed_type_ids::I32),
+                    ("strong_str".to_string(), fixed_type_ids::STR),
+                    ("weak_str".to_string(), weak_str),
+                ],
+            }],
+        };
+
+        let mut diag = DiagnosticBag::new(32);
+        let _ = check_ownership(&module, &type_ctx, &mut diag);
+
+        assert!(
+            diag.diagnostics.iter().any(|d| d.code == codes::MPO0004),
+            "expected MPO0004 projection diagnostics, got: {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            diag.diagnostics.iter().any(|d| d.code == codes::MPO0103),
+            "expected MPO0103 map.get Dupable diagnostics, got: {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_call_borrow_param_not_consumed() {
+        let mut type_ctx = TypeCtx::new();
+        let borrow_str = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::BuiltinStr,
+        });
+
+        let callee_sid = Sid("F:TAKEBORROW0".to_string());
+        let caller_sid = Sid("F:CALLER00000".to_string());
+        let module = HirModule {
+            module_id: ModuleId(0),
+            sid: Sid("M:OWNCALL0000".to_string()),
+            path: "test.own".to_string(),
+            functions: vec![
+                HirFunction {
+                    fn_id: FnId(0),
+                    sid: callee_sid.clone(),
+                    name: "take_borrow".to_string(),
+                    params: vec![(LocalId(0), borrow_str)],
+                    ret_ty: fixed_type_ids::UNIT,
+                    blocks: vec![HirBlock {
+                        id: BlockId(0),
+                        instrs: vec![],
+                        void_ops: vec![],
+                        terminator: HirTerminator::Ret(None),
+                    }],
+                    is_async: false,
+                    is_unsafe: false,
+                },
+                HirFunction {
+                    fn_id: FnId(1),
+                    sid: caller_sid,
+                    name: "caller".to_string(),
+                    params: vec![(LocalId(0), borrow_str)],
+                    ret_ty: fixed_type_ids::UNIT,
+                    blocks: vec![HirBlock {
+                        id: BlockId(0),
+                        instrs: vec![
+                            HirInstr {
+                                dst: LocalId(1),
+                                ty: fixed_type_ids::UNIT,
+                                op: HirOp::Call {
+                                    callee_sid: callee_sid.clone(),
+                                    inst: vec![],
+                                    args: vec![HirValue::Local(LocalId(0))],
+                                },
+                            },
+                            HirInstr {
+                                dst: LocalId(2),
+                                ty: fixed_type_ids::UNIT,
+                                op: HirOp::Call {
+                                    callee_sid,
+                                    inst: vec![],
+                                    args: vec![HirValue::Local(LocalId(0))],
+                                },
+                            },
+                        ],
+                        void_ops: vec![],
+                        terminator: HirTerminator::Ret(None),
+                    }],
+                    is_async: false,
+                    is_unsafe: false,
+                },
+            ],
+            globals: vec![],
+            type_decls: vec![],
+        };
+
+        let mut diag = DiagnosticBag::new(32);
+        let _ = check_ownership(&module, &type_ctx, &mut diag);
+        assert!(
+            !diag.diagnostics.iter().any(|d| d.code == "MPO0007"),
+            "borrow call args should not be consumed; got diagnostics: {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_spawn_callable_requires_send_captures() {
+        let mut type_ctx = TypeCtx::new();
+        let borrow_str = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::BuiltinStr,
+        });
+        let callable_ty = type_ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Unique,
+            base: HeapBase::Callable {
+                sig_sid: Sid("E:SPAWNTEST0".to_string()),
+            },
+        });
+
+        let module = HirModule {
+            module_id: ModuleId(0),
+            sid: Sid("M:SPAWNTEST0".to_string()),
+            path: "test.own".to_string(),
+            functions: vec![HirFunction {
+                fn_id: FnId(0),
+                sid: Sid("F:SPAWNTEST0".to_string()),
+                name: "spawn_non_send_capture".to_string(),
+                params: vec![(LocalId(0), borrow_str)],
+                ret_ty: fixed_type_ids::UNIT,
+                blocks: vec![HirBlock {
+                    id: BlockId(0),
+                    instrs: vec![
+                        HirInstr {
+                            dst: LocalId(1),
+                            ty: callable_ty,
+                            op: HirOp::CallableCapture {
+                                fn_ref: Sid("F:WORKITEM00".to_string()),
+                                captures: vec![("msg".to_string(), HirValue::Local(LocalId(0)))],
+                            },
+                        },
+                        HirInstr {
+                            dst: LocalId(2),
+                            ty: fixed_type_ids::UNIT,
+                            op: HirOp::Call {
+                                callee_sid: Sid("F:std.thread.spawn".to_string()),
+                                inst: vec![],
+                                args: vec![HirValue::Local(LocalId(1))],
+                            },
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: HirTerminator::Ret(None),
+                }],
+                is_async: false,
+                is_unsafe: false,
+            }],
+            globals: vec![],
+            type_decls: vec![],
+        };
+
+        let mut diag = DiagnosticBag::new(32);
+        let _ = check_ownership(&module, &type_ctx, &mut diag);
+
+        assert!(
+            diag.diagnostics.iter().any(|d| d.code == "MPO0201"),
+            "expected MPO0201 diagnostics, got: {:?}",
             diag.diagnostics
                 .iter()
                 .map(|d| d.code.as_str())

@@ -249,33 +249,15 @@ fn scan_terms(text: &str, apply_stopwords: bool) -> Vec<MmsTerm> {
         let mut best: Option<(usize, MmsTermKind, usize)> = None;
 
         consider_candidate(&mut best, i, 0, match_diag(text, i), MmsTermKind::Diag);
-        consider_candidate(
-            &mut best,
-            i,
-            1,
-            match_symbol(text, i),
-            MmsTermKind::Symbol,
-        );
+        consider_candidate(&mut best, i, 1, match_symbol(text, i), MmsTermKind::Symbol);
         consider_candidate(&mut best, i, 2, match_path(text, i), MmsTermKind::Path);
-        consider_candidate(
-            &mut best,
-            i,
-            3,
-            match_number(text, i),
-            MmsTermKind::Number,
-        );
+        consider_candidate(&mut best, i, 3, match_number(text, i), MmsTermKind::Number);
         consider_candidate(&mut best, i, 4, match_word(text, i), MmsTermKind::Word);
 
         if let Some((end, kind, _priority_rank)) = best {
             let raw_token = &text[i..end];
             let term_text = fold_case(raw_token);
-            maybe_push_term(
-                &mut out,
-                &mut position,
-                term_text,
-                kind,
-                apply_stopwords,
-            );
+            maybe_push_term(&mut out, &mut position, term_text, kind, apply_stopwords);
 
             if matches!(kind, MmsTermKind::Symbol | MmsTermKind::Word) {
                 let mut seen_codes = BTreeSet::new();
@@ -496,8 +478,7 @@ fn truncate_chars(text: &str, limit: usize) -> String {
 fn is_stopword(term: &str) -> bool {
     matches!(
         term,
-        "a"
-            | "an"
+        "a" | "an"
             | "and"
             | "are"
             | "as"
@@ -584,8 +565,9 @@ fn split_camel_and_digit_boundaries(piece: &str) -> Vec<String> {
         let next = chars.get(i + 1).copied();
 
         let lower_to_upper = prev.is_lowercase() && curr.is_uppercase();
-        let acronym_to_word =
-            prev.is_uppercase() && curr.is_uppercase() && next.map(char::is_lowercase).unwrap_or(false);
+        let acronym_to_word = prev.is_uppercase()
+            && curr.is_uppercase()
+            && next.map(char::is_lowercase).unwrap_or(false);
         let alpha_digit = prev.is_alphabetic() && curr.is_ascii_digit();
         let digit_alpha = prev.is_ascii_digit() && curr.is_alphabetic();
 
@@ -668,8 +650,7 @@ fn doc_has_module_overlap(item: &MmsItem, query_module_terms: &BTreeSet<String>)
 }
 
 fn item_token_cost(item: &MmsItem) -> u32 {
-    item
-        .token_cost
+    item.token_cost
         .get("approx:utf8_4chars")
         .copied()
         .or_else(|| item.token_cost.values().min().copied())
@@ -681,4 +662,77 @@ fn compare_results(a: &MmsResult, b: &MmsResult) -> Ordering {
         .total_cmp(&a.score)
         .then_with(|| a.token_cost.cmp(&b.token_cost))
         .then_with(|| a.item_id.cmp(&b.item_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_item(
+        item_id: &str,
+        kind: &str,
+        text: &str,
+        tags: Vec<&str>,
+        priority: u32,
+        cost: u32,
+    ) -> MmsItem {
+        let mut token_cost = BTreeMap::new();
+        token_cost.insert("approx:utf8_4chars".to_string(), cost);
+
+        MmsItem {
+            item_id: item_id.to_string(),
+            kind: kind.to_string(),
+            sid: format!("S:{item_id}"),
+            fqn: format!("demo::{item_id}"),
+            module_sid: "M:demo".to_string(),
+            source_digest: "src".to_string(),
+            body_digest: "body".to_string(),
+            text: text.to_string(),
+            tags: tags.into_iter().map(str::to_string).collect(),
+            priority,
+            token_cost,
+        }
+    }
+
+    #[test]
+    fn query_bm25_prioritizes_diagnostic_match() {
+        let items = vec![
+            make_item(
+                "diag-1",
+                "diag_template",
+                "MPP0001 raised in module alpha due to missing export",
+                vec!["MPP0001"],
+                100,
+                40,
+            ),
+            make_item(
+                "util-1",
+                "spec_excerpt",
+                "Array and map helper routines for utility package",
+                vec![],
+                20,
+                12,
+            ),
+        ];
+
+        let index = build_index(&items);
+        let results = query_bm25(&index, "mpp0001 alpha", 5);
+
+        assert!(!results.is_empty(), "query should produce matches");
+        assert_eq!(results[0].item_id, "diag-1");
+        assert!(results[0].score.is_finite() && results[0].score > 0.0);
+        assert_eq!(results[0].token_cost, 40);
+    }
+
+    #[test]
+    fn tokenize_mms_normalizes_diag_codes_to_uppercase() {
+        let terms = tokenize_mms("mpp0001 and MpP0002");
+        let diag_terms = terms
+            .into_iter()
+            .filter(|term| term.term_kind == MmsTermKind::Diag)
+            .map(|term| term.term_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(diag_terms, vec!["MPP0001", "MPP0002"]);
+    }
 }

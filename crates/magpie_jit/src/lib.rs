@@ -2,9 +2,17 @@
 //!
 //! REPL/JIT scaffolding for SPEC §23.
 
+use magpie_ast::FileId;
+use magpie_codegen_llvm::codegen_module;
 use magpie_diag::{Diagnostic, DiagnosticBag, Severity};
+use magpie_driver::lower_hir_module_to_mpir;
+use magpie_lex::lex;
+use magpie_mpir::print_mpir;
+use magpie_parse::parse_file;
+use magpie_sema::{lower_to_hir, resolve_modules};
+use magpie_types::TypeCtx;
 use std::collections::HashMap;
-use std::process::Command;
+use std::io::{self, Write};
 
 const SESSION_HEADER: &str = "MAGPIE_REPL_V1";
 
@@ -45,6 +53,12 @@ pub struct CompiledModule {
     pub ty: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct EvalArtifacts {
+    mpir: String,
+    llvm_ir: String,
+}
+
 pub fn parse_repl_command(input: &str) -> ReplCommand {
     let trimmed = input.trim();
 
@@ -69,6 +83,66 @@ pub fn parse_repl_command(input: &str) -> ReplCommand {
 
 pub fn create_repl_session() -> ReplSession {
     ReplSession::default()
+}
+
+pub fn run_repl() -> Result<(), String> {
+    let mut session = create_repl_session();
+    let mut diag = DiagnosticBag::new(200);
+    let stdin = io::stdin();
+    let mut line = String::new();
+
+    loop {
+        print!("magpie> ");
+        io::stdout()
+            .flush()
+            .map_err(|err| format!("failed to flush repl prompt: {err}"))?;
+        line.clear();
+
+        let read = stdin
+            .read_line(&mut line)
+            .map_err(|err| format!("failed to read repl input: {err}"))?;
+        if read == 0 {
+            break;
+        }
+
+        let input = line.trim_end_matches(&['\n', '\r'][..]);
+        match parse_repl_command(input) {
+            ReplCommand::Quit => break,
+            ReplCommand::DiagLast => {
+                if let Some(last) = session.diagnostics_history.last() {
+                    print_diagnostic(last);
+                } else {
+                    println!("no diagnostics");
+                }
+            }
+            ReplCommand::Type(expr) => match inspect_type(&session, &expr) {
+                Some(ty) => println!("{ty}"),
+                None => println!("unknown"),
+            },
+            ReplCommand::Ir(expr) => match inspect_ir(&session, &expr) {
+                Some(ir) => println!("{ir}"),
+                None => println!("no IR available"),
+            },
+            ReplCommand::Llvm(expr) => match inspect_llvm_ir(&session, &expr) {
+                Some(ir) => println!("{ir}"),
+                None => println!("no LLVM IR available"),
+            },
+            ReplCommand::Eval(code) => {
+                let result = eval_cell(&mut session, &code, &mut diag);
+                if let Some(llvm_ir) = &result.llvm_ir {
+                    println!("{llvm_ir}");
+                } else if result.diagnostics.is_empty() {
+                    println!("{}", result.output);
+                } else {
+                    for diagnostic in &result.diagnostics {
+                        print_diagnostic(diagnostic);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn eval_cell(session: &mut ReplSession, code: &str, diag: &mut DiagnosticBag) -> ReplResult {
@@ -102,15 +176,10 @@ pub fn eval_cell(session: &mut ReplSession, code: &str, diag: &mut DiagnosticBag
         ok = false;
     }
 
-    // Staged pipeline scaffold (SPEC §23.2 / §23.3):
-    // lex -> parse -> resolve -> HIR -> MPIR -> LLVM IR.
-    let ir = render_mpir_stub(&module_name, &fn_name, &wrapped_source);
-    let llvm_ir = render_llvm_stub(&module_name, &fn_name, infer_expression_type(code).as_deref());
-
-    let compile_note = if ok {
-        compile_stub_with_llc_clang(&module_name, &llvm_ir, diag)
+    let compiled = if ok {
+        eval_source_to_artifacts(&wrapped_source, diag).ok()
     } else {
-        "pipeline stopped before native compile step".to_string()
+        None
     };
 
     let inferred_ty = infer_expression_type(code);
@@ -121,20 +190,20 @@ pub fn eval_cell(session: &mut ReplSession, code: &str, diag: &mut DiagnosticBag
         }
     }
 
-    let llvm_ir_out = if ok { Some(llvm_ir.clone()) } else { None };
-    let output = if ok {
-        format!("compiled {module_name}::@{fn_name} ({compile_note})")
+    let llvm_ir_out = compiled.as_ref().map(|artifacts| artifacts.llvm_ir.clone());
+    let output = if compiled.is_some() {
+        format!("compiled {module_name}::@{fn_name}")
     } else {
         format!("failed to compile {module_name}::@{fn_name}")
     };
 
-    if ok {
+    if let Some(artifacts) = compiled {
         session.compiled_modules.push(CompiledModule {
             module_name: module_name.clone(),
             fn_name: fn_name.clone(),
             source: wrapped_source,
-            ir,
-            llvm_ir,
+            ir: artifacts.mpir,
+            llvm_ir: artifacts.llvm_ir,
             output: output.clone(),
             ty: inferred_ty.clone(),
         });
@@ -163,7 +232,12 @@ pub fn inspect_type(session: &ReplSession, expr: &str) -> Option<String> {
         .symbol_table
         .get(expr)
         .cloned()
-        .or_else(|| session.symbol_table.get(expr.trim_start_matches('@')).cloned())
+        .or_else(|| {
+            session
+                .symbol_table
+                .get(expr.trim_start_matches('@'))
+                .cloned()
+        })
         .or_else(|| infer_expression_type(expr))
 }
 
@@ -179,6 +253,20 @@ pub fn inspect_ir(session: &ReplSession, fn_name: &str) -> Option<String> {
         .rev()
         .find(|m| m.fn_name == query || m.module_name == query)
         .map(|m| m.ir.clone())
+}
+
+pub fn inspect_llvm_ir(session: &ReplSession, fn_name: &str) -> Option<String> {
+    let query = fn_name.trim().trim_start_matches('@');
+    if query.is_empty() {
+        return session.compiled_modules.last().map(|m| m.llvm_ir.clone());
+    }
+
+    session
+        .compiled_modules
+        .iter()
+        .rev()
+        .find(|m| m.fn_name == query || m.module_name == query)
+        .map(|m| m.llvm_ir.clone())
 }
 
 pub fn save_session(session: &ReplSession) -> String {
@@ -219,10 +307,7 @@ pub fn save_session(session: &ReplSession) -> String {
         out.push('\n');
     }
 
-    out.push_str(&format!(
-        "modules\t{}\n",
-        session.compiled_modules.len()
-    ));
+    out.push_str(&format!("modules\t{}\n", session.compiled_modules.len()));
     for module in &session.compiled_modules {
         out.push_str("mod\t");
         out.push_str(&escape_field(&module.module_name));
@@ -347,81 +432,50 @@ fn wrap_cell_source(module_name: &str, fn_name: &str, code: &str) -> String {
     )
 }
 
-fn render_mpir_stub(module_name: &str, fn_name: &str, wrapped_source: &str) -> String {
-    let mut out = String::new();
-    out.push_str("mpir.version 0.1\n");
-    out.push_str(&format!("module {module_name}\n"));
-    out.push_str(&format!("fn @{fn_name}() -> type_id 5\n"));
-    out.push_str("{\n  bb0:\n    ret const.i32 0\n}\n\n");
-    out.push_str("; wrapped source\n");
-    out.push_str(wrapped_source);
-    out
+pub fn eval_source_to_llvm_ir(source: &str, diag: &mut DiagnosticBag) -> Result<String, ()> {
+    eval_source_to_artifacts(source, diag).map(|artifacts| artifacts.llvm_ir)
 }
 
-fn render_llvm_stub(module_name: &str, fn_name: &str, inferred_ty: Option<&str>) -> String {
-    let llvm_ret_ty = match inferred_ty.unwrap_or("i32") {
-        "bool" => "i1",
-        "i32" => "i32",
-        "i64" => "i64",
-        "f64" => "double",
-        "String" => "ptr",
-        _ => "i32",
-    };
-
-    let ret_value = match llvm_ret_ty {
-        "i1" => "0",
-        "i32" => "0",
-        "i64" => "0",
-        "double" => "0.0",
-        "ptr" => "null",
-        _ => "0",
-    };
-
-    format!(
-        "; ModuleID = '{module_name}'\nsource_filename = \"{module_name}\"\n\ndefine {llvm_ret_ty} @{fn_name}() {{\nentry:\n  ret {llvm_ret_ty} {ret_value}\n}}\n"
-    )
-}
-
-fn compile_stub_with_llc_clang(module_name: &str, llvm_ir: &str, diag: &mut DiagnosticBag) -> String {
-    let _ = llvm_ir;
-    let llc_ready = command_available("llc");
-    let clang_ready = command_available("clang");
-
-    if llc_ready && clang_ready {
-        emit_diag(
-            diag,
-            "MPJ0100",
-            Severity::Info,
-            "native compile stub",
-            format!(
-                "llc and clang are available for module '{}'; native linking is currently stubbed.",
-                module_name
-            ),
-        );
-        "llc+clang detected; native compile step stubbed".to_string()
-    } else {
-        emit_diag(
-            diag,
-            "MPJ0101",
-            Severity::Warning,
-            "native toolchain unavailable",
-            format!(
-                "Skipping native compile for module '{}': llc={} clang={}.",
-                module_name,
-                llc_ready,
-                clang_ready
-            ),
-        );
-        "native compile skipped (toolchain missing or disabled)".to_string()
+fn eval_source_to_artifacts(source: &str, diag: &mut DiagnosticBag) -> Result<EvalArtifacts, ()> {
+    let file_id = FileId(0);
+    let lex_errors = diag.error_count();
+    let tokens = lex(file_id, source, diag);
+    if diag.error_count() > lex_errors {
+        return Err(());
     }
-}
 
-fn command_available(bin: &str) -> bool {
-    Command::new(bin)
-        .arg("--version")
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+    let ast = parse_file(&tokens, file_id, diag)?;
+    let resolved_modules = resolve_modules(std::slice::from_ref(&ast), diag)?;
+
+    let mut type_ctx = TypeCtx::new();
+    for resolved in &resolved_modules {
+        let hir_module = lower_to_hir(resolved, &mut type_ctx, diag)?;
+        let mpir_module = lower_hir_module_to_mpir(&hir_module, &type_ctx);
+        let mpir = print_mpir(&mpir_module, &type_ctx);
+        let llvm_ir = match codegen_module(&mpir_module, &type_ctx) {
+            Ok(llvm_ir) => llvm_ir,
+            Err(err) => {
+                emit_diag(
+                    diag,
+                    "MPG0001",
+                    Severity::Error,
+                    "llvm codegen failed",
+                    err,
+                );
+                return Err(());
+            }
+        };
+        return Ok(EvalArtifacts { mpir, llvm_ir });
+    }
+
+    emit_diag(
+        diag,
+        "MPJ0003",
+        Severity::Error,
+        "empty lowered module",
+        "REPL evaluation produced no lowered modules.",
+    );
+    Err(())
 }
 
 fn infer_expression_type(expr: &str) -> Option<String> {
@@ -491,6 +545,15 @@ fn emit_diag(
         why: None,
         suggested_fixes: Vec::new(),
     });
+}
+
+fn print_diagnostic(diag: &Diagnostic) {
+    println!(
+        "{} [{}] {}",
+        severity_to_str(&diag.severity),
+        diag.code,
+        diag.message
+    );
 }
 
 fn collect_new_diagnostics(diag: &DiagnosticBag, from: usize) -> Vec<Diagnostic> {

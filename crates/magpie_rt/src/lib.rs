@@ -6,9 +6,10 @@
 #![allow(clippy::missing_safety_doc)]
 
 use std::alloc::{self, Layout};
+use std::cell::UnsafeCell;
 use std::ffi::c_char;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Mutex, Once, OnceLock, RwLock};
 
 // ---------------------------------------------------------------------------
 // §20.1.1  Object header
@@ -80,6 +81,18 @@ pub const TYPE_ID_STR: u32 = 20;
 pub const TYPE_ID_STRBUILDER: u32 = 21;
 pub const TYPE_ID_ARRAY: u32 = 22;
 pub const TYPE_ID_MAP: u32 = 23;
+pub const TYPE_ID_BOOL: u32 = 1;
+pub const TYPE_ID_I8: u32 = 2;
+pub const TYPE_ID_I16: u32 = 3;
+pub const TYPE_ID_I32: u32 = 4;
+pub const TYPE_ID_I64: u32 = 5;
+pub const TYPE_ID_U8: u32 = 7;
+pub const TYPE_ID_U16: u32 = 8;
+pub const TYPE_ID_U32: u32 = 9;
+pub const TYPE_ID_U64: u32 = 10;
+pub const TYPE_ID_F32: u32 = 14;
+pub const TYPE_ID_F64: u32 = 15;
+pub const TYPE_ID_TCALLABLE: u32 = 26;
 
 // ---------------------------------------------------------------------------
 // Global type registry
@@ -331,7 +344,12 @@ pub unsafe extern "C" fn mp_rt_weak_upgrade(obj: *mut MpRtHeader) -> *mut MpRtHe
         if current == 0 {
             return std::ptr::null_mut();
         }
-        match strong.compare_exchange_weak(current, current + 1, Ordering::Acquire, Ordering::Relaxed) {
+        match strong.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
             Ok(_) => return obj,
             Err(_) => continue,
         }
@@ -350,7 +368,12 @@ pub unsafe extern "C" fn mp_rt_weak_upgrade(obj: *mut MpRtHeader) -> *mut MpRtHe
 ///
 /// The returned pointer is the header; payload starts at offset 32
 /// (assuming payload_align <= 8, which is true for all builtin types).
-unsafe fn alloc_builtin(type_id: u32, flags: u32, payload_size: usize, payload_align: usize) -> *mut MpRtHeader {
+unsafe fn alloc_builtin(
+    type_id: u32,
+    flags: u32,
+    payload_size: usize,
+    payload_align: usize,
+) -> *mut MpRtHeader {
     let header_layout = Layout::new::<MpRtHeader>();
     let payload_layout = Layout::from_size_align(payload_size.max(1), payload_align).unwrap();
     let (combined, _payload_offset) = header_layout.extend(payload_layout).unwrap();
@@ -392,7 +415,12 @@ unsafe fn str_payload_base(obj: *mut MpRtHeader) -> *mut u8 {
 #[no_mangle]
 pub unsafe extern "C" fn mp_rt_str_from_utf8(bytes: *const u8, len: u64) -> *mut MpRtHeader {
     let payload_size = (std::mem::size_of::<u64>() as u64 + len) as usize;
-    let obj = alloc_builtin(TYPE_ID_STR, FLAG_HEAP | FLAG_SEND | FLAG_SYNC, payload_size, 8);
+    let obj = alloc_builtin(
+        TYPE_ID_STR,
+        FLAG_HEAP | FLAG_SEND | FLAG_SYNC,
+        payload_size,
+        8,
+    );
 
     let base = str_payload_base(obj);
     // Write length.
@@ -436,7 +464,11 @@ pub unsafe extern "C" fn mp_rt_str_eq(a: *mut MpRtHeader, b: *mut MpRtHeader) ->
     }
     let bytes_a = std::slice::from_raw_parts(base_a.add(8), len_a as usize);
     let bytes_b = std::slice::from_raw_parts(base_b.add(8), len_b as usize);
-    if bytes_a == bytes_b { 1 } else { 0 }
+    if bytes_a == bytes_b {
+        1
+    } else {
+        0
+    }
 }
 
 /// Concatenate two Str objects and return a new Str.
@@ -444,7 +476,10 @@ pub unsafe extern "C" fn mp_rt_str_eq(a: *mut MpRtHeader, b: *mut MpRtHeader) ->
 /// # Safety
 /// Both `a` and `b` must be valid Str objects.
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_str_concat(a: *mut MpRtHeader, b: *mut MpRtHeader) -> *mut MpRtHeader {
+pub unsafe extern "C" fn mp_rt_str_concat(
+    a: *mut MpRtHeader,
+    b: *mut MpRtHeader,
+) -> *mut MpRtHeader {
     let base_a = str_payload_base(a);
     let base_b = str_payload_base(b);
     let len_a = *(base_a as *const u64);
@@ -452,7 +487,12 @@ pub unsafe extern "C" fn mp_rt_str_concat(a: *mut MpRtHeader, b: *mut MpRtHeader
     let new_len = len_a + len_b;
 
     let payload_size = (std::mem::size_of::<u64>() as u64 + new_len) as usize;
-    let obj = alloc_builtin(TYPE_ID_STR, FLAG_HEAP | FLAG_SEND | FLAG_SYNC, payload_size, 8);
+    let obj = alloc_builtin(
+        TYPE_ID_STR,
+        FLAG_HEAP | FLAG_SEND | FLAG_SYNC,
+        payload_size,
+        8,
+    );
 
     let base = str_payload_base(obj);
     *(base as *mut u64) = new_len;
@@ -473,7 +513,11 @@ pub unsafe extern "C" fn mp_rt_str_concat(a: *mut MpRtHeader, b: *mut MpRtHeader
 /// # Safety
 /// `s` must be a valid Str object.
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_str_slice(s: *mut MpRtHeader, start: u64, end: u64) -> *mut MpRtHeader {
+pub unsafe extern "C" fn mp_rt_str_slice(
+    s: *mut MpRtHeader,
+    start: u64,
+    end: u64,
+) -> *mut MpRtHeader {
     let base = str_payload_base(s);
     let len = *(base as *const u64);
     assert!(start <= end && end <= len, "mp_rt_str_slice: out of bounds");
@@ -593,6 +637,779 @@ pub unsafe extern "C" fn mp_rt_panic(str_msg: *mut MpRtHeader) -> ! {
     std::process::abort()
 }
 
+#[no_mangle]
+pub extern "C" fn mp_std_println(s: *const u8, len: usize) {
+    let slice = unsafe { std::slice::from_raw_parts(s, len) };
+    let text = std::str::from_utf8(slice).unwrap_or("<invalid utf8>");
+    println!("{}", text);
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_eprintln(s: *const u8, len: usize) {
+    let slice = unsafe { std::slice::from_raw_parts(s, len) };
+    let text = std::str::from_utf8(slice).unwrap_or("<invalid utf8>");
+    eprintln!("{}", text);
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_readln() -> *mut u8 {
+    use std::io::{self, BufRead};
+
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line).unwrap_or(0);
+    if line.ends_with('\n') {
+        line.pop();
+    }
+    if line.ends_with('\r') {
+        line.pop();
+    }
+    // Return as a Magpie TStr (ptr to heap-allocated UTF-8 with length prefix)
+    // For now, use the same pattern as mp_rt_str_from_utf8
+    let bytes = line.into_bytes();
+    let len = bytes.len();
+    let layout = std::alloc::Layout::from_size_align(16 + len, 8).unwrap();
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    if ptr.is_null() {
+        std::process::abort();
+    }
+    unsafe {
+        *(ptr as *mut u64) = len as u64;
+        *(ptr.add(8) as *mut u64) = len as u64;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), len);
+    }
+    ptr
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_std_assert(cond: i32, msg: *const u8, msg_len: usize) {
+    if cond == 0 {
+        let slice = std::slice::from_raw_parts(msg, msg_len);
+        let text = std::str::from_utf8(slice).unwrap_or("assertion failed");
+        eprintln!("assertion failed: {}", text);
+        std::process::abort();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_std_assert_eq(a: i64, b: i64) {
+    if a != b {
+        eprintln!("assertion failed: {} != {}", a, b);
+        std::process::abort();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_hash_str(s: *mut MpRtHeader) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    unsafe { str_to_rust_str(s) }.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_hash_i32(v: i32) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_hash_i64(v: i64) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_abs_i32(v: i32) -> i32 {
+    v.abs()
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_abs_i64(v: i64) -> i64 {
+    v.abs()
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_sqrt_f64(v: f64) -> f64 {
+    v.sqrt()
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_min_i32(a: i32, b: i32) -> i32 {
+    a.min(b)
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_max_i32(a: i32, b: i32) -> i32 {
+    a.max(b)
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_env_var(name: *const u8, name_len: usize) -> *mut MpRtHeader {
+    let slice = unsafe { std::slice::from_raw_parts(name, name_len) };
+    let key = std::str::from_utf8(slice).unwrap_or("");
+    match std::env::var(key) {
+        Ok(val) => unsafe { mp_rt_str_from_utf8(val.as_ptr(), val.len() as u64) },
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn mp_std_args() -> *mut MpRtHeader {
+    let args = std::env::args().collect::<Vec<_>>();
+    let arr = unsafe {
+        mp_rt_arr_new(
+            TYPE_ID_STR,
+            std::mem::size_of::<*mut MpRtHeader>() as u64,
+            args.len() as u64,
+        )
+    };
+
+    for arg in args {
+        let arg_obj = unsafe { mp_rt_str_from_utf8(arg.as_ptr(), arg.len() as u64) };
+        let arg_ptr = &arg_obj as *const *mut MpRtHeader as *const u8;
+        unsafe {
+            mp_rt_arr_push(arr, arg_ptr, std::mem::size_of::<*mut MpRtHeader>() as u64);
+        }
+    }
+
+    arr
+}
+
+// ---------------------------------------------------------------------------
+// Phase B runtime functions
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct MpRtCallablePayload {
+    vtable_ptr: *const MpRtCallableVtable,
+    data_ptr: *mut u8,
+}
+
+#[repr(C)]
+struct MpRtCallableVtable {
+    call_fn: *mut u8,
+    drop_fn: Option<unsafe extern "C" fn(*mut u8)>,
+    size: u64,
+}
+
+type ArrForeachCallFn = unsafe extern "C" fn(*mut u8, *const u8);
+type ArrMapCallFn = unsafe extern "C" fn(*mut u8, *const u8, *mut u8);
+type ArrFilterCallFn = unsafe extern "C" fn(*mut u8, *const u8) -> i32;
+type ArrReduceCallFn = unsafe extern "C" fn(*mut u8, *mut u8, *const u8);
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_callable_new(fn_ptr: *mut u8, captures_ptr: *mut u8) -> *mut u8 {
+    let mut captures_size: usize = 0;
+    let mut captures_data = std::ptr::null_mut::<u8>();
+    if !captures_ptr.is_null() {
+        captures_size = *(captures_ptr as *const u64) as usize;
+        if captures_size > 0 {
+            let layout =
+                Layout::from_size_align(captures_size, 8).expect("callable captures layout");
+            captures_data = alloc::alloc_zeroed(layout);
+            if captures_data.is_null() {
+                alloc::handle_alloc_error(layout);
+            }
+            std::ptr::copy_nonoverlapping(
+                (captures_ptr as *const u8).add(8),
+                captures_data,
+                captures_size,
+            );
+        }
+    }
+
+    let callable = alloc_builtin(
+        TYPE_ID_TCALLABLE,
+        FLAG_HEAP,
+        std::mem::size_of::<MpRtCallablePayload>(),
+        std::mem::align_of::<MpRtCallablePayload>(),
+    );
+    let payload = str_payload_base(callable) as *mut MpRtCallablePayload;
+    let vtable = Box::into_raw(Box::new(MpRtCallableVtable {
+        call_fn: fn_ptr,
+        drop_fn: None,
+        size: captures_size as u64,
+    }));
+    (*payload).vtable_ptr = vtable;
+    (*payload).data_ptr = captures_data;
+    callable as *mut u8
+}
+
+#[inline]
+unsafe fn callable_payload(callable: *mut u8) -> *mut MpRtCallablePayload {
+    assert!(!callable.is_null(), "callable is null");
+    str_payload_base(callable as *mut MpRtHeader) as *mut MpRtCallablePayload
+}
+
+#[inline]
+unsafe fn callable_parts(callable: *mut u8) -> (*mut u8, *mut u8) {
+    let payload = callable_payload(callable);
+    let vtable = (*payload).vtable_ptr;
+    assert!(!vtable.is_null(), "callable vtable is null");
+    let call_fn = (*vtable).call_fn;
+    assert!(!call_fn.is_null(), "callable call_fn is null");
+    (call_fn, (*payload).data_ptr)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_arr_foreach(arr: *mut MpRtHeader, callable: *mut u8) {
+    let payload = arr_payload(arr);
+    let (call_fn, data_ptr) = callable_parts(callable);
+    let callback: ArrForeachCallFn = std::mem::transmute(call_fn);
+
+    let len = usize_from_u64((*payload).len, "array len too large");
+    let elem_size = usize_from_u64((*payload).elem_size, "array elem_size too large");
+    for i in 0..len {
+        let elem_ptr = if elem_size == 0 {
+            std::ptr::NonNull::<u8>::dangling().as_ptr() as *const u8
+        } else {
+            (*payload)
+                .data_ptr
+                .add(mul_usize(i, elem_size, "array index overflow")) as *const u8
+        };
+        callback(data_ptr, elem_ptr);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_arr_map(
+    arr: *mut MpRtHeader,
+    callable: *mut u8,
+    result_elem_type_id: u32,
+    result_elem_size: u64,
+) -> *mut MpRtHeader {
+    let payload = arr_payload(arr);
+    let out = mp_rt_arr_new(result_elem_type_id, result_elem_size, (*payload).len);
+    if (*payload).len == 0 {
+        return out;
+    }
+
+    let (call_fn, data_ptr) = callable_parts(callable);
+    let callback: ArrMapCallFn = std::mem::transmute(call_fn);
+
+    let len = usize_from_u64((*payload).len, "array len too large");
+    let elem_size = usize_from_u64((*payload).elem_size, "array elem_size too large");
+    let result_elem_size_usize =
+        usize_from_u64(result_elem_size, "array result elem_size too large");
+    let mut scratch = vec![0_u8; result_elem_size_usize.max(1)];
+
+    for i in 0..len {
+        let elem_ptr = if elem_size == 0 {
+            std::ptr::NonNull::<u8>::dangling().as_ptr() as *const u8
+        } else {
+            (*payload)
+                .data_ptr
+                .add(mul_usize(i, elem_size, "array index overflow")) as *const u8
+        };
+        if result_elem_size_usize == 0 {
+            callback(data_ptr, elem_ptr, std::ptr::null_mut());
+            mp_rt_arr_push(out, std::ptr::null(), 0);
+        } else {
+            callback(data_ptr, elem_ptr, scratch.as_mut_ptr());
+            mp_rt_arr_push(out, scratch.as_ptr(), result_elem_size);
+        }
+    }
+
+    out
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_arr_filter(
+    arr: *mut MpRtHeader,
+    callable: *mut u8,
+) -> *mut MpRtHeader {
+    let payload = arr_payload(arr);
+    let out = mp_rt_arr_new(
+        (*payload).elem_type_id,
+        (*payload).elem_size,
+        (*payload).len,
+    );
+    if (*payload).len == 0 {
+        return out;
+    }
+
+    let (call_fn, data_ptr) = callable_parts(callable);
+    let callback: ArrFilterCallFn = std::mem::transmute(call_fn);
+
+    let len = usize_from_u64((*payload).len, "array len too large");
+    let elem_size = usize_from_u64((*payload).elem_size, "array elem_size too large");
+    for i in 0..len {
+        let elem_ptr = if elem_size == 0 {
+            std::ptr::NonNull::<u8>::dangling().as_ptr() as *const u8
+        } else {
+            (*payload)
+                .data_ptr
+                .add(mul_usize(i, elem_size, "array index overflow")) as *const u8
+        };
+        if callback(data_ptr, elem_ptr) != 0 {
+            mp_rt_arr_push(out, elem_ptr, (*payload).elem_size);
+        }
+    }
+
+    out
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_arr_reduce(
+    arr: *mut MpRtHeader,
+    acc_inout: *mut u8,
+    acc_size: u64,
+    callable: *mut u8,
+) {
+    let _ = acc_size;
+
+    let payload = arr_payload(arr);
+    if (*payload).len == 0 {
+        return;
+    }
+
+    let (call_fn, data_ptr) = callable_parts(callable);
+    let callback: ArrReduceCallFn = std::mem::transmute(call_fn);
+
+    let len = usize_from_u64((*payload).len, "array len too large");
+    let elem_size = usize_from_u64((*payload).elem_size, "array elem_size too large");
+    for i in 0..len {
+        let elem_ptr = if elem_size == 0 {
+            std::ptr::NonNull::<u8>::dangling().as_ptr() as *const u8
+        } else {
+            (*payload)
+                .data_ptr
+                .add(mul_usize(i, elem_size, "array index overflow")) as *const u8
+        };
+        callback(data_ptr, acc_inout, elem_ptr);
+    }
+}
+
+struct MpRtMutexState {
+    mutex: Mutex<()>,
+    locked: std::sync::atomic::AtomicBool,
+}
+
+struct MpRtRwLockState {
+    rwlock: RwLock<()>,
+    state: std::sync::atomic::AtomicI32, // 0=unlocked, 1=read, 2=write
+}
+
+struct MpRtCellState {
+    value: UnsafeCell<*mut u8>,
+}
+
+#[repr(C)]
+struct MpRtFutureState {
+    ready: bool,
+    value: *mut u8,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_mutex_new() -> *mut u8 {
+    Box::into_raw(Box::new(MpRtMutexState {
+        mutex: Mutex::new(()),
+        locked: std::sync::atomic::AtomicBool::new(false),
+    })) as *mut u8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_mutex_lock(m: *mut u8) {
+    assert!(!m.is_null(), "mp_rt_mutex_lock: null mutex");
+    let state = m as *mut MpRtMutexState;
+
+    // Surface poison state to callers while keeping the runtime running.
+    drop(match (*state).mutex.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    });
+
+    assert!(
+        (*state)
+            .locked
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok(),
+        "mp_rt_mutex_lock: already locked"
+    );
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_mutex_unlock(m: *mut u8) {
+    assert!(!m.is_null(), "mp_rt_mutex_unlock: null mutex");
+    let state = m as *mut MpRtMutexState;
+    assert!(
+        (*state).locked.swap(false, Ordering::AcqRel),
+        "mp_rt_mutex_unlock: mutex not locked"
+    );
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_rwlock_new() -> *mut u8 {
+    Box::into_raw(Box::new(MpRtRwLockState {
+        rwlock: RwLock::new(()),
+        state: std::sync::atomic::AtomicI32::new(0),
+    })) as *mut u8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_rwlock_read(rw: *mut u8) {
+    assert!(!rw.is_null(), "mp_rt_rwlock_read: null rwlock");
+    let state = rw as *mut MpRtRwLockState;
+
+    drop(match (*state).rwlock.read() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    });
+
+    assert!(
+        (*state)
+            .state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok(),
+        "mp_rt_rwlock_read: lock already held"
+    );
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_rwlock_write(rw: *mut u8) {
+    assert!(!rw.is_null(), "mp_rt_rwlock_write: null rwlock");
+    let state = rw as *mut MpRtRwLockState;
+
+    drop(match (*state).rwlock.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    });
+
+    assert!(
+        (*state)
+            .state
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok(),
+        "mp_rt_rwlock_write: lock already held"
+    );
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_rwlock_unlock(rw: *mut u8) {
+    assert!(!rw.is_null(), "mp_rt_rwlock_unlock: null rwlock");
+    let state = rw as *mut MpRtRwLockState;
+    assert_ne!(
+        (*state).state.swap(0, Ordering::AcqRel),
+        0,
+        "mp_rt_rwlock_unlock: lock not held"
+    );
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_cell_new(init: *mut u8) -> *mut u8 {
+    Box::into_raw(Box::new(MpRtCellState {
+        value: UnsafeCell::new(init),
+    })) as *mut u8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_cell_get(cell: *mut u8) -> *mut u8 {
+    assert!(!cell.is_null(), "mp_rt_cell_get: null cell");
+    *(*(cell as *mut MpRtCellState)).value.get()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_cell_set(cell: *mut u8, val: *mut u8) {
+    assert!(!cell.is_null(), "mp_rt_cell_set: null cell");
+    *(*(cell as *mut MpRtCellState)).value.get() = val;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_future_poll(future: *mut u8) -> i32 {
+    assert!(!future.is_null(), "mp_rt_future_poll: null future");
+    if (*(future as *mut MpRtFutureState)).ready {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_future_take(future: *mut u8) -> *mut u8 {
+    assert!(!future.is_null(), "mp_rt_future_take: null future");
+    let state = future as *mut MpRtFutureState;
+    assert!((*state).ready, "mp_rt_future_take: future not ready");
+    let value = (*state).value;
+    (*state).value = std::ptr::null_mut();
+    value
+}
+
+#[inline]
+unsafe fn str_to_rust_str<'a>(s: *mut MpRtHeader) -> &'a str {
+    let base = str_payload_base(s);
+    let len = *(base as *const u64) as usize;
+    let bytes = std::slice::from_raw_parts(base.add(8), len);
+    std::str::from_utf8(bytes).expect("invalid utf-8 string")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_str_parse_i64(s: *mut MpRtHeader) -> i64 {
+    str_to_rust_str(s)
+        .parse::<i64>()
+        .expect("str.parse_i64 failed")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_str_parse_u64(s: *mut MpRtHeader) -> u64 {
+    str_to_rust_str(s)
+        .parse::<u64>()
+        .expect("str.parse_u64 failed")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_str_parse_f64(s: *mut MpRtHeader) -> f64 {
+    str_to_rust_str(s)
+        .parse::<f64>()
+        .expect("str.parse_f64 failed")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_str_parse_bool(s: *mut MpRtHeader) -> i32 {
+    if str_to_rust_str(s)
+        .parse::<bool>()
+        .expect("str.parse_bool failed")
+    {
+        1
+    } else {
+        0
+    }
+}
+
+fn json_escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn json_unescape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next().expect("JSON: invalid escape sequence") {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            _ => panic!("JSON: unsupported escape"),
+        }
+    }
+    out
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_json_encode(obj: *mut u8, type_id: u32) -> *mut MpRtHeader {
+    let json = match type_id {
+        TYPE_ID_BOOL => {
+            if *(obj as *const u8) != 0 {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        TYPE_ID_I8 => (*(obj as *const i8)).to_string(),
+        TYPE_ID_I16 => (*(obj as *const i16)).to_string(),
+        TYPE_ID_I32 => (*(obj as *const i32)).to_string(),
+        TYPE_ID_I64 => (*(obj as *const i64)).to_string(),
+        TYPE_ID_U8 => (*(obj as *const u8)).to_string(),
+        TYPE_ID_U16 => (*(obj as *const u16)).to_string(),
+        TYPE_ID_U32 => (*(obj as *const u32)).to_string(),
+        TYPE_ID_U64 => (*(obj as *const u64)).to_string(),
+        TYPE_ID_F32 => (*(obj as *const f32)).to_string(),
+        TYPE_ID_F64 => (*(obj as *const f64)).to_string(),
+        TYPE_ID_STR => {
+            let s = str_to_rust_str(obj as *mut MpRtHeader);
+            format!("\"{}\"", json_escape_str(s))
+        }
+        _ => panic!("JSON: unsupported type"),
+    };
+
+    mp_rt_str_from_utf8(json.as_ptr(), json.len() as u64)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_json_decode(json_str: *mut MpRtHeader, type_id: u32) -> *mut u8 {
+    let src = str_to_rust_str(json_str).trim();
+    match type_id {
+        TYPE_ID_BOOL => Box::into_raw(Box::new(
+            if src.parse::<bool>().expect("JSON bool parse failed") {
+                1_u8
+            } else {
+                0_u8
+            },
+        )) as *mut u8,
+        TYPE_ID_I8 => {
+            Box::into_raw(Box::new(src.parse::<i8>().expect("JSON i8 parse failed"))) as *mut u8
+        }
+        TYPE_ID_I16 => {
+            Box::into_raw(Box::new(src.parse::<i16>().expect("JSON i16 parse failed"))) as *mut u8
+        }
+        TYPE_ID_I32 => {
+            Box::into_raw(Box::new(src.parse::<i32>().expect("JSON i32 parse failed"))) as *mut u8
+        }
+        TYPE_ID_I64 => {
+            Box::into_raw(Box::new(src.parse::<i64>().expect("JSON i64 parse failed"))) as *mut u8
+        }
+        TYPE_ID_U8 => {
+            Box::into_raw(Box::new(src.parse::<u8>().expect("JSON u8 parse failed"))) as *mut u8
+        }
+        TYPE_ID_U16 => {
+            Box::into_raw(Box::new(src.parse::<u16>().expect("JSON u16 parse failed"))) as *mut u8
+        }
+        TYPE_ID_U32 => {
+            Box::into_raw(Box::new(src.parse::<u32>().expect("JSON u32 parse failed"))) as *mut u8
+        }
+        TYPE_ID_U64 => {
+            Box::into_raw(Box::new(src.parse::<u64>().expect("JSON u64 parse failed"))) as *mut u8
+        }
+        TYPE_ID_F32 => {
+            Box::into_raw(Box::new(src.parse::<f32>().expect("JSON f32 parse failed"))) as *mut u8
+        }
+        TYPE_ID_F64 => {
+            Box::into_raw(Box::new(src.parse::<f64>().expect("JSON f64 parse failed"))) as *mut u8
+        }
+        TYPE_ID_STR => {
+            if src.len() < 2 || !src.starts_with('"') || !src.ends_with('"') {
+                panic!("JSON: unsupported type");
+            }
+            let unescaped = json_unescape_str(&src[1..src.len() - 1]);
+            mp_rt_str_from_utf8(unescaped.as_ptr(), unescaped.len() as u64) as *mut u8
+        }
+        _ => panic!("JSON: unsupported type"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime stubs: channels / web / GPU
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_channel_new(_cap: u64) -> *mut u8 {
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_channel_send(_ch: *mut u8, _val: *mut u8) -> i32 {
+    -1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_channel_recv(_ch: *mut u8) -> *mut u8 {
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_web_serve(port: u32, _handler: *mut u8) -> i32 {
+    // TODO: implement HTTP/1.1 server
+    eprintln!("magpie: web server not yet implemented (port={})", port);
+    -1
+}
+
+#[no_mangle]
+pub extern "C" fn mp_rt_gpu_device_count() -> i32 {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_device_open(_idx: i32) -> *mut u8 {
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_device_close(_dev: *mut u8) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_buffer_alloc(_dev: *mut u8, _size: u64) -> *mut u8 {
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_buffer_free(_buf: *mut u8) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_buffer_write(
+    _buf: *mut u8,
+    _offset: u64,
+    _data: *const u8,
+    _len: u64,
+) -> i32 {
+    -1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_buffer_read(
+    _buf: *mut u8,
+    _offset: u64,
+    _out: *mut u8,
+    _len: u64,
+) -> i32 {
+    -1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_kernel_load(
+    _dev: *mut u8,
+    _spv: *const u8,
+    _spv_len: u64,
+) -> *mut u8 {
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_kernel_free(_kernel: *mut u8) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_launch(
+    _kernel: *mut u8,
+    _groups_x: u32,
+    _groups_y: u32,
+    _groups_z: u32,
+    _args: *const *mut u8,
+    _arg_count: u32,
+) -> i32 {
+    -1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_launch_async(
+    _kernel: *mut u8,
+    _groups_x: u32,
+    _groups_y: u32,
+    _groups_z: u32,
+    _args: *const *mut u8,
+    _arg_count: u32,
+) -> *mut u8 {
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_fence_wait(_fence: *mut u8) -> i32 {
+    -1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_gpu_fence_free(_fence: *mut u8) {}
+
 // ---------------------------------------------------------------------------
 // Public helper: mp_rt_alloc with layout stored in reserved0.
 // Overrides the no_mangle version above so callers that go through the
@@ -637,9 +1454,130 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
+    unsafe fn make_test_callable(call_fn: *mut u8) -> (*mut u8, *mut MpRtCallableVtable) {
+        let callable = alloc_builtin(
+            TYPE_ID_TCALLABLE,
+            FLAG_HEAP,
+            std::mem::size_of::<MpRtCallablePayload>(),
+            std::mem::align_of::<MpRtCallablePayload>(),
+        );
+        let payload = str_payload_base(callable) as *mut MpRtCallablePayload;
+        let vtable = Box::into_raw(Box::new(MpRtCallableVtable {
+            call_fn,
+            drop_fn: None,
+            size: 0,
+        }));
+        (*payload).vtable_ptr = vtable;
+        (*payload).data_ptr = std::ptr::null_mut();
+        (callable as *mut u8, vtable)
+    }
+
+    unsafe extern "C" fn arr_map_double(_ctx: *mut u8, elem: *const u8, out: *mut u8) {
+        let v = *(elem as *const i32);
+        *(out as *mut i32) = v * 2;
+    }
+
+    unsafe extern "C" fn arr_filter_even(_ctx: *mut u8, elem: *const u8) -> i32 {
+        if *(elem as *const i32) % 2 == 0 {
+            1
+        } else {
+            0
+        }
+    }
+
+    unsafe extern "C" fn arr_reduce_sum(_ctx: *mut u8, acc: *mut u8, elem: *const u8) {
+        let acc = acc as *mut i32;
+        *acc += *(elem as *const i32);
+    }
+
     // -----------------------------------------------------------------------
     // ARC: alloc + retain + release cycle
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_std_println_does_not_crash() {
+        let msg = b"Hello, world!";
+        mp_std_println(msg.as_ptr(), msg.len());
+    }
+
+    #[test]
+    fn test_std_assert_success_paths() {
+        unsafe {
+            let msg = b"ok";
+            mp_std_assert(1, msg.as_ptr(), msg.len());
+            mp_std_assert_eq(7, 7);
+        }
+    }
+
+    #[test]
+    fn test_std_hash_functions() {
+        use std::hash::{Hash, Hasher};
+
+        unsafe {
+            let s = make_str("hash-me");
+            let actual = mp_std_hash_str(s);
+            let mut expected_hasher = std::collections::hash_map::DefaultHasher::new();
+            "hash-me".hash(&mut expected_hasher);
+            let expected = expected_hasher.finish();
+            assert_eq!(actual, expected);
+            mp_rt_release_strong(s);
+        }
+
+        let mut i32_hasher = std::collections::hash_map::DefaultHasher::new();
+        123_i32.hash(&mut i32_hasher);
+        assert_eq!(mp_std_hash_i32(123), i32_hasher.finish());
+
+        let mut i64_hasher = std::collections::hash_map::DefaultHasher::new();
+        456_i64.hash(&mut i64_hasher);
+        assert_eq!(mp_std_hash_i64(456), i64_hasher.finish());
+    }
+
+    #[test]
+    fn test_std_math_functions() {
+        assert_eq!(mp_std_abs_i32(-9), 9);
+        assert_eq!(mp_std_abs_i64(-11), 11);
+        assert_eq!(mp_std_min_i32(2, -5), -5);
+        assert_eq!(mp_std_max_i32(2, -5), 2);
+        assert_eq!(mp_std_sqrt_f64(81.0), 9.0);
+    }
+
+    #[test]
+    fn test_gpu_stubs_return_safe_defaults() {
+        unsafe {
+            assert_eq!(mp_rt_gpu_device_count(), 0);
+            assert!(mp_rt_gpu_device_open(0).is_null());
+            mp_rt_gpu_device_close(std::ptr::null_mut());
+
+            assert!(mp_rt_gpu_buffer_alloc(std::ptr::null_mut(), 64).is_null());
+            mp_rt_gpu_buffer_free(std::ptr::null_mut());
+            assert_eq!(
+                mp_rt_gpu_buffer_write(std::ptr::null_mut(), 0, std::ptr::null(), 0),
+                -1
+            );
+            assert_eq!(
+                mp_rt_gpu_buffer_read(std::ptr::null_mut(), 0, std::ptr::null_mut(), 0),
+                -1
+            );
+
+            assert!(mp_rt_gpu_kernel_load(std::ptr::null_mut(), std::ptr::null(), 0).is_null());
+            mp_rt_gpu_kernel_free(std::ptr::null_mut());
+
+            let args: [*mut u8; 0] = [];
+            assert_eq!(
+                mp_rt_gpu_launch(std::ptr::null_mut(), 1, 1, 1, args.as_ptr(), 0),
+                -1
+            );
+            assert!(mp_rt_gpu_launch_async(std::ptr::null_mut(), 1, 1, 1, args.as_ptr(), 0).is_null());
+            assert_eq!(mp_rt_gpu_fence_wait(std::ptr::null_mut()), -1);
+            mp_rt_gpu_fence_free(std::ptr::null_mut());
+
+            assert!(mp_rt_channel_new(1).is_null());
+            assert_eq!(mp_rt_channel_send(std::ptr::null_mut(), std::ptr::null_mut()), -1);
+            assert!(mp_rt_channel_recv(std::ptr::null_mut()).is_null());
+
+            assert_eq!(mp_rt_web_serve(8080, std::ptr::null_mut()), -1);
+        }
+    }
 
     #[test]
     fn test_arc_retain_release_cycle() {
@@ -836,6 +1774,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_arr_map_filter_reduce() {
+        unsafe {
+            let arr = mp_rt_arr_new(4, std::mem::size_of::<i32>() as u64, 0);
+            for v in [1_i32, 2_i32, 3_i32, 4_i32] {
+                mp_rt_arr_push(
+                    arr,
+                    &v as *const i32 as *const u8,
+                    std::mem::size_of::<i32>() as u64,
+                );
+            }
+
+            let (map_callable, map_vtable) =
+                make_test_callable(arr_map_double as *const () as *mut u8);
+            let mapped = mp_rt_arr_map(arr, map_callable, 4, std::mem::size_of::<i32>() as u64);
+            assert_eq!(mp_rt_arr_len(mapped), 4);
+            assert_eq!(*(mp_rt_arr_get(mapped, 0) as *const i32), 2);
+            assert_eq!(*(mp_rt_arr_get(mapped, 1) as *const i32), 4);
+            assert_eq!(*(mp_rt_arr_get(mapped, 2) as *const i32), 6);
+            assert_eq!(*(mp_rt_arr_get(mapped, 3) as *const i32), 8);
+
+            let (filter_callable, filter_vtable) =
+                make_test_callable(arr_filter_even as *const () as *mut u8);
+            let filtered = mp_rt_arr_filter(arr, filter_callable);
+            assert_eq!(mp_rt_arr_len(filtered), 2);
+            assert_eq!(*(mp_rt_arr_get(filtered, 0) as *const i32), 2);
+            assert_eq!(*(mp_rt_arr_get(filtered, 1) as *const i32), 4);
+
+            let (reduce_callable, reduce_vtable) =
+                make_test_callable(arr_reduce_sum as *const () as *mut u8);
+            let mut sum = 0_i32;
+            mp_rt_arr_reduce(
+                filtered,
+                &mut sum as *mut i32 as *mut u8,
+                std::mem::size_of::<i32>() as u64,
+                reduce_callable,
+            );
+            assert_eq!(sum, 6);
+
+            mp_rt_release_strong(arr);
+            mp_rt_release_strong(mapped);
+            mp_rt_release_strong(filtered);
+            mp_rt_release_strong(map_callable as *mut MpRtHeader);
+            mp_rt_release_strong(filter_callable as *mut MpRtHeader);
+            mp_rt_release_strong(reduce_callable as *mut MpRtHeader);
+            drop(Box::from_raw(map_vtable));
+            drop(Box::from_raw(filter_vtable));
+            drop(Box::from_raw(reduce_vtable));
+        }
+    }
+
+    #[test]
+    fn test_mutex_lock_unlock() {
+        unsafe {
+            let m = mp_rt_mutex_new();
+            mp_rt_mutex_lock(m);
+            mp_rt_mutex_unlock(m);
+            mp_rt_mutex_lock(m);
+            mp_rt_mutex_unlock(m);
+            drop(Box::from_raw(m as *mut MpRtMutexState));
+        }
+    }
+
+    #[test]
+    fn test_str_parse_i64() {
+        unsafe {
+            let s = make_str("-12345");
+            assert_eq!(mp_rt_str_parse_i64(s), -12345);
+            mp_rt_release_strong(s);
+        }
+    }
+
+    #[test]
+    fn test_future_poll_take() {
+        unsafe {
+            let state = Box::into_raw(Box::new(MpRtFutureState {
+                ready: false,
+                value: std::ptr::null_mut(),
+            }));
+            let future = state as *mut u8;
+            assert_eq!(mp_rt_future_poll(future), 0);
+
+            let result_ptr = Box::into_raw(Box::new(77_i64)) as *mut u8;
+            (*state).ready = true;
+            (*state).value = result_ptr;
+
+            assert_eq!(mp_rt_future_poll(future), 1);
+            let taken = mp_rt_future_take(future);
+            assert_eq!(*(taken as *const i64), 77);
+
+            drop(Box::from_raw(taken as *mut i64));
+            drop(Box::from_raw(state));
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Type registry
     // -----------------------------------------------------------------------
@@ -923,7 +1956,8 @@ fn add_usize(a: usize, b: usize, ctx: &str) -> usize {
 
 #[inline]
 unsafe fn collection_alloc_zeroed(size: usize) -> *mut u8 {
-    let layout = Layout::from_size_align(size.max(1), COLLECTION_DATA_ALIGN).expect("bad collection alloc layout");
+    let layout = Layout::from_size_align(size.max(1), COLLECTION_DATA_ALIGN)
+        .expect("bad collection alloc layout");
     let ptr = alloc::alloc_zeroed(layout);
     if ptr.is_null() {
         alloc::handle_alloc_error(layout);
@@ -933,12 +1967,12 @@ unsafe fn collection_alloc_zeroed(size: usize) -> *mut u8 {
 
 #[inline]
 unsafe fn collection_realloc(ptr: *mut u8, old_size: usize, new_size: usize) -> *mut u8 {
-    let old_layout =
-        Layout::from_size_align(old_size.max(1), COLLECTION_DATA_ALIGN).expect("bad collection realloc old layout");
+    let old_layout = Layout::from_size_align(old_size.max(1), COLLECTION_DATA_ALIGN)
+        .expect("bad collection realloc old layout");
     let new_ptr = alloc::realloc(ptr, old_layout, new_size.max(1));
     if new_ptr.is_null() {
-        let new_layout =
-            Layout::from_size_align(new_size.max(1), COLLECTION_DATA_ALIGN).expect("bad collection realloc new layout");
+        let new_layout = Layout::from_size_align(new_size.max(1), COLLECTION_DATA_ALIGN)
+            .expect("bad collection realloc new layout");
         alloc::handle_alloc_error(new_layout);
     }
     new_ptr
@@ -949,7 +1983,8 @@ unsafe fn collection_dealloc(ptr: *mut u8, size: usize) {
     if ptr.is_null() {
         return;
     }
-    let layout = Layout::from_size_align(size.max(1), COLLECTION_DATA_ALIGN).expect("bad collection dealloc layout");
+    let layout = Layout::from_size_align(size.max(1), COLLECTION_DATA_ALIGN)
+        .expect("bad collection dealloc layout");
     alloc::dealloc(ptr, layout);
 }
 
@@ -977,7 +2012,10 @@ fn map_layout(cap: u64, key_size: u64, val_size: u64) -> (usize, usize, usize) {
 
     let keys_off = align_up(cap, COLLECTION_DATA_ALIGN);
     let keys_bytes = mul_usize(cap, key_size, "map keys bytes overflow");
-    let vals_off = align_up(add_usize(keys_off, keys_bytes, "map keys offset overflow"), COLLECTION_DATA_ALIGN);
+    let vals_off = align_up(
+        add_usize(keys_off, keys_bytes, "map keys offset overflow"),
+        COLLECTION_DATA_ALIGN,
+    );
     let vals_bytes = mul_usize(cap, val_size, "map vals bytes overflow");
     let total = add_usize(vals_off, vals_bytes, "map total bytes overflow");
 
@@ -1059,7 +2097,9 @@ unsafe fn arr_reserve(payload: *mut MpRtArrayPayload, needed: u64) {
     }
     let mut new_cap = (*payload).cap.max(4);
     while new_cap < needed {
-        new_cap = new_cap.checked_mul(2).expect("mp_rt_arr_push: capacity overflow");
+        new_cap = new_cap
+            .checked_mul(2)
+            .expect("mp_rt_arr_push: capacity overflow");
     }
 
     if (*payload).elem_size == 0 {
@@ -1174,20 +2214,28 @@ unsafe fn map_ensure_capacity(payload: *mut MpRtMapPayload) {
 
     // Grow around 70% load factor.
     let len_after = (*payload).len.checked_add(1).expect("map length overflow");
-    if len_after
-        .checked_mul(10)
-        .expect("map load factor overflow")
-        > (*payload).cap.checked_mul(7).expect("map load factor overflow")
+    if len_after.checked_mul(10).expect("map load factor overflow")
+        > (*payload)
+            .cap
+            .checked_mul(7)
+            .expect("map load factor overflow")
     {
         map_resize(
             payload,
-            (*payload).cap.checked_mul(2).expect("map capacity overflow"),
+            (*payload)
+                .cap
+                .checked_mul(2)
+                .expect("map capacity overflow"),
         );
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_arr_new(elem_type_id: u32, elem_size: u64, capacity: u64) -> *mut MpRtHeader {
+pub unsafe extern "C" fn mp_rt_arr_new(
+    elem_type_id: u32,
+    elem_size: u64,
+    capacity: u64,
+) -> *mut MpRtHeader {
     ensure_collection_types_registered();
 
     let obj = alloc_builtin(
@@ -1237,9 +2285,18 @@ pub unsafe extern "C" fn mp_rt_arr_get(arr: *mut MpRtHeader, idx: u64) -> *mut u
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_arr_set(arr: *mut MpRtHeader, idx: u64, val: *const u8, elem_size: u64) {
+pub unsafe extern "C" fn mp_rt_arr_set(
+    arr: *mut MpRtHeader,
+    idx: u64,
+    val: *const u8,
+    elem_size: u64,
+) {
     let payload = arr_payload(arr);
-    assert_eq!(elem_size, (*payload).elem_size, "mp_rt_arr_set: elem_size mismatch");
+    assert_eq!(
+        elem_size,
+        (*payload).elem_size,
+        "mp_rt_arr_set: elem_size mismatch"
+    );
     assert!(idx < (*payload).len, "mp_rt_arr_set: out of bounds");
 
     if elem_size == 0 {
@@ -1257,13 +2314,22 @@ pub unsafe extern "C" fn mp_rt_arr_set(arr: *mut MpRtHeader, idx: u64, val: *con
 #[no_mangle]
 pub unsafe extern "C" fn mp_rt_arr_push(arr: *mut MpRtHeader, val: *const u8, elem_size: u64) {
     let payload = arr_payload(arr);
-    assert_eq!(elem_size, (*payload).elem_size, "mp_rt_arr_push: elem_size mismatch");
+    assert_eq!(
+        elem_size,
+        (*payload).elem_size,
+        "mp_rt_arr_push: elem_size mismatch"
+    );
 
-    let new_len = (*payload).len.checked_add(1).expect("mp_rt_arr_push: length overflow");
+    let new_len = (*payload)
+        .len
+        .checked_add(1)
+        .expect("mp_rt_arr_push: length overflow");
     arr_reserve(payload, new_len);
 
     if elem_size > 0 {
-        let dst = (*payload).data_ptr.add(array_bytes((*payload).len, elem_size));
+        let dst = (*payload)
+            .data_ptr
+            .add(array_bytes((*payload).len, elem_size));
         std::ptr::copy_nonoverlapping(
             val,
             dst,
@@ -1276,14 +2342,20 @@ pub unsafe extern "C" fn mp_rt_arr_push(arr: *mut MpRtHeader, val: *const u8, el
 #[no_mangle]
 pub unsafe extern "C" fn mp_rt_arr_pop(arr: *mut MpRtHeader, out: *mut u8, elem_size: u64) -> i32 {
     let payload = arr_payload(arr);
-    assert_eq!(elem_size, (*payload).elem_size, "mp_rt_arr_pop: elem_size mismatch");
+    assert_eq!(
+        elem_size,
+        (*payload).elem_size,
+        "mp_rt_arr_pop: elem_size mismatch"
+    );
     if (*payload).len == 0 {
         return 0;
     }
 
     (*payload).len -= 1;
     if elem_size > 0 && !out.is_null() {
-        let src = (*payload).data_ptr.add(array_bytes((*payload).len, elem_size));
+        let src = (*payload)
+            .data_ptr
+            .add(array_bytes((*payload).len, elem_size));
         std::ptr::copy_nonoverlapping(
             src,
             out,
@@ -1294,7 +2366,11 @@ pub unsafe extern "C" fn mp_rt_arr_pop(arr: *mut MpRtHeader, out: *mut u8, elem_
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_arr_slice(arr: *mut MpRtHeader, start: u64, end: u64) -> *mut MpRtHeader {
+pub unsafe extern "C" fn mp_rt_arr_slice(
+    arr: *mut MpRtHeader,
+    start: u64,
+    end: u64,
+) -> *mut MpRtHeader {
     let payload = arr_payload(arr);
     assert!(
         start <= end && end <= (*payload).len,
@@ -1307,9 +2383,21 @@ pub unsafe extern "C" fn mp_rt_arr_slice(arr: *mut MpRtHeader, start: u64, end: 
 
     if count > 0 && (*payload).elem_size > 0 {
         let elem_size = usize_from_u64((*payload).elem_size, "array elem_size too large");
-        let start_off = mul_usize(usize_from_u64(start, "array start too large"), elem_size, "array start overflow");
-        let total = mul_usize(usize_from_u64(count, "array count too large"), elem_size, "array slice overflow");
-        std::ptr::copy_nonoverlapping((*payload).data_ptr.add(start_off), (*out_payload).data_ptr, total);
+        let start_off = mul_usize(
+            usize_from_u64(start, "array start too large"),
+            elem_size,
+            "array start overflow",
+        );
+        let total = mul_usize(
+            usize_from_u64(count, "array count too large"),
+            elem_size,
+            "array slice overflow",
+        );
+        std::ptr::copy_nonoverlapping(
+            (*payload).data_ptr.add(start_off),
+            (*out_payload).data_ptr,
+            total,
+        );
     }
 
     (*out_payload).len = count;
@@ -1363,9 +2451,10 @@ pub unsafe extern "C" fn mp_rt_arr_sort(arr: *mut MpRtHeader, cmp: MpRtCmpFn) {
     for i in 1..len {
         let mut j = i;
         while j > 0 {
-            let lhs = (*payload)
-                .data_ptr
-                .add(mul_usize(j - 1, elem_size, "array lhs index overflow"));
+            let lhs =
+                (*payload)
+                    .data_ptr
+                    .add(mul_usize(j - 1, elem_size, "array lhs index overflow"));
             let rhs = (*payload)
                 .data_ptr
                 .add(mul_usize(j, elem_size, "array rhs index overflow"));
@@ -1421,9 +2510,17 @@ pub unsafe extern "C" fn mp_rt_map_len(map: *mut MpRtHeader) -> u64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_map_get(map: *mut MpRtHeader, key: *const u8, key_size: u64) -> *mut u8 {
+pub unsafe extern "C" fn mp_rt_map_get(
+    map: *mut MpRtHeader,
+    key: *const u8,
+    key_size: u64,
+) -> *mut u8 {
     let payload = map_payload(map);
-    assert_eq!(key_size, (*payload).key_size, "mp_rt_map_get: key_size mismatch");
+    assert_eq!(
+        key_size,
+        (*payload).key_size,
+        "mp_rt_map_get: key_size mismatch"
+    );
 
     if (*payload).cap == 0 || (*payload).data_ptr.is_null() {
         return std::ptr::null_mut();
@@ -1446,8 +2543,16 @@ pub unsafe extern "C" fn mp_rt_map_set(
     val_size: u64,
 ) {
     let payload = map_payload(map);
-    assert_eq!(key_size, (*payload).key_size, "mp_rt_map_set: key_size mismatch");
-    assert_eq!(val_size, (*payload).val_size, "mp_rt_map_set: val_size mismatch");
+    assert_eq!(
+        key_size,
+        (*payload).key_size,
+        "mp_rt_map_set: key_size mismatch"
+    );
+    assert_eq!(
+        val_size,
+        (*payload).val_size,
+        "mp_rt_map_set: val_size mismatch"
+    );
 
     map_ensure_capacity(payload);
     let (found, idx) = map_find_slot(payload, key);
@@ -1476,8 +2581,16 @@ pub unsafe extern "C" fn mp_rt_map_take(
     val_size: u64,
 ) -> i32 {
     let payload = map_payload(map);
-    assert_eq!(key_size, (*payload).key_size, "mp_rt_map_take: key_size mismatch");
-    assert_eq!(val_size, (*payload).val_size, "mp_rt_map_take: val_size mismatch");
+    assert_eq!(
+        key_size,
+        (*payload).key_size,
+        "mp_rt_map_take: key_size mismatch"
+    );
+    assert_eq!(
+        val_size,
+        (*payload).val_size,
+        "mp_rt_map_take: val_size mismatch"
+    );
 
     if (*payload).cap == 0 || (*payload).data_ptr.is_null() {
         return 0;
@@ -1498,9 +2611,17 @@ pub unsafe extern "C" fn mp_rt_map_take(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_map_delete(map: *mut MpRtHeader, key: *const u8, key_size: u64) -> i32 {
+pub unsafe extern "C" fn mp_rt_map_delete(
+    map: *mut MpRtHeader,
+    key: *const u8,
+    key_size: u64,
+) -> i32 {
     let payload = map_payload(map);
-    assert_eq!(key_size, (*payload).key_size, "mp_rt_map_delete: key_size mismatch");
+    assert_eq!(
+        key_size,
+        (*payload).key_size,
+        "mp_rt_map_delete: key_size mismatch"
+    );
     if (*payload).cap == 0 || (*payload).data_ptr.is_null() {
         return 0;
     }
@@ -1516,7 +2637,11 @@ pub unsafe extern "C" fn mp_rt_map_delete(map: *mut MpRtHeader, key: *const u8, 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_map_contains_key(map: *mut MpRtHeader, key: *const u8, key_size: u64) -> i32 {
+pub unsafe extern "C" fn mp_rt_map_contains_key(
+    map: *mut MpRtHeader,
+    key: *const u8,
+    key_size: u64,
+) -> i32 {
     if mp_rt_map_get(map, key, key_size).is_null() {
         0
     } else {
@@ -1567,7 +2692,11 @@ mod collection_tests {
     unsafe extern "C" fn i32_eq(a: *const u8, b: *const u8) -> i32 {
         let av = *(a as *const i32);
         let bv = *(b as *const i32);
-        if av == bv { 1 } else { 0 }
+        if av == bv {
+            1
+        } else {
+            0
+        }
     }
 
     unsafe extern "C" fn i32_cmp(a: *const u8, b: *const u8) -> i32 {
@@ -1607,9 +2736,21 @@ mod collection_tests {
             let v1 = 10_i32;
             let v2 = 30_i32;
             let v3 = 20_i32;
-            mp_rt_arr_push(arr, &v1 as *const i32 as *const u8, std::mem::size_of::<i32>() as u64);
-            mp_rt_arr_push(arr, &v2 as *const i32 as *const u8, std::mem::size_of::<i32>() as u64);
-            mp_rt_arr_push(arr, &v3 as *const i32 as *const u8, std::mem::size_of::<i32>() as u64);
+            mp_rt_arr_push(
+                arr,
+                &v1 as *const i32 as *const u8,
+                std::mem::size_of::<i32>() as u64,
+            );
+            mp_rt_arr_push(
+                arr,
+                &v2 as *const i32 as *const u8,
+                std::mem::size_of::<i32>() as u64,
+            );
+            mp_rt_arr_push(
+                arr,
+                &v3 as *const i32 as *const u8,
+                std::mem::size_of::<i32>() as u64,
+            );
 
             assert_eq!(mp_rt_arr_len(arr), 3);
             assert_eq!(*(mp_rt_arr_get(arr, 0) as *const i32), 10);
@@ -1681,23 +2822,44 @@ mod collection_tests {
 
             assert_eq!(mp_rt_map_len(map), 2);
 
-            let p1 = mp_rt_map_get(map, &k1 as *const u64 as *const u8, std::mem::size_of::<u64>() as u64);
+            let p1 = mp_rt_map_get(
+                map,
+                &k1 as *const u64 as *const u8,
+                std::mem::size_of::<u64>() as u64,
+            );
             assert!(!p1.is_null());
             assert_eq!(*(p1 as *const u64), 101);
 
             assert_eq!(
-                mp_rt_map_contains_key(map, &k2 as *const u64 as *const u8, std::mem::size_of::<u64>() as u64),
+                mp_rt_map_contains_key(
+                    map,
+                    &k2 as *const u64 as *const u8,
+                    std::mem::size_of::<u64>() as u64
+                ),
                 1
             );
             assert_eq!(
-                mp_rt_map_delete(map, &k2 as *const u64 as *const u8, std::mem::size_of::<u64>() as u64),
+                mp_rt_map_delete(
+                    map,
+                    &k2 as *const u64 as *const u8,
+                    std::mem::size_of::<u64>() as u64
+                ),
                 1
             );
             assert_eq!(
-                mp_rt_map_contains_key(map, &k2 as *const u64 as *const u8, std::mem::size_of::<u64>() as u64),
+                mp_rt_map_contains_key(
+                    map,
+                    &k2 as *const u64 as *const u8,
+                    std::mem::size_of::<u64>() as u64
+                ),
                 0
             );
-            assert!(mp_rt_map_get(map, &k2 as *const u64 as *const u8, std::mem::size_of::<u64>() as u64).is_null());
+            assert!(mp_rt_map_get(
+                map,
+                &k2 as *const u64 as *const u8,
+                std::mem::size_of::<u64>() as u64
+            )
+            .is_null());
 
             let keys = mp_rt_map_keys(map);
             let values = mp_rt_map_values(map);

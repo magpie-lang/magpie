@@ -67,9 +67,9 @@ impl<'a, 'd> Parser<'a, 'd> {
         let start = self.peek().span;
 
         self.expect(TokenKind::Module);
-        let module_path = self
-            .parse_module_path()
-            .unwrap_or(ModulePath { segments: Vec::new() });
+        let module_path = self.parse_module_path().unwrap_or(ModulePath {
+            segments: Vec::new(),
+        });
 
         self.expect(TokenKind::Exports);
         let exports = self.parse_exports_block();
@@ -129,9 +129,9 @@ impl<'a, 'd> Parser<'a, 'd> {
 
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let start = self.peek().span;
-            let module_path = self
-                .parse_module_path()
-                .unwrap_or(ModulePath { segments: Vec::new() });
+            let module_path = self.parse_module_path().unwrap_or(ModulePath {
+                segments: Vec::new(),
+            });
             self.expect_double_colon();
             self.expect(TokenKind::LBrace);
 
@@ -246,7 +246,9 @@ impl<'a, 'd> Parser<'a, 'd> {
             }
         }
 
-        let name = self.parse_fn_name().unwrap_or_else(|| "@<error>".to_string());
+        let name = self
+            .parse_fn_name()
+            .unwrap_or_else(|| "@<error>".to_string());
 
         self.expect(TokenKind::LParen);
         let params = self.parse_params_list(TokenKind::RParen);
@@ -360,7 +362,11 @@ impl<'a, 'd> Parser<'a, 'd> {
 
         self.expect(TokenKind::RBrace);
 
-        Some(AstFnMeta { uses, effects, cost })
+        Some(AstFnMeta {
+            uses,
+            effects,
+            cost,
+        })
     }
 
     fn parse_type_decl(
@@ -386,7 +392,9 @@ impl<'a, 'd> Parser<'a, 'd> {
             return None;
         };
 
-        let name = self.parse_type_name().unwrap_or_else(|| "T<error>".to_string());
+        let name = self
+            .parse_type_name()
+            .unwrap_or_else(|| "T<error>".to_string());
         let type_params = self.parse_type_params_opt();
 
         self.expect(TokenKind::LBrace);
@@ -660,10 +668,13 @@ impl<'a, 'd> Parser<'a, 'd> {
 
         let mut instrs = Vec::new();
         while !self.at_terminator_start() {
-            if self.at(TokenKind::BlockLabel) || self.at(TokenKind::RBrace) || self.at(TokenKind::Eof)
+            if self.at(TokenKind::BlockLabel)
+                || self.at(TokenKind::RBrace)
+                || self.at(TokenKind::Eof)
             {
                 self.error_here("Missing block terminator.");
-                let term = Spanned::new(AstTerminator::Unreachable, self.span_from(self.peek().span));
+                let term =
+                    Spanned::new(AstTerminator::Unreachable, self.span_from(self.peek().span));
                 return Some(Spanned::new(
                     AstBlock {
                         label,
@@ -765,7 +776,10 @@ impl<'a, 'd> Parser<'a, 'd> {
         }
 
         self.expect(TokenKind::RBrace);
-        Some(Spanned::new(AstInstr::UnsafeBlock(inner), self.span_from(start)))
+        Some(Spanned::new(
+            AstInstr::UnsafeBlock(inner),
+            self.span_from(start),
+        ))
     }
 
     fn parse_terminator(&mut self) -> Option<Spanned<AstTerminator>> {
@@ -778,7 +792,10 @@ impl<'a, 'd> Parser<'a, 'd> {
             } else {
                 None
             };
-            return Some(Spanned::new(AstTerminator::Ret(value), self.span_from(start)));
+            return Some(Spanned::new(
+                AstTerminator::Ret(value),
+                self.span_from(start),
+            ));
         }
 
         if self.at_word("br") {
@@ -917,7 +934,11 @@ impl<'a, 'd> Parser<'a, 'd> {
                 let callee = self.parse_fn_ref()?;
                 let targs = self.parse_type_args_opt();
                 let args = self.parse_arg_pairs_braced()?;
-                Some(AstOp::Call { callee, targs, args })
+                Some(AstOp::Call {
+                    callee,
+                    targs,
+                    args,
+                })
             }
 
             TokenKind::CallIndirect => {
@@ -932,7 +953,11 @@ impl<'a, 'd> Parser<'a, 'd> {
                 let callee = self.parse_fn_ref()?;
                 let targs = self.parse_type_args_opt();
                 let args = self.parse_arg_pairs_braced()?;
-                Some(AstOp::Try { callee, targs, args })
+                Some(AstOp::Try {
+                    callee,
+                    targs,
+                    args,
+                })
             }
 
             TokenKind::SuspendCall => {
@@ -940,7 +965,11 @@ impl<'a, 'd> Parser<'a, 'd> {
                 let callee = self.parse_fn_ref()?;
                 let targs = self.parse_type_args_opt();
                 let args = self.parse_arg_pairs_braced()?;
-                Some(AstOp::SuspendCall { callee, targs, args })
+                Some(AstOp::SuspendCall {
+                    callee,
+                    targs,
+                    args,
+                })
             }
 
             TokenKind::SuspendAwait => {
@@ -1527,7 +1556,11 @@ impl<'a, 'd> Parser<'a, 'd> {
                 let callee = self.parse_fn_ref()?;
                 let targs = self.parse_type_args_opt();
                 let args = self.parse_arg_pairs_braced()?;
-                Some(AstOpVoid::CallVoid { callee, targs, args })
+                Some(AstOpVoid::CallVoid {
+                    callee,
+                    targs,
+                    args,
+                })
             }
             TokenKind::CallVoidIndirect => {
                 self.advance();
@@ -1798,14 +1831,18 @@ impl<'a, 'd> Parser<'a, 'd> {
                         self.expect(TokenKind::LAngle);
                         let t = self.parse_type().node;
                         self.expect(TokenKind::RAngle);
-                        Some(AstBaseType::Builtin(AstBuiltinType::TChannelSend(Box::new(t))))
+                        Some(AstBaseType::Builtin(AstBuiltinType::TChannelSend(
+                            Box::new(t),
+                        )))
                     }
                     "TChannelRecv" => {
                         self.advance();
                         self.expect(TokenKind::LAngle);
                         let t = self.parse_type().node;
                         self.expect(TokenKind::RAngle);
-                        Some(AstBaseType::Builtin(AstBuiltinType::TChannelRecv(Box::new(t))))
+                        Some(AstBaseType::Builtin(AstBuiltinType::TChannelRecv(
+                            Box::new(t),
+                        )))
                     }
                     "TCallable" => {
                         self.advance();
@@ -2240,10 +2277,13 @@ impl<'a, 'd> Parser<'a, 'd> {
             return None;
         }
         let tok = self.advance();
-        let value = parse_i128_lit(&tok.text).ok_or(()).and_then(|v| i64::try_from(v).map_err(|_| ())).unwrap_or_else(|_| {
-            self.error_at(tok.span, "Integer literal out of i64 range.");
-            0
-        });
+        let value = parse_i128_lit(&tok.text)
+            .ok_or(())
+            .and_then(|v| i64::try_from(v).map_err(|_| ()))
+            .unwrap_or_else(|_| {
+                self.error_at(tok.span, "Integer literal out of i64 range.");
+                0
+            });
         Some(value)
     }
 
@@ -2609,8 +2649,7 @@ enum FnFlavor {
 fn is_prim_type(name: &str) -> bool {
     matches!(
         name,
-        "i1"
-            | "i8"
+        "i1" | "i8"
             | "i16"
             | "i32"
             | "i64"
@@ -2641,6 +2680,7 @@ fn parse_i128_lit(text: &str) -> Option<i128> {
 mod tests {
     use super::parse_file;
     use magpie_ast::{AstDecl, FileId};
+    use magpie_csnf::format_csnf;
     use magpie_diag::DiagnosticBag;
 
     fn parse_fixture(path: &str) -> (magpie_ast::AstFile, DiagnosticBag) {
@@ -2738,5 +2778,28 @@ mod tests {
             vec!["test", "try_error"]
         );
         assert_eq!(ast.decls.len(), 1);
+    }
+
+    fn canonical_fixture(path: &str) -> String {
+        let (ast, diag) = parse_fixture(path);
+        assert!(
+            !diag.has_errors(),
+            "fixture should parse without errors: {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
+        );
+        format_csnf(&ast)
+    }
+
+    #[test]
+    fn snapshot_hello_parser_output() {
+        insta::assert_snapshot!(canonical_fixture("../../tests/fixtures/hello.mp"));
+    }
+
+    #[test]
+    fn snapshot_arithmetic_parser_output() {
+        insta::assert_snapshot!(canonical_fixture("../../tests/fixtures/arithmetic.mp"));
     }
 }

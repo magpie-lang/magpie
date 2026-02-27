@@ -40,6 +40,28 @@ pub struct WhyEvent {
     pub span: Option<Span>,
 }
 
+impl WhyTrace {
+    pub fn new(kind: impl Into<String>, trace: Vec<WhyEvent>) -> Self {
+        Self {
+            kind: kind.into(),
+            trace,
+        }
+    }
+
+    pub fn ownership(trace: Vec<WhyEvent>) -> Self {
+        Self::new("ownership", trace)
+    }
+}
+
+impl WhyEvent {
+    pub fn new(description: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+            span: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SuggestedFix {
     pub title: String,
@@ -56,7 +78,10 @@ pub struct DiagnosticBag {
 
 impl DiagnosticBag {
     pub fn new(max_errors: usize) -> Self {
-        Self { diagnostics: Vec::new(), max_errors }
+        Self {
+            diagnostics: Vec::new(),
+            max_errors,
+        }
     }
 
     pub fn emit(&mut self, diag: Diagnostic) {
@@ -66,11 +91,16 @@ impl DiagnosticBag {
     }
 
     pub fn has_errors(&self) -> bool {
-        self.diagnostics.iter().any(|d| matches!(d.severity, Severity::Error))
+        self.diagnostics
+            .iter()
+            .any(|d| matches!(d.severity, Severity::Error))
     }
 
     pub fn error_count(&self) -> usize {
-        self.diagnostics.iter().filter(|d| matches!(d.severity, Severity::Error)).count()
+        self.diagnostics
+            .iter()
+            .filter(|d| matches!(d.severity, Severity::Error))
+            .count()
     }
 }
 
@@ -101,7 +131,7 @@ pub mod codes {
     pub const MPT1023: &str = "MPT1023"; // MISSING_REQUIRED_TRAIT_IMPL
     pub const MPT1030: &str = "MPT1030"; // TCALLABLE_SUSPEND_FORBIDDEN
     pub const MPT1200: &str = "MPT1200"; // ORPHAN_IMPL
-    // Ownership
+                                         // Ownership
     pub const MPO_PREFIX: &str = "MPO";
     pub const MPO0003: &str = "MPO0003"; // BORROW_ESCAPES_SCOPE
     pub const MPO0004: &str = "MPO0004"; // SHARED_MUTATION
@@ -109,27 +139,31 @@ pub mod codes {
     pub const MPO0101: &str = "MPO0101"; // BORROW_CROSSES_BLOCK
     pub const MPO0102: &str = "MPO0102"; // BORROW_IN_PHI
     pub const MPO0103: &str = "MPO0103"; // MAP_GET_REQUIRES_DUPABLE_V
-    // ARC
+                                         // ARC
     pub const MPA_PREFIX: &str = "MPA";
     // SSA verification
     pub const MPS_PREFIX: &str = "MPS";
     // Async
     pub const MPAS_PREFIX: &str = "MPAS";
     pub const MPAS0001: &str = "MPAS0001"; // SUSPEND_IN_NON_ASYNC
-    // FFI
+                                           // FFI
     pub const MPF0001: &str = "MPF0001"; // FFI_RETURN_OWNERSHIP_REQUIRED
-    // GPU
+                                         // GPU
     pub const MPG_PREFIX: &str = "MPG";
     // Web
     pub const MPW_PREFIX: &str = "MPW";
     pub const MPW1001: &str = "MPW1001"; // DUPLICATE_ROUTE
-    // Package
+                                         // Package
     pub const MPK_PREFIX: &str = "MPK";
     // Lint / LLM
     pub const MPL_PREFIX: &str = "MPL";
     pub const MPL0801: &str = "MPL0801"; // TOKEN_BUDGET_TOO_SMALL
     pub const MPL0802: &str = "MPL0802"; // TOKENIZER_FALLBACK_USED
-    pub const MPL2001: &str = "MPL2001"; // FN_TOO_LARGE
+    pub const MPL2001: &str = "MPL2001"; // UNUSED_VARIABLE
+    pub const MPL2002: &str = "MPL2002"; // UNUSED_FUNCTION
+    pub const MPL2003: &str = "MPL2003"; // UNNECESSARY_BORROW
+    pub const MPL2005: &str = "MPL2005"; // EMPTY_BLOCK
+    pub const MPL2007: &str = "MPL2007"; // UNREACHABLE_CODE
     pub const MPL2020: &str = "MPL2020"; // EXCESSIVE_MONO
     pub const MPL2021: &str = "MPL2021"; // MIXED_GENERICS_MODE
 }
@@ -285,6 +319,41 @@ pub fn enforce_budget(envelope: &mut OutputEnvelope, budget: &TokenBudget) {
     }
 
     if estimated_envelope_tokens(envelope, &tokenizer) > budget.budget {
+        // Hard trim: remove artifacts and extra diagnostics before final fallback.
+        if !envelope.artifacts.is_empty() {
+            envelope.artifacts.clear();
+            dropped.push(BudgetDrop {
+                field: "artifacts".to_string(),
+                reason: "budget_hard_trim".to_string(),
+            });
+        }
+        while estimated_envelope_tokens(envelope, &tokenizer) > budget.budget
+            && envelope.diagnostics.len() > 1
+        {
+            envelope.diagnostics.pop();
+            dropped.push(BudgetDrop {
+                field: "diagnostics[last]".to_string(),
+                reason: "budget_hard_trim".to_string(),
+            });
+        }
+        while estimated_envelope_tokens(envelope, &tokenizer) > budget.budget {
+            let Some(diag) = envelope.diagnostics.first_mut() else {
+                break;
+            };
+            let current_len = diag.message.chars().count();
+            if current_len <= 64 {
+                break;
+            }
+            let next_len = (current_len / 2).max(64);
+            diag.message = truncate_chars(&diag.message, next_len);
+            dropped.push(BudgetDrop {
+                field: "diagnostics[0].message".to_string(),
+                reason: "budget_hard_trim".to_string(),
+            });
+        }
+    }
+
+    if estimated_envelope_tokens(envelope, &tokenizer) > budget.budget {
         // Tier 0 alone still exceeds budget: return MPL0801 minimal envelope.
         let mut tier0_probe = envelope.clone();
         tier0_probe.artifacts.clear();
@@ -297,7 +366,9 @@ pub fn enforce_budget(envelope: &mut OutputEnvelope, budget: &TokenBudget) {
                 diag.message = truncate_chars(&diag.message, 200);
             }
         }
-        let recommended_budget = estimated_envelope_tokens(&tier0_probe, &tokenizer).saturating_mul(2).max(1);
+        let recommended_budget = estimated_envelope_tokens(&tier0_probe, &tokenizer)
+            .saturating_mul(2)
+            .max(1);
 
         envelope.success = false;
         envelope.artifacts.clear();
@@ -307,7 +378,10 @@ pub fn enforce_budget(envelope: &mut OutputEnvelope, budget: &TokenBudget) {
             title: "token budget too small".to_string(),
             primary_span: None,
             secondary_spans: Vec::new(),
-            message: format!("Configured budget {} is too small; recommended minimum is {}.", budget.budget, recommended_budget),
+            message: format!(
+                "Configured budget {} is too small; recommended minimum is {}.",
+                budget.budget, recommended_budget
+            ),
             explanation_md: None,
             why: None,
             suggested_fixes: Vec::new(),
@@ -327,25 +401,179 @@ pub fn enforce_budget(envelope: &mut OutputEnvelope, budget: &TokenBudget) {
     };
     envelope.llm_budget = serde_json::to_value(&report).ok();
     report.estimated_tokens = estimated_envelope_tokens(envelope, &tokenizer);
+    if report.estimated_tokens > budget.budget {
+        let dropped_count = report.dropped.len();
+        report.dropped = vec![BudgetDrop {
+            field: "dropped".to_string(),
+            reason: format!("{} entries omitted", dropped_count),
+        }];
+        envelope.llm_budget = serde_json::to_value(&report).ok();
+        report.estimated_tokens = estimated_envelope_tokens(envelope, &tokenizer);
+        if report.estimated_tokens > budget.budget {
+            envelope.llm_budget = None;
+            return;
+        }
+    }
     envelope.llm_budget = serde_json::to_value(&report).ok();
 }
 
 /// Return a compact remediation template for major diagnostic namespaces.
 pub fn explain_code(code: &str) -> Option<String> {
-    if code.starts_with(codes::MPO_PREFIX) {
-        return Some(
-            "Ownership remediation: avoid using values after move, shorten borrow lifetimes, and clone only when sharing is required.".to_string(),
-        );
+    let normalized = code.trim().to_ascii_uppercase();
+    let template = match normalized.as_str() {
+        "MPP0001" => "Source I/O failed. Example: file read/write path missing. Fix template: verify path, create directories, and ensure read/write permissions.",
+        "MPP0002" => "Syntax/tokenization error. Example: invalid token or malformed grammar production. Fix template: run `magpie fmt`, then correct the highlighted token sequence.",
+        "MPP0003" => "Artifact emission failed. Example: `.ll`/`.mpir`/graph write error. Fix template: verify target directory permissions and free disk space, then rebuild.",
+        "MPM0001" => "MPIR lowering produced no modules. Example: HIR lowered to empty module set. Fix template: confirm entry module parses and lowering pass receives at least one resolved module.",
+        "MPHIR01" => "HIR invariant violated: `getfield` object is not borrow/mutborrow. Example: direct field read from owned value. Fix template: borrow the object first, then perform `getfield`.",
+        "MPHIR02" => "HIR invariant violated: `setfield` requires mutborrow. Example: writing through shared/owned handle. Fix template: obtain `mutborrow` and perform mutation through that handle.",
+        "MPHIR03" => "HIR invariant violated: borrow value escapes via return. Example: function returns `borrow T`. Fix template: return owned/shared value or redesign API to keep borrow local.",
+        "MPO0003" => "Borrow escapes scope. Example: storing borrow in global/collection. Fix template: store owned/shared values instead, or shorten borrow to local use only.",
+        "MPO0004" => "Mutation through shared/invalid ownership mode. Example: mutating intrinsic called on shared handle. Fix template: require unique/mutborrow receiver or clone into mutable owner.",
+        "MPO0007" => "Use-after-move. Example: reading `%x` after `move %x`. Fix template: avoid subsequent uses, clone before move if sharing is required.",
+        "MPO0011" => "Move while borrowed. Example: `move %x` while borrow of `%x` is alive. Fix template: end borrow scope before move, or duplicate value when legal.",
+        "MPO0101" => "Borrow crosses basic block boundary. Example: borrow defined in one block, used in another. Fix template: recreate borrow in each block or pass owned/shared value instead.",
+        "MPO0102" => "Borrow in phi is forbidden. Example: phi incoming includes borrow handle. Fix template: phi owned/shared values only; recreate borrows after join.",
+        "MPO0103" => "Map `get` requires Dupable value type. Example: map value is move-only. Fix template: use `map.get_ref`, change value type to Dupable, or redesign ownership flow.",
+        "MPS0000" => "Module resolution failed without specific diagnostics. Fix template: validate module headers/import graph and rerun with full diagnostics.",
+        "MPS0001" => "Duplicate definition / SSA single-definition violation. Example: module path or `%local` defined twice. Fix template: keep one declaration per symbol/local.",
+        "MPS0002" => "Unresolved reference/import target. Example: imported module/symbol missing. Fix template: add missing module, correct import path, or declare value before use.",
+        "MPS0003" => "Symbol resolution failure. Example: import item or SSA local cannot be resolved. Fix template: fix name/path typo and ensure declaration exists in scope.",
+        "MPS0004" => "Namespace/SID consistency violation. Example: import conflicts or SID kind mismatch. Fix template: remove conflicting symbol names and ensure SID kind matches entity.",
+        "MPS0005" => "Namespace/SID validity violation. Example: type import conflict or malformed SID. Fix template: use unique type names and valid canonical SID format.",
+        "MPS0006" => "Ambiguous import. Example: same short name resolves to multiple FQNs. Fix template: import with unambiguous names or reference by fully-qualified name.",
+        "MPS0008" => "Invalid control-flow edge. Example: branch/switch targets missing block. Fix template: ensure every terminator target exists in function block list.",
+        "MPS0009" => "MPIR entry block invariant failed. Example: expected `bb0` missing. Fix template: preserve canonical entry block and reachable CFG structure.",
+        "MPS0010" => "Type/invariant check failed. Example: unknown type in signature or invalid phi/value type. Fix template: use declared types and keep phi/value invariants valid.",
+        "MPS0011" => "Instruction typing/evaluation mismatch. Example: op argument type incompatible with expected type. Fix template: insert explicit cast or correct operand types.",
+        "MPS0012" => "Call arity mismatch. Example: passed argument count differs from callee signature. Fix template: align call args with signature exactly.",
+        "MPS0013" => "Return type mismatch. Example: returned value type differs from function return type. Fix template: return the declared type or adjust function signature.",
+        "MPS0014" => "Return shape mismatch. Example: unit function returns value (or vice versa). Fix template: match `ret` form to declared return type.",
+        "MPS0015" => "Call argument contract mismatch. Example: argument type/ownership differs from parameter contract. Fix template: pass values with matching type and ownership mode.",
+        "MPS0016" => "Unknown or invalid callee reference. Example: call target SID/name not found. Fix template: ensure callee exists and reference is fully resolved.",
+        "MPS0017" => "Conditional branch predicate type invalid. Example: non-boolean condition in `cbr`. Fix template: produce `bool` condition before branching.",
+        "MPS0020" => "No-overloads rule violated in function/global namespace. Fix template: rename duplicate `@` symbols within module.",
+        "MPS0021" => "No-overloads rule violated in type namespace. Fix template: rename duplicate `T` symbols within module.",
+        "MPS0022" => "No-overloads rule violated for globals/functions. Fix template: keep each `@` symbol name unique per module.",
+        "MPS0023" => "No-overloads rule violated in signature namespace. Fix template: rename duplicate `sig` declarations.",
+        "MPL0001" => "Unknown emit kind. Example: unsupported `--emit` value. Fix template: use supported emits (e.g. `exe`, `llvm-ir`, `mpir`, `symgraph`).",
+        "MPL0801" => "Token budget too small for required output. Fix template: increase `--llm-token-budget` or use `minimal` budget policy.",
+        "MPL0802" => "Requested tokenizer unavailable; fallback used. Fix template: install/configure requested tokenizer or explicitly use `approx:utf8_4chars`.",
+        "MPL2001" => "Function too large lint. Fix template: split function into smaller helpers and keep CFG/local scope compact.",
+        "MPL2002" => "Unused function lint. Fix template: remove dead function, reference it from call sites, or mark as intentionally exported.",
+        "MPL2003" => "Unnecessary borrow lint. Fix template: pass owned/shared value directly when no borrow semantics are required.",
+        "MPL2005" => "Empty block lint. Fix template: remove empty block or add meaningful instructions/terminator flow.",
+        "MPL2007" => "Unreachable code lint. Fix template: delete dead instructions or restructure control flow to make intent explicit.",
+        "MPL2020" => "Monomorphization budget exceeded. Fix template: reduce generic instance explosion or enable shared-generics mode.",
+        "MPL2021" => "Mixed generics mode conflict. Fix template: use a single generics strategy consistently for the build target/profile.",
+        "MPLINK01" => "Primary native link path failed; fallback started. Fix template: install/configure `llc` + system linker, or rely on clang IR fallback.",
+        "MPLINK02" => "Native linking unavailable after fallback. Fix template: install linker toolchain for target triple; use LLVM IR artifacts until toolchain is fixed.",
+        _ => {
+            if normalized.starts_with(codes::MPO_PREFIX) {
+                "Ownership remediation: avoid using values after move, shorten borrow lifetimes, and clone only when sharing is required."
+            } else if normalized.starts_with(codes::MPT_PREFIX) {
+                "Type remediation: align declared and inferred types, satisfy required trait bounds, and remove recursive/value-layout mismatches."
+            } else if normalized.starts_with(codes::MPS_PREFIX) {
+                "SSA remediation: ensure each value is defined before use, phi inputs match predecessor blocks, and control-flow edges stay structurally valid."
+            } else if normalized.starts_with(codes::MPL_PREFIX) {
+                "Lint/LLM remediation: adjust build policy, token budget, or code structure to satisfy deterministic output constraints."
+            } else {
+                return None;
+            }
+        }
+    };
+
+    Some(template.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enforce_budget_truncates_to_fit_budget() {
+        let long_text = "x".repeat(8_000);
+        let mut envelope = OutputEnvelope {
+            magpie_version: "0.1.0".to_string(),
+            command: "build".to_string(),
+            target: Some("x86_64-unknown-linux".to_string()),
+            success: false,
+            artifacts: vec!["very-long-artifact-name".repeat(40)],
+            diagnostics: vec![
+                Diagnostic {
+                    code: "MPL2001".to_string(),
+                    severity: Severity::Error,
+                    title: "too large".to_string(),
+                    primary_span: None,
+                    secondary_spans: Vec::new(),
+                    message: long_text.clone(),
+                    explanation_md: Some(long_text.clone()),
+                    why: Some(WhyTrace {
+                        kind: "trace".to_string(),
+                        trace: vec![
+                            WhyEvent {
+                                description: long_text.clone(),
+                                span: None,
+                            },
+                            WhyEvent {
+                                description: long_text.clone(),
+                                span: None,
+                            },
+                        ],
+                    }),
+                    suggested_fixes: vec![
+                        SuggestedFix {
+                            title: "fix".to_string(),
+                            patch_format: "unified".to_string(),
+                            patch: long_text.clone(),
+                            confidence: 0.5,
+                        },
+                        SuggestedFix {
+                            title: "fix2".to_string(),
+                            patch_format: "unified".to_string(),
+                            patch: long_text.clone(),
+                            confidence: 0.4,
+                        },
+                    ],
+                },
+                Diagnostic {
+                    code: "MPL2002".to_string(),
+                    severity: Severity::Error,
+                    title: "also large".to_string(),
+                    primary_span: None,
+                    secondary_spans: Vec::new(),
+                    message: long_text.clone(),
+                    explanation_md: Some(long_text),
+                    why: None,
+                    suggested_fixes: Vec::new(),
+                },
+            ],
+            timing_ms: serde_json::json!({}),
+            llm_budget: None,
+        };
+
+        let budget = TokenBudget {
+            budget: 500,
+            tokenizer: "approx:utf8_4chars".to_string(),
+            policy: "balanced".to_string(),
+        };
+
+        enforce_budget(&mut envelope, &budget);
+
+        if let Some(report) = envelope
+            .llm_budget
+            .as_ref()
+            .and_then(|value| serde_json::from_value::<BudgetReport>(value.clone()).ok())
+        {
+            assert!(
+                !report.dropped.is_empty(),
+                "expected budget enforcement to drop some fields, report={report:?}"
+            );
+        } else {
+            assert!(
+                estimated_envelope_tokens(&envelope, "approx:utf8_4chars") <= budget.budget,
+                "payload should fit budget when budget metadata is omitted"
+            );
+        }
     }
-    if code.starts_with(codes::MPT_PREFIX) {
-        return Some(
-            "Type remediation: align declared and inferred types, satisfy required trait bounds, and remove recursive/value-layout mismatches.".to_string(),
-        );
-    }
-    if code.starts_with(codes::MPS_PREFIX) {
-        return Some(
-            "SSA remediation: ensure each value is defined before use, phi inputs match predecessor blocks, and control-flow edges stay structurally valid.".to_string(),
-        );
-    }
-    None
 }

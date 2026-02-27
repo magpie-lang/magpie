@@ -1,6 +1,10 @@
 //! Magpie type system: TypeKind, HeapBase, type interning, TypeId assignment (§8, §16.2-16.3).
 
 use serde::{Deserialize, Serialize};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 pub struct PackageId(pub u32);
@@ -31,17 +35,43 @@ pub struct BlockId(pub u32);
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum PrimType {
-    I1, I8, I16, I32, I64, I128,
-    U1, U8, U16, U32, U64, U128,
-    F16, F32, F64,
+    I1,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    U1,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    F16,
+    F32,
+    F64,
     Bool, // alias for I1
     Unit,
 }
 
 impl PrimType {
     pub fn is_integer(&self) -> bool {
-        matches!(self, Self::I1 | Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::I128
-            | Self::U1 | Self::U8 | Self::U16 | Self::U32 | Self::U64 | Self::U128 | Self::Bool)
+        matches!(
+            self,
+            Self::I1
+                | Self::I8
+                | Self::I16
+                | Self::I32
+                | Self::I64
+                | Self::I128
+                | Self::U1
+                | Self::U8
+                | Self::U16
+                | Self::U32
+                | Self::U64
+                | Self::U128
+                | Self::Bool
+        )
     }
 
     pub fn is_float(&self) -> bool {
@@ -49,7 +79,10 @@ impl PrimType {
     }
 
     pub fn is_signed(&self) -> bool {
-        matches!(self, Self::I1 | Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::I128)
+        matches!(
+            self,
+            Self::I1 | Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::I128
+        )
     }
 
     pub fn bit_width(&self) -> u32 {
@@ -78,7 +111,11 @@ impl Sid {
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum HandleKind {
-    Unique, Shared, Borrow, MutBorrow, Weak,
+    Unique,
+    Shared,
+    Borrow,
+    MutBorrow,
+    Weak,
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
@@ -108,6 +145,13 @@ pub enum HeapBase {
     BuiltinChannelRecv { elem: TypeId },
     Callable { sig_sid: Sid },
     UserType { type_sid: Sid, targs: Vec<TypeId> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypeLayout {
+    pub size: u64,
+    pub align: u64,
+    pub fields: Vec<(String, u64)>, // (field_name, byte_offset)
 }
 
 /// Fixed type_id table (§20.1.4)
@@ -147,11 +191,22 @@ pub mod fixed_type_ids {
 pub struct TypeCtx {
     pub types: Vec<(TypeId, TypeKind)>,
     next_user_id: u32,
+    type_fqns: HashMap<Sid, String>,
+    value_struct_fields: HashMap<Sid, Vec<(String, TypeId)>>,
+    value_enum_variants: HashMap<Sid, Vec<(String, Vec<(String, TypeId)>)>>,
+    layout_cache: RefCell<HashMap<TypeId, TypeLayout>>,
 }
 
 impl TypeCtx {
     pub fn new() -> Self {
-        let mut ctx = Self { types: Vec::with_capacity(64), next_user_id: 1000 };
+        let mut ctx = Self {
+            types: Vec::with_capacity(64),
+            next_user_id: fixed_type_ids::USER_TYPE_START.0,
+            type_fqns: HashMap::new(),
+            value_struct_fields: HashMap::new(),
+            value_enum_variants: HashMap::new(),
+            layout_cache: RefCell::new(HashMap::new()),
+        };
         ctx.populate_fixed_types();
         ctx
     }
@@ -175,8 +230,20 @@ impl TypeCtx {
             (F16, TypeKind::Prim(PrimType::F16)),
             (F32, TypeKind::Prim(PrimType::F32)),
             (F64, TypeKind::Prim(PrimType::F64)),
-            (STR, TypeKind::HeapHandle { hk: HandleKind::Unique, base: HeapBase::BuiltinStr }),
-            (STR_BUILDER, TypeKind::HeapHandle { hk: HandleKind::Unique, base: HeapBase::BuiltinStrBuilder }),
+            (
+                STR,
+                TypeKind::HeapHandle {
+                    hk: HandleKind::Unique,
+                    base: HeapBase::BuiltinStr,
+                },
+            ),
+            (
+                STR_BUILDER,
+                TypeKind::HeapHandle {
+                    hk: HandleKind::Unique,
+                    base: HeapBase::BuiltinStrBuilder,
+                },
+            ),
         ];
         for (id, kind) in fixed {
             self.types.push((id, kind));
@@ -191,6 +258,7 @@ impl TypeCtx {
         let id = TypeId(self.next_user_id);
         self.next_user_id += 1;
         self.types.push((id, kind));
+        self.layout_cache.borrow_mut().clear();
         id
     }
 
@@ -221,5 +289,582 @@ impl TypeCtx {
             PrimType::F32 => fixed_type_ids::F32,
             PrimType::F64 => fixed_type_ids::F64,
         }
+    }
+
+    pub fn register_type_fqn(&mut self, sid: Sid, fqn: impl Into<String>) {
+        self.type_fqns.insert(sid, fqn.into());
+    }
+
+    pub fn register_value_struct_fields(&mut self, sid: Sid, fields: Vec<(String, TypeId)>) {
+        self.value_struct_fields.insert(sid, fields);
+        self.layout_cache.borrow_mut().clear();
+    }
+
+    pub fn register_value_enum_variants(
+        &mut self,
+        sid: Sid,
+        variants: Vec<(String, Vec<(String, TypeId)>)>,
+    ) {
+        self.value_enum_variants.insert(sid, variants);
+        self.layout_cache.borrow_mut().clear();
+    }
+
+    pub fn type_str(&self, type_id: TypeId) -> String {
+        self.lookup(type_id)
+            .map(|k| self.type_str_kind(k))
+            .unwrap_or_else(|| format!("type#{}", type_id.0))
+    }
+
+    pub fn compute_layout(&self, type_id: TypeId) -> TypeLayout {
+        if let Some(layout) = self.layout_cache.borrow().get(&type_id).cloned() {
+            return layout;
+        }
+        let mut visiting = HashSet::new();
+        self.compute_layout_inner(type_id, &mut visiting)
+    }
+
+    pub fn finalize_type_ids(&mut self) {
+        let mut user_entries = self
+            .types
+            .iter()
+            .filter(|(id, _)| id.0 >= fixed_type_ids::USER_TYPE_START.0)
+            .map(|(id, _)| (*id, self.type_str(*id)))
+            .collect::<Vec<_>>();
+        user_entries.sort_by(|(lhs_id, lhs_key), (rhs_id, rhs_key)| {
+            lhs_key.cmp(rhs_key).then(lhs_id.0.cmp(&rhs_id.0))
+        });
+
+        let mut remap: HashMap<TypeId, TypeId> = HashMap::with_capacity(user_entries.len());
+        let mut next = fixed_type_ids::USER_TYPE_START.0;
+        for (old_id, _) in user_entries {
+            remap.insert(old_id, TypeId(next));
+            next += 1;
+        }
+
+        if remap.is_empty() {
+            self.next_user_id = fixed_type_ids::USER_TYPE_START.0;
+            return;
+        }
+
+        let mut rewritten = Vec::with_capacity(self.types.len());
+        for (old_id, kind) in &self.types {
+            let new_id = Self::remap_type_id(*old_id, &remap);
+            let new_kind = Self::remap_type_kind(kind, &remap);
+            rewritten.push((new_id, new_kind));
+        }
+        rewritten.sort_by_key(|(id, _)| id.0);
+        self.types = rewritten;
+
+        for fields in self.value_struct_fields.values_mut() {
+            for (_, ty) in fields {
+                *ty = Self::remap_type_id(*ty, &remap);
+            }
+        }
+        for variants in self.value_enum_variants.values_mut() {
+            for (_, fields) in variants {
+                for (_, ty) in fields {
+                    *ty = Self::remap_type_id(*ty, &remap);
+                }
+            }
+        }
+
+        self.next_user_id = self
+            .types
+            .iter()
+            .map(|(id, _)| id.0)
+            .max()
+            .map_or(fixed_type_ids::USER_TYPE_START.0, |max_id| {
+                max_id.saturating_add(1)
+            })
+            .max(fixed_type_ids::USER_TYPE_START.0);
+
+        self.layout_cache.borrow_mut().clear();
+    }
+
+    fn compute_layout_inner(&self, type_id: TypeId, visiting: &mut HashSet<TypeId>) -> TypeLayout {
+        if let Some(layout) = self.layout_cache.borrow().get(&type_id).cloned() {
+            return layout;
+        }
+        if !visiting.insert(type_id) {
+            return TypeLayout {
+                size: 0,
+                align: 1,
+                fields: Vec::new(),
+            };
+        }
+
+        let layout = match self.lookup(type_id) {
+            Some(TypeKind::Prim(p)) => self.prim_layout(*p),
+            Some(TypeKind::HeapHandle { .. }) | Some(TypeKind::RawPtr { .. }) => TypeLayout {
+                size: 8,
+                align: 8,
+                fields: Vec::new(),
+            },
+            Some(TypeKind::BuiltinOption { inner }) => self.compute_enum_layout(
+                &[
+                    ("None".to_string(), Vec::new()),
+                    ("Some".to_string(), vec![("value".to_string(), *inner)]),
+                ],
+                visiting,
+            ),
+            Some(TypeKind::BuiltinResult { ok, err }) => self.compute_enum_layout(
+                &[
+                    ("Ok".to_string(), vec![("value".to_string(), *ok)]),
+                    ("Err".to_string(), vec![("error".to_string(), *err)]),
+                ],
+                visiting,
+            ),
+            Some(TypeKind::Arr { n, elem }) | Some(TypeKind::Vec { n, elem }) => {
+                let elem_layout = self.compute_layout_inner(*elem, visiting);
+                TypeLayout {
+                    size: elem_layout.size.saturating_mul(u64::from(*n)),
+                    align: elem_layout.align.max(1),
+                    fields: Vec::new(),
+                }
+            }
+            Some(TypeKind::Tuple { elems }) => {
+                let fields = elems
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, ty)| (idx.to_string(), *ty))
+                    .collect::<Vec<_>>();
+                self.compute_struct_layout(&fields, visiting)
+            }
+            Some(TypeKind::ValueStruct { sid }) => {
+                if let Some(variants) = self.value_enum_variants.get(sid) {
+                    self.compute_enum_layout(variants, visiting)
+                } else if let Some(fields) = self.value_struct_fields.get(sid) {
+                    self.compute_struct_layout(fields, visiting)
+                } else {
+                    TypeLayout {
+                        size: 0,
+                        align: 1,
+                        fields: Vec::new(),
+                    }
+                }
+            }
+            None => TypeLayout {
+                size: 0,
+                align: 1,
+                fields: Vec::new(),
+            },
+        };
+
+        visiting.remove(&type_id);
+        self.layout_cache
+            .borrow_mut()
+            .insert(type_id, layout.clone());
+        layout
+    }
+
+    fn compute_struct_layout(
+        &self,
+        fields: &[(String, TypeId)],
+        visiting: &mut HashSet<TypeId>,
+    ) -> TypeLayout {
+        let mut align = 1_u64;
+        let mut offset = 0_u64;
+        let mut field_offsets = Vec::with_capacity(fields.len());
+
+        for (name, ty) in fields {
+            let field_layout = self.compute_layout_inner(*ty, visiting);
+            let field_align = field_layout.align.max(1);
+            offset = align_to(offset, field_align);
+            field_offsets.push((name.clone(), offset));
+            offset = offset.saturating_add(field_layout.size);
+            align = align.max(field_align);
+        }
+
+        TypeLayout {
+            size: align_to(offset, align),
+            align,
+            fields: field_offsets,
+        }
+    }
+
+    fn compute_enum_layout(
+        &self,
+        variants: &[(String, Vec<(String, TypeId)>)],
+        visiting: &mut HashSet<TypeId>,
+    ) -> TypeLayout {
+        let mut payload_size = 0_u64;
+        let mut payload_align = 1_u64;
+
+        for (_, fields) in variants {
+            let payload_layout = self.compute_struct_layout(fields, visiting);
+            payload_size = payload_size.max(payload_layout.size);
+            payload_align = payload_align.max(payload_layout.align);
+        }
+
+        let tag_size = 4_u64;
+        let tag_align = 4_u64;
+        let payload_offset = align_to(tag_size, payload_align);
+        let align = tag_align.max(payload_align);
+        let size = align_to(payload_offset.saturating_add(payload_size), align);
+        let mut fields = vec![("tag".to_string(), 0)];
+        if payload_size > 0 {
+            fields.push(("payload".to_string(), payload_offset));
+        }
+
+        TypeLayout {
+            size,
+            align,
+            fields,
+        }
+    }
+
+    fn prim_layout(&self, prim: PrimType) -> TypeLayout {
+        let (size, align) = match prim {
+            PrimType::Unit => (0, 1),
+            PrimType::Bool | PrimType::I1 | PrimType::U1 => (1, 1),
+            PrimType::I8 | PrimType::U8 => (1, 1),
+            PrimType::I16 | PrimType::U16 | PrimType::F16 => (2, 2),
+            PrimType::I32 | PrimType::U32 | PrimType::F32 => (4, 4),
+            PrimType::I64 | PrimType::U64 | PrimType::F64 => (8, 8),
+            PrimType::I128 | PrimType::U128 => (16, 16),
+        };
+        TypeLayout {
+            size,
+            align,
+            fields: Vec::new(),
+        }
+    }
+
+    fn type_str_kind(&self, kind: &TypeKind) -> String {
+        match kind {
+            TypeKind::Prim(p) => self.prim_type_str(*p).to_string(),
+            TypeKind::HeapHandle { hk, base } => {
+                let base_s = self.heap_base_str(base);
+                match hk {
+                    HandleKind::Unique => base_s,
+                    HandleKind::Shared => format!("shared {}", base_s),
+                    HandleKind::Borrow => format!("borrow {}", base_s),
+                    HandleKind::MutBorrow => format!("mutborrow {}", base_s),
+                    HandleKind::Weak => format!("weak {}", base_s),
+                }
+            }
+            TypeKind::BuiltinOption { inner } => format!("TOption<{}>", self.type_str(*inner)),
+            TypeKind::BuiltinResult { ok, err } => {
+                format!("TResult<{},{}>", self.type_str(*ok), self.type_str(*err))
+            }
+            TypeKind::RawPtr { to } => format!("rawptr<{}>", self.type_str(*to)),
+            TypeKind::Arr { n, elem } => format!("arr<{},{}>", n, self.type_str(*elem)),
+            TypeKind::Vec { n, elem } => format!("vec<{},{}>", n, self.type_str(*elem)),
+            TypeKind::Tuple { elems } => {
+                let joined = elems
+                    .iter()
+                    .map(|ty| self.type_str(*ty))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("tuple<{}>", joined)
+            }
+            TypeKind::ValueStruct { sid } => self.user_type_name(sid),
+        }
+    }
+
+    fn heap_base_str(&self, base: &HeapBase) -> String {
+        match base {
+            HeapBase::BuiltinStr => "Str".to_string(),
+            HeapBase::BuiltinArray { elem } => format!("Array<{}>", self.type_str(*elem)),
+            HeapBase::BuiltinMap { key, val } => {
+                format!("Map<{},{}>", self.type_str(*key), self.type_str(*val))
+            }
+            HeapBase::BuiltinStrBuilder => "TStrBuilder".to_string(),
+            HeapBase::BuiltinMutex { inner } => format!("TMutex<{}>", self.type_str(*inner)),
+            HeapBase::BuiltinRwLock { inner } => format!("TRwLock<{}>", self.type_str(*inner)),
+            HeapBase::BuiltinCell { inner } => format!("TCell<{}>", self.type_str(*inner)),
+            HeapBase::BuiltinFuture { result } => format!("TFuture<{}>", self.type_str(*result)),
+            HeapBase::BuiltinChannelSend { elem } => {
+                format!("TChannelSend<{}>", self.type_str(*elem))
+            }
+            HeapBase::BuiltinChannelRecv { elem } => {
+                format!("TChannelRecv<{}>", self.type_str(*elem))
+            }
+            HeapBase::Callable { sig_sid } => format!("TCallable<{}>", sig_sid.0),
+            HeapBase::UserType { type_sid, targs } => {
+                let base = self.user_type_name(type_sid);
+                if targs.is_empty() {
+                    base
+                } else {
+                    let joined = targs
+                        .iter()
+                        .map(|ty| self.type_str(*ty))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("{}<{}>", base, joined)
+                }
+            }
+        }
+    }
+
+    fn user_type_name(&self, sid: &Sid) -> String {
+        self.type_fqns
+            .get(sid)
+            .cloned()
+            .unwrap_or_else(|| sid.0.clone())
+    }
+
+    fn prim_type_str(&self, prim: PrimType) -> &'static str {
+        match prim {
+            PrimType::I1 => "i1",
+            PrimType::I8 => "i8",
+            PrimType::I16 => "i16",
+            PrimType::I32 => "i32",
+            PrimType::I64 => "i64",
+            PrimType::I128 => "i128",
+            PrimType::U1 => "u1",
+            PrimType::U8 => "u8",
+            PrimType::U16 => "u16",
+            PrimType::U32 => "u32",
+            PrimType::U64 => "u64",
+            PrimType::U128 => "u128",
+            PrimType::F16 => "f16",
+            PrimType::F32 => "f32",
+            PrimType::F64 => "f64",
+            PrimType::Bool => "bool",
+            PrimType::Unit => "unit",
+        }
+    }
+
+    fn remap_type_id(id: TypeId, remap: &HashMap<TypeId, TypeId>) -> TypeId {
+        remap.get(&id).copied().unwrap_or(id)
+    }
+
+    fn remap_type_kind(kind: &TypeKind, remap: &HashMap<TypeId, TypeId>) -> TypeKind {
+        match kind {
+            TypeKind::Prim(p) => TypeKind::Prim(*p),
+            TypeKind::HeapHandle { hk, base } => TypeKind::HeapHandle {
+                hk: *hk,
+                base: Self::remap_heap_base(base, remap),
+            },
+            TypeKind::BuiltinOption { inner } => TypeKind::BuiltinOption {
+                inner: Self::remap_type_id(*inner, remap),
+            },
+            TypeKind::BuiltinResult { ok, err } => TypeKind::BuiltinResult {
+                ok: Self::remap_type_id(*ok, remap),
+                err: Self::remap_type_id(*err, remap),
+            },
+            TypeKind::RawPtr { to } => TypeKind::RawPtr {
+                to: Self::remap_type_id(*to, remap),
+            },
+            TypeKind::Arr { n, elem } => TypeKind::Arr {
+                n: *n,
+                elem: Self::remap_type_id(*elem, remap),
+            },
+            TypeKind::Vec { n, elem } => TypeKind::Vec {
+                n: *n,
+                elem: Self::remap_type_id(*elem, remap),
+            },
+            TypeKind::Tuple { elems } => TypeKind::Tuple {
+                elems: elems
+                    .iter()
+                    .map(|ty| Self::remap_type_id(*ty, remap))
+                    .collect(),
+            },
+            TypeKind::ValueStruct { sid } => TypeKind::ValueStruct { sid: sid.clone() },
+        }
+    }
+
+    fn remap_heap_base(base: &HeapBase, remap: &HashMap<TypeId, TypeId>) -> HeapBase {
+        match base {
+            HeapBase::BuiltinStr => HeapBase::BuiltinStr,
+            HeapBase::BuiltinArray { elem } => HeapBase::BuiltinArray {
+                elem: Self::remap_type_id(*elem, remap),
+            },
+            HeapBase::BuiltinMap { key, val } => HeapBase::BuiltinMap {
+                key: Self::remap_type_id(*key, remap),
+                val: Self::remap_type_id(*val, remap),
+            },
+            HeapBase::BuiltinStrBuilder => HeapBase::BuiltinStrBuilder,
+            HeapBase::BuiltinMutex { inner } => HeapBase::BuiltinMutex {
+                inner: Self::remap_type_id(*inner, remap),
+            },
+            HeapBase::BuiltinRwLock { inner } => HeapBase::BuiltinRwLock {
+                inner: Self::remap_type_id(*inner, remap),
+            },
+            HeapBase::BuiltinCell { inner } => HeapBase::BuiltinCell {
+                inner: Self::remap_type_id(*inner, remap),
+            },
+            HeapBase::BuiltinFuture { result } => HeapBase::BuiltinFuture {
+                result: Self::remap_type_id(*result, remap),
+            },
+            HeapBase::BuiltinChannelSend { elem } => HeapBase::BuiltinChannelSend {
+                elem: Self::remap_type_id(*elem, remap),
+            },
+            HeapBase::BuiltinChannelRecv { elem } => HeapBase::BuiltinChannelRecv {
+                elem: Self::remap_type_id(*elem, remap),
+            },
+            HeapBase::Callable { sig_sid } => HeapBase::Callable {
+                sig_sid: sig_sid.clone(),
+            },
+            HeapBase::UserType { type_sid, targs } => HeapBase::UserType {
+                type_sid: type_sid.clone(),
+                targs: targs
+                    .iter()
+                    .map(|ty| Self::remap_type_id(*ty, remap))
+                    .collect(),
+            },
+        }
+    }
+}
+
+fn align_to(value: u64, align: u64) -> u64 {
+    if align <= 1 {
+        value
+    } else {
+        let rem = value % align;
+        if rem == 0 {
+            value
+        } else {
+            value + (align - rem)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_for_primitives() {
+        let ctx = TypeCtx::new();
+        assert_eq!(
+            ctx.compute_layout(fixed_type_ids::BOOL),
+            TypeLayout {
+                size: 1,
+                align: 1,
+                fields: Vec::new()
+            }
+        );
+        assert_eq!(
+            ctx.compute_layout(fixed_type_ids::I32),
+            TypeLayout {
+                size: 4,
+                align: 4,
+                fields: Vec::new()
+            }
+        );
+        assert_eq!(
+            ctx.compute_layout(fixed_type_ids::F64),
+            TypeLayout {
+                size: 8,
+                align: 8,
+                fields: Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn layout_for_simple_value_struct() {
+        let mut ctx = TypeCtx::new();
+        let sid = Sid("T:VALUE00001".to_string());
+        let ty = ctx.intern(TypeKind::ValueStruct { sid: sid.clone() });
+        ctx.register_value_struct_fields(
+            sid,
+            vec![
+                ("age".to_string(), fixed_type_ids::I32),
+                ("score".to_string(), fixed_type_ids::I64),
+            ],
+        );
+
+        let layout = ctx.compute_layout(ty);
+        assert_eq!(layout.size, 16);
+        assert_eq!(layout.align, 8);
+        assert_eq!(
+            layout.fields,
+            vec![("age".to_string(), 0), ("score".to_string(), 8)]
+        );
+    }
+
+    #[test]
+    fn finalize_type_ids_sorts_by_fqn() {
+        let mut ctx = TypeCtx::new();
+        let sid_z = Sid("T:ZZZZZZZZZZ".to_string());
+        let sid_a = Sid("T:AAAAAAAAAA".to_string());
+        let _z = ctx.intern(TypeKind::ValueStruct { sid: sid_z.clone() });
+        let _a = ctx.intern(TypeKind::ValueStruct { sid: sid_a.clone() });
+        ctx.register_type_fqn(sid_z.clone(), "pkg.zmod.TZed");
+        ctx.register_type_fqn(sid_a.clone(), "pkg.amod.TAlpha");
+
+        ctx.finalize_type_ids();
+
+        let id_alpha = ctx
+            .types
+            .iter()
+            .find_map(|(id, kind)| {
+                if matches!(kind, TypeKind::ValueStruct { sid } if sid == &sid_a) {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .expect("alpha type must exist");
+        let id_zed = ctx
+            .types
+            .iter()
+            .find_map(|(id, kind)| {
+                if matches!(kind, TypeKind::ValueStruct { sid } if sid == &sid_z) {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .expect("zed type must exist");
+
+        assert_eq!(id_alpha, TypeId(1000));
+        assert_eq!(id_zed, TypeId(1001));
+    }
+
+    #[test]
+    fn canonical_type_str_common_types() {
+        let mut ctx = TypeCtx::new();
+        let i32_ty = fixed_type_ids::I32;
+        let str_ty = fixed_type_ids::STR;
+
+        let shared_str = ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Shared,
+            base: HeapBase::BuiltinStr,
+        });
+        let borrow_map = ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Borrow,
+            base: HeapBase::BuiltinMap {
+                key: i32_ty,
+                val: str_ty,
+            },
+        });
+        let opt_shared = ctx.intern(TypeKind::BuiltinOption { inner: shared_str });
+        let result_ty = ctx.intern(TypeKind::BuiltinResult {
+            ok: i32_ty,
+            err: borrow_map,
+        });
+        let raw_i32 = ctx.intern(TypeKind::RawPtr { to: i32_ty });
+        let callable = ctx.intern(TypeKind::HeapHandle {
+            hk: HandleKind::Unique,
+            base: HeapBase::Callable {
+                sig_sid: Sid("E:CALLABLE01".to_string()),
+            },
+        });
+        let user_sid = Sid("T:USERTYPE01".to_string());
+        let user_type = ctx.intern(TypeKind::ValueStruct {
+            sid: user_sid.clone(),
+        });
+        ctx.register_type_fqn(user_sid, "pkg.mod.TNode");
+
+        assert_eq!(ctx.type_str(i32_ty), "i32");
+        assert_eq!(ctx.type_str(str_ty), "Str");
+        assert_eq!(ctx.type_str(shared_str), "shared Str");
+        assert_eq!(ctx.type_str(borrow_map), "borrow Map<i32,Str>");
+        assert_eq!(ctx.type_str(opt_shared), "TOption<shared Str>");
+        assert_eq!(
+            ctx.type_str(result_ty),
+            "TResult<i32,borrow Map<i32,Str>>"
+        );
+        assert_eq!(ctx.type_str(raw_i32), "rawptr<i32>");
+        assert_eq!(ctx.type_str(callable), "TCallable<E:CALLABLE01>");
+        assert_eq!(ctx.type_str(user_type), "pkg.mod.TNode");
+
+        assert!(!ctx.type_str(result_ty).contains(", "));
+        assert!(ctx.type_str(shared_str).starts_with("shared "));
+        assert!(ctx.type_str(borrow_map).starts_with("borrow "));
     }
 }

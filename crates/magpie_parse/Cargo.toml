@@ -7,3 +7,7 @@ edition.workspace = true
 magpie_ast = { path = "../magpie_ast" }
 magpie_lex = { path = "../magpie_lex" }
 magpie_diag = { path = "../magpie_diag" }
+
+[dev-dependencies]
+insta = { workspace = true }
+magpie_csnf = { path = "../magpie_csnf" }

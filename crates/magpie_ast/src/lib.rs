@@ -20,7 +20,11 @@ impl Span {
     }
 
     pub fn dummy() -> Self {
-        Self { file: FileId(0), start: 0, end: 0 }
+        Self {
+            file: FileId(0),
+            start: 0,
+            end: 0,
+        }
     }
 }
 
@@ -61,7 +65,12 @@ impl SourceMap {
         let line_starts = std::iter::once(0)
             .chain(source.match_indices('\n').map(|(i, _)| (i + 1) as u32))
             .collect();
-        self.files.push(SourceFile { id, path, source, line_starts });
+        self.files.push(SourceFile {
+            id,
+            path,
+            source,
+            line_starts,
+        });
         id
     }
 
@@ -76,7 +85,12 @@ impl SourceMap {
     pub fn lookup_line_col(&self, span: Span) -> Option<(usize, usize)> {
         let file = self.get_file(span.file)?;
         let line = file.line_starts.partition_point(|&s| s <= span.start);
-        let col = span.start - file.line_starts.get(line.saturating_sub(1)).copied().unwrap_or(0);
+        let col = span.start
+            - file
+                .line_starts
+                .get(line.saturating_sub(1))
+                .copied()
+                .unwrap_or(0);
         Some((line, col as usize))
     }
 }
@@ -111,7 +125,7 @@ impl ModulePath {
 #[derive(Clone, Debug)]
 pub enum ExportItem {
     Fn(String),   // @name
-    Type(String),  // TName
+    Type(String), // TName
 }
 
 #[derive(Clone, Debug)]
@@ -193,8 +207,16 @@ pub enum AstInstr {
 pub enum AstTerminator {
     Ret(Option<AstValueRef>),
     Br(u32),
-    Cbr { cond: AstValueRef, then_bb: u32, else_bb: u32 },
-    Switch { val: AstValueRef, arms: Vec<(AstConstLit, u32)>, default: u32 },
+    Cbr {
+        cond: AstValueRef,
+        then_bb: u32,
+        else_bb: u32,
+    },
+    Switch {
+        val: AstValueRef,
+        arms: Vec<(AstConstLit, u32)>,
+        default: u32,
+    },
     Unreachable,
 }
 
@@ -223,95 +245,341 @@ pub enum AstConstLit {
 #[derive(Clone, Debug)]
 pub enum AstOp {
     Const(AstConstExpr),
-    BinOp { kind: BinOpKind, lhs: AstValueRef, rhs: AstValueRef },
-    Cmp { kind: CmpKind, pred: String, lhs: AstValueRef, rhs: AstValueRef },
-    Call { callee: String, targs: Vec<AstType>, args: Vec<(String, AstArgValue)> },
-    CallIndirect { callee: AstValueRef, args: Vec<(String, AstArgValue)> },
-    Try { callee: String, targs: Vec<AstType>, args: Vec<(String, AstArgValue)> },
-    SuspendCall { callee: String, targs: Vec<AstType>, args: Vec<(String, AstArgValue)> },
-    SuspendAwait { fut: AstValueRef },
-    New { ty: AstType, fields: Vec<(String, AstValueRef)> },
-    GetField { obj: AstValueRef, field: String },
-    Phi { ty: AstType, incomings: Vec<(u32, AstValueRef)> },
-    EnumNew { variant: String, args: Vec<(String, AstValueRef)> },
-    EnumTag { v: AstValueRef },
-    EnumPayload { variant: String, v: AstValueRef },
-    EnumIs { variant: String, v: AstValueRef },
-    Share { v: AstValueRef },
-    CloneShared { v: AstValueRef },
-    CloneWeak { v: AstValueRef },
-    WeakDowngrade { v: AstValueRef },
-    WeakUpgrade { v: AstValueRef },
-    Cast { from: AstType, to: AstType, v: AstValueRef },
-    BorrowShared { v: AstValueRef },
-    BorrowMut { v: AstValueRef },
-    PtrNull { ty: AstType },
-    PtrAddr { ty: AstType, p: AstValueRef },
-    PtrFromAddr { ty: AstType, addr: AstValueRef },
-    PtrAdd { ty: AstType, p: AstValueRef, count: AstValueRef },
-    PtrLoad { ty: AstType, p: AstValueRef },
-    CallableCapture { fn_ref: String, captures: Vec<(String, AstValueRef)> },
-    ArrNew { elem_ty: AstType, cap: AstValueRef },
-    ArrLen { arr: AstValueRef },
-    ArrGet { arr: AstValueRef, idx: AstValueRef },
-    ArrPop { arr: AstValueRef },
-    ArrSlice { arr: AstValueRef, start: AstValueRef, end: AstValueRef },
-    ArrContains { arr: AstValueRef, val: AstValueRef },
-    ArrMap { arr: AstValueRef, func: AstValueRef },
-    ArrFilter { arr: AstValueRef, func: AstValueRef },
-    ArrReduce { arr: AstValueRef, init: AstValueRef, func: AstValueRef },
-    MapNew { key_ty: AstType, val_ty: AstType },
-    MapLen { map: AstValueRef },
-    MapGet { map: AstValueRef, key: AstValueRef },
-    MapGetRef { map: AstValueRef, key: AstValueRef },
-    MapDelete { map: AstValueRef, key: AstValueRef },
-    MapContainsKey { map: AstValueRef, key: AstValueRef },
-    MapKeys { map: AstValueRef },
-    MapValues { map: AstValueRef },
-    StrConcat { a: AstValueRef, b: AstValueRef },
-    StrLen { s: AstValueRef },
-    StrEq { a: AstValueRef, b: AstValueRef },
-    StrSlice { s: AstValueRef, start: AstValueRef, end: AstValueRef },
-    StrBytes { s: AstValueRef },
+    BinOp {
+        kind: BinOpKind,
+        lhs: AstValueRef,
+        rhs: AstValueRef,
+    },
+    Cmp {
+        kind: CmpKind,
+        pred: String,
+        lhs: AstValueRef,
+        rhs: AstValueRef,
+    },
+    Call {
+        callee: String,
+        targs: Vec<AstType>,
+        args: Vec<(String, AstArgValue)>,
+    },
+    CallIndirect {
+        callee: AstValueRef,
+        args: Vec<(String, AstArgValue)>,
+    },
+    Try {
+        callee: String,
+        targs: Vec<AstType>,
+        args: Vec<(String, AstArgValue)>,
+    },
+    SuspendCall {
+        callee: String,
+        targs: Vec<AstType>,
+        args: Vec<(String, AstArgValue)>,
+    },
+    SuspendAwait {
+        fut: AstValueRef,
+    },
+    New {
+        ty: AstType,
+        fields: Vec<(String, AstValueRef)>,
+    },
+    GetField {
+        obj: AstValueRef,
+        field: String,
+    },
+    Phi {
+        ty: AstType,
+        incomings: Vec<(u32, AstValueRef)>,
+    },
+    EnumNew {
+        variant: String,
+        args: Vec<(String, AstValueRef)>,
+    },
+    EnumTag {
+        v: AstValueRef,
+    },
+    EnumPayload {
+        variant: String,
+        v: AstValueRef,
+    },
+    EnumIs {
+        variant: String,
+        v: AstValueRef,
+    },
+    Share {
+        v: AstValueRef,
+    },
+    CloneShared {
+        v: AstValueRef,
+    },
+    CloneWeak {
+        v: AstValueRef,
+    },
+    WeakDowngrade {
+        v: AstValueRef,
+    },
+    WeakUpgrade {
+        v: AstValueRef,
+    },
+    Cast {
+        from: AstType,
+        to: AstType,
+        v: AstValueRef,
+    },
+    BorrowShared {
+        v: AstValueRef,
+    },
+    BorrowMut {
+        v: AstValueRef,
+    },
+    PtrNull {
+        ty: AstType,
+    },
+    PtrAddr {
+        ty: AstType,
+        p: AstValueRef,
+    },
+    PtrFromAddr {
+        ty: AstType,
+        addr: AstValueRef,
+    },
+    PtrAdd {
+        ty: AstType,
+        p: AstValueRef,
+        count: AstValueRef,
+    },
+    PtrLoad {
+        ty: AstType,
+        p: AstValueRef,
+    },
+    CallableCapture {
+        fn_ref: String,
+        captures: Vec<(String, AstValueRef)>,
+    },
+    ArrNew {
+        elem_ty: AstType,
+        cap: AstValueRef,
+    },
+    ArrLen {
+        arr: AstValueRef,
+    },
+    ArrGet {
+        arr: AstValueRef,
+        idx: AstValueRef,
+    },
+    ArrPop {
+        arr: AstValueRef,
+    },
+    ArrSlice {
+        arr: AstValueRef,
+        start: AstValueRef,
+        end: AstValueRef,
+    },
+    ArrContains {
+        arr: AstValueRef,
+        val: AstValueRef,
+    },
+    ArrMap {
+        arr: AstValueRef,
+        func: AstValueRef,
+    },
+    ArrFilter {
+        arr: AstValueRef,
+        func: AstValueRef,
+    },
+    ArrReduce {
+        arr: AstValueRef,
+        init: AstValueRef,
+        func: AstValueRef,
+    },
+    MapNew {
+        key_ty: AstType,
+        val_ty: AstType,
+    },
+    MapLen {
+        map: AstValueRef,
+    },
+    MapGet {
+        map: AstValueRef,
+        key: AstValueRef,
+    },
+    MapGetRef {
+        map: AstValueRef,
+        key: AstValueRef,
+    },
+    MapDelete {
+        map: AstValueRef,
+        key: AstValueRef,
+    },
+    MapContainsKey {
+        map: AstValueRef,
+        key: AstValueRef,
+    },
+    MapKeys {
+        map: AstValueRef,
+    },
+    MapValues {
+        map: AstValueRef,
+    },
+    StrConcat {
+        a: AstValueRef,
+        b: AstValueRef,
+    },
+    StrLen {
+        s: AstValueRef,
+    },
+    StrEq {
+        a: AstValueRef,
+        b: AstValueRef,
+    },
+    StrSlice {
+        s: AstValueRef,
+        start: AstValueRef,
+        end: AstValueRef,
+    },
+    StrBytes {
+        s: AstValueRef,
+    },
     StrBuilderNew,
-    StrBuilderBuild { b: AstValueRef },
-    StrParseI64 { s: AstValueRef },
-    StrParseU64 { s: AstValueRef },
-    StrParseF64 { s: AstValueRef },
-    StrParseBool { s: AstValueRef },
-    JsonEncode { ty: AstType, v: AstValueRef },
-    JsonDecode { ty: AstType, s: AstValueRef },
-    GpuThreadId { dim: AstValueRef },
-    GpuWorkgroupId { dim: AstValueRef },
-    GpuWorkgroupSize { dim: AstValueRef },
-    GpuGlobalId { dim: AstValueRef },
-    GpuBufferLoad { ty: AstType, buf: AstValueRef, idx: AstValueRef },
-    GpuBufferLen { ty: AstType, buf: AstValueRef },
-    GpuShared { count: i64, ty: AstType },
-    GpuLaunch { device: AstValueRef, kernel: String, grid: AstArgValue, block: AstArgValue, args: AstArgValue },
-    GpuLaunchAsync { device: AstValueRef, kernel: String, grid: AstArgValue, block: AstArgValue, args: AstArgValue },
+    StrBuilderBuild {
+        b: AstValueRef,
+    },
+    StrParseI64 {
+        s: AstValueRef,
+    },
+    StrParseU64 {
+        s: AstValueRef,
+    },
+    StrParseF64 {
+        s: AstValueRef,
+    },
+    StrParseBool {
+        s: AstValueRef,
+    },
+    JsonEncode {
+        ty: AstType,
+        v: AstValueRef,
+    },
+    JsonDecode {
+        ty: AstType,
+        s: AstValueRef,
+    },
+    GpuThreadId {
+        dim: AstValueRef,
+    },
+    GpuWorkgroupId {
+        dim: AstValueRef,
+    },
+    GpuWorkgroupSize {
+        dim: AstValueRef,
+    },
+    GpuGlobalId {
+        dim: AstValueRef,
+    },
+    GpuBufferLoad {
+        ty: AstType,
+        buf: AstValueRef,
+        idx: AstValueRef,
+    },
+    GpuBufferLen {
+        ty: AstType,
+        buf: AstValueRef,
+    },
+    GpuShared {
+        count: i64,
+        ty: AstType,
+    },
+    GpuLaunch {
+        device: AstValueRef,
+        kernel: String,
+        grid: AstArgValue,
+        block: AstArgValue,
+        args: AstArgValue,
+    },
+    GpuLaunchAsync {
+        device: AstValueRef,
+        kernel: String,
+        grid: AstArgValue,
+        block: AstArgValue,
+        args: AstArgValue,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub enum AstOpVoid {
-    CallVoid { callee: String, targs: Vec<AstType>, args: Vec<(String, AstArgValue)> },
-    CallVoidIndirect { callee: AstValueRef, args: Vec<(String, AstArgValue)> },
-    SetField { obj: AstValueRef, field: String, val: AstValueRef },
-    Panic { msg: AstValueRef },
-    PtrStore { ty: AstType, p: AstValueRef, v: AstValueRef },
-    ArrSet { arr: AstValueRef, idx: AstValueRef, val: AstValueRef },
-    ArrPush { arr: AstValueRef, val: AstValueRef },
-    ArrSort { arr: AstValueRef },
-    ArrForeach { arr: AstValueRef, func: AstValueRef },
-    MapSet { map: AstValueRef, key: AstValueRef, val: AstValueRef },
-    MapDeleteVoid { map: AstValueRef, key: AstValueRef },
-    StrBuilderAppendStr { b: AstValueRef, s: AstValueRef },
-    StrBuilderAppendI64 { b: AstValueRef, v: AstValueRef },
-    StrBuilderAppendI32 { b: AstValueRef, v: AstValueRef },
-    StrBuilderAppendF64 { b: AstValueRef, v: AstValueRef },
-    StrBuilderAppendBool { b: AstValueRef, v: AstValueRef },
+    CallVoid {
+        callee: String,
+        targs: Vec<AstType>,
+        args: Vec<(String, AstArgValue)>,
+    },
+    CallVoidIndirect {
+        callee: AstValueRef,
+        args: Vec<(String, AstArgValue)>,
+    },
+    SetField {
+        obj: AstValueRef,
+        field: String,
+        val: AstValueRef,
+    },
+    Panic {
+        msg: AstValueRef,
+    },
+    PtrStore {
+        ty: AstType,
+        p: AstValueRef,
+        v: AstValueRef,
+    },
+    ArrSet {
+        arr: AstValueRef,
+        idx: AstValueRef,
+        val: AstValueRef,
+    },
+    ArrPush {
+        arr: AstValueRef,
+        val: AstValueRef,
+    },
+    ArrSort {
+        arr: AstValueRef,
+    },
+    ArrForeach {
+        arr: AstValueRef,
+        func: AstValueRef,
+    },
+    MapSet {
+        map: AstValueRef,
+        key: AstValueRef,
+        val: AstValueRef,
+    },
+    MapDeleteVoid {
+        map: AstValueRef,
+        key: AstValueRef,
+    },
+    StrBuilderAppendStr {
+        b: AstValueRef,
+        s: AstValueRef,
+    },
+    StrBuilderAppendI64 {
+        b: AstValueRef,
+        v: AstValueRef,
+    },
+    StrBuilderAppendI32 {
+        b: AstValueRef,
+        v: AstValueRef,
+    },
+    StrBuilderAppendF64 {
+        b: AstValueRef,
+        v: AstValueRef,
+    },
+    StrBuilderAppendBool {
+        b: AstValueRef,
+        v: AstValueRef,
+    },
     GpuBarrier,
-    GpuBufferStore { ty: AstType, buf: AstValueRef, idx: AstValueRef, v: AstValueRef },
+    GpuBufferStore {
+        ty: AstType,
+        buf: AstValueRef,
+        idx: AstValueRef,
+        v: AstValueRef,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -329,12 +597,34 @@ pub enum AstArgListElem {
 
 #[derive(Clone, Debug)]
 pub enum BinOpKind {
-    IAdd, ISub, IMul, ISDiv, IUDiv, ISRem, IURem,
-    IAddWrap, ISubWrap, IMulWrap,
-    IAddChecked, ISubChecked, IMulChecked,
-    IAnd, IOr, IXor, IShl, ILshr, IAshr,
-    FAdd, FSub, FMul, FDiv, FRem,
-    FAddFast, FSubFast, FMulFast, FDivFast,
+    IAdd,
+    ISub,
+    IMul,
+    ISDiv,
+    IUDiv,
+    ISRem,
+    IURem,
+    IAddWrap,
+    ISubWrap,
+    IMulWrap,
+    IAddChecked,
+    ISubChecked,
+    IMulChecked,
+    IAnd,
+    IOr,
+    IXor,
+    IShl,
+    ILshr,
+    IAshr,
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
+    FRem,
+    FAddFast,
+    FSubFast,
+    FMulFast,
+    FDivFast,
 }
 
 #[derive(Clone, Debug)]
@@ -362,9 +652,15 @@ pub enum OwnershipMod {
 #[derive(Clone, Debug)]
 pub enum AstBaseType {
     Prim(String),
-    Named { path: Option<ModulePath>, name: String, targs: Vec<AstType> },
+    Named {
+        path: Option<ModulePath>,
+        name: String,
+        targs: Vec<AstType>,
+    },
     Builtin(AstBuiltinType),
-    Callable { sig_ref: String },
+    Callable {
+        sig_ref: String,
+    },
     RawPtr(Box<AstType>),
 }
 
@@ -456,4 +752,88 @@ pub struct AstSigDecl {
     pub name: String,
     pub param_types: Vec<AstType>,
     pub ret_ty: AstType,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prim_i32() -> AstType {
+        AstType {
+            ownership: None,
+            base: AstBaseType::Prim("i32".to_string()),
+        }
+    }
+
+    #[test]
+    fn constructs_ast_file_with_function_decl() {
+        let span = Span::new(FileId(7), 10, 20);
+        let module = ModulePath {
+            segments: vec!["core".to_string(), "math".to_string()],
+        };
+
+        let fn_decl = AstFnDecl {
+            name: "add".to_string(),
+            params: vec![AstParam {
+                name: "lhs".to_string(),
+                ty: Spanned::new(prim_i32(), span),
+            }],
+            ret_ty: Spanned::new(prim_i32(), span),
+            meta: None,
+            blocks: vec![Spanned::new(
+                AstBlock {
+                    label: 0,
+                    instrs: Vec::new(),
+                    terminator: Spanned::new(AstTerminator::Ret(None), span),
+                },
+                span,
+            )],
+            doc: Some("Adds two integers".to_string()),
+        };
+
+        let ast = AstFile {
+            header: Spanned::new(
+                AstHeader {
+                    module_path: Spanned::new(module, span),
+                    exports: vec![Spanned::new(ExportItem::Fn("add".to_string()), span)],
+                    imports: Vec::new(),
+                    digest: Spanned::new(String::new(), span),
+                },
+                span,
+            ),
+            decls: vec![Spanned::new(AstDecl::Fn(fn_decl), span)],
+        };
+
+        assert_eq!(ast.header.node.module_path.node.to_string(), "core.math");
+        assert_eq!(ast.decls.len(), 1);
+
+        match &ast.decls[0].node {
+            AstDecl::Fn(func) => {
+                assert_eq!(func.name, "add");
+                assert_eq!(func.params.len(), 1);
+                assert_eq!(func.blocks.len(), 1);
+                assert!(matches!(func.blocks[0].node.terminator.node, AstTerminator::Ret(None)));
+            }
+            other => panic!("expected fn declaration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_map_lookup_line_col_uses_file_offsets() {
+        let mut source_map = SourceMap::new();
+        let file_id = source_map.add_file("demo.mp".to_string(), "alpha\nbeta\ngamma".to_string());
+        let span = Span::new(file_id, 7, 8);
+
+        let (line, col) = source_map
+            .lookup_line_col(span)
+            .expect("span should resolve to line/column");
+
+        assert_eq!(line, 2);
+        assert_eq!(col, 1);
+        assert_eq!(
+            source_map.get_source(file_id),
+            Some("alpha\nbeta\ngamma"),
+            "source text should round-trip via source map",
+        );
+    }
 }

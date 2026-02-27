@@ -40,7 +40,8 @@ impl<'a> LlvmTextCodegen<'a> {
         let module_init = mangle_init_types(&self.mpir.sid);
         let main_fn = self.mpir.functions.iter().find(|f| f.name == "main");
 
-        writeln!(out, "; ModuleID = '{}'", llvm_quote(&self.mpir.path)).map_err(|e| e.to_string())?;
+        writeln!(out, "; ModuleID = '{}'", llvm_quote(&self.mpir.path))
+            .map_err(|e| e.to_string())?;
         writeln!(out, "source_filename = \"{}\"", llvm_quote(&self.mpir.path))
             .map_err(|e| e.to_string())?;
         writeln!(out).map_err(|e| e.to_string())?;
@@ -98,6 +99,7 @@ impl<'a> LlvmTextCodegen<'a> {
             "declare ptr @mp_rt_arr_map(ptr, ptr, i32, i64)",
             "declare ptr @mp_rt_arr_filter(ptr, ptr)",
             "declare void @mp_rt_arr_reduce(ptr, ptr, i64, ptr)",
+            "declare ptr @mp_rt_callable_new(ptr, ptr)",
             "declare ptr @mp_rt_map_new(i32, i32, i64, i64, i64, ptr, ptr)",
             "declare i64 @mp_rt_map_len(ptr)",
             "declare ptr @mp_rt_map_get(ptr, ptr, i64)",
@@ -112,6 +114,12 @@ impl<'a> LlvmTextCodegen<'a> {
             "declare i32 @mp_rt_str_eq(ptr, ptr)",
             "declare ptr @mp_rt_str_slice(ptr, i64, i64)",
             "declare ptr @mp_rt_str_bytes(ptr, ptr)",
+            "declare ptr @mp_rt_json_encode(ptr, i32)",
+            "declare ptr @mp_rt_json_decode(ptr, i32)",
+            "declare i64 @mp_rt_str_parse_i64(ptr)",
+            "declare i64 @mp_rt_str_parse_u64(ptr)",
+            "declare double @mp_rt_str_parse_f64(ptr)",
+            "declare i32 @mp_rt_str_parse_bool(ptr)",
             "declare ptr @mp_rt_strbuilder_new()",
             "declare void @mp_rt_strbuilder_append_str(ptr, ptr)",
             "declare void @mp_rt_strbuilder_append_i64(ptr, i64)",
@@ -119,6 +127,8 @@ impl<'a> LlvmTextCodegen<'a> {
             "declare void @mp_rt_strbuilder_append_f64(ptr, double)",
             "declare void @mp_rt_strbuilder_append_bool(ptr, i32)",
             "declare ptr @mp_rt_strbuilder_build(ptr)",
+            "declare i32 @mp_rt_future_poll(ptr)",
+            "declare void @mp_rt_future_take(ptr, ptr)",
             "declare { i8, i1 } @llvm.sadd.with.overflow.i8(i8, i8)",
             "declare { i8, i1 } @llvm.ssub.with.overflow.i8(i8, i8)",
             "declare { i8, i1 } @llvm.smul.with.overflow.i8(i8, i8)",
@@ -243,7 +253,9 @@ impl<'a> LlvmTextCodegen<'a> {
             },
             Some(TypeKind::HeapHandle { .. }) | Some(TypeKind::RawPtr { .. }) => 8,
             Some(TypeKind::BuiltinOption { inner }) => self.size_of_ty(*inner).max(1) + 1,
-            Some(TypeKind::BuiltinResult { ok, err }) => 1 + self.size_of_ty(*ok) + self.size_of_ty(*err),
+            Some(TypeKind::BuiltinResult { ok, err }) => {
+                1 + self.size_of_ty(*ok) + self.size_of_ty(*err)
+            }
             Some(TypeKind::Arr { n, elem }) => (*n as u64).saturating_mul(self.size_of_ty(*elem)),
             Some(TypeKind::Vec { n, elem }) => (*n as u64).saturating_mul(self.size_of_ty(*elem)),
             Some(TypeKind::Tuple { elems }) => elems.iter().map(|e| self.size_of_ty(*e)).sum(),
@@ -306,8 +318,14 @@ impl<'a> FnBuilder<'a> {
             .collect::<Vec<_>>()
             .join(", ");
         let mut out = String::new();
-        writeln!(out, "define {} @{}({}) {{", ret_ty, mangle_fn(&f.sid), params)
-            .map_err(|e| e.to_string())?;
+        writeln!(
+            out,
+            "define {} @{}({}) {{",
+            ret_ty,
+            mangle_fn(&f.sid),
+            params
+        )
+        .map_err(|e| e.to_string())?;
 
         let mut locals = HashMap::new();
         for (id, ty) in &f.params {
@@ -389,12 +407,15 @@ impl<'a> FnBuilder<'a> {
                 let op = self.value(v)?;
                 self.assign_or_copy(i.dst, i.ty, op)?;
             }
-            MpirOp::IAdd { lhs, rhs }
-            | MpirOp::IAddWrap { lhs, rhs } => self.emit_bin(i.dst, i.ty, "add", lhs, rhs)?,
-            MpirOp::ISub { lhs, rhs }
-            | MpirOp::ISubWrap { lhs, rhs } => self.emit_bin(i.dst, i.ty, "sub", lhs, rhs)?,
-            MpirOp::IMul { lhs, rhs }
-            | MpirOp::IMulWrap { lhs, rhs } => self.emit_bin(i.dst, i.ty, "mul", lhs, rhs)?,
+            MpirOp::IAdd { lhs, rhs } | MpirOp::IAddWrap { lhs, rhs } => {
+                self.emit_bin(i.dst, i.ty, "add", lhs, rhs)?
+            }
+            MpirOp::ISub { lhs, rhs } | MpirOp::ISubWrap { lhs, rhs } => {
+                self.emit_bin(i.dst, i.ty, "sub", lhs, rhs)?
+            }
+            MpirOp::IMul { lhs, rhs } | MpirOp::IMulWrap { lhs, rhs } => {
+                self.emit_bin(i.dst, i.ty, "mul", lhs, rhs)?
+            }
             MpirOp::ISDiv { lhs, rhs } => self.emit_bin(i.dst, i.ty, "sdiv", lhs, rhs)?,
             MpirOp::IUDiv { lhs, rhs } => self.emit_bin(i.dst, i.ty, "udiv", lhs, rhs)?,
             MpirOp::ISRem { lhs, rhs } => self.emit_bin(i.dst, i.ty, "srem", lhs, rhs)?,
@@ -462,8 +483,12 @@ impl<'a> FnBuilder<'a> {
             }
             MpirOp::PtrAddr { p } => {
                 let p = self.value(p)?;
-                writeln!(self.out, "  {dst} = ptrtoint {} {} to {}", p.ty, p.repr, dst_ty)
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  {dst} = ptrtoint {} {} to {}",
+                    p.ty, p.repr, dst_ty
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
             }
             MpirOp::PtrFromAddr { .. } => {
@@ -471,8 +496,12 @@ impl<'a> FnBuilder<'a> {
                     MpirOp::PtrFromAddr { addr, .. } => self.value(addr)?,
                     _ => unreachable!(),
                 };
-                writeln!(self.out, "  {dst} = inttoptr {} {} to {}", addr.ty, addr.repr, dst_ty)
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  {dst} = inttoptr {} {} to {}",
+                    addr.ty, addr.repr, dst_ty
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
             }
             MpirOp::PtrAdd { p, count } => {
@@ -485,14 +514,21 @@ impl<'a> FnBuilder<'a> {
             MpirOp::PtrLoad { to, p } => {
                 let p = self.ensure_ptr_value(p)?;
                 let load_ty = self.cg.llvm_ty(*to);
-                writeln!(self.out, "  {dst} = load {load_ty}, ptr {p}").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  {dst} = load {load_ty}, ptr {p}")
+                    .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
             }
             MpirOp::PtrStore { to, p, v } => {
                 let p = self.ensure_ptr_value(p)?;
                 let v = self.value(v)?;
-                writeln!(self.out, "  store {} {}, ptr {}", self.cg.llvm_ty(*to), v.repr, p)
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  store {} {}, ptr {}",
+                    self.cg.llvm_ty(*to),
+                    v.repr,
+                    p
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_default(i.dst, i.ty)?;
             }
             MpirOp::Call {
@@ -501,10 +537,63 @@ impl<'a> FnBuilder<'a> {
                 let args = self.call_args(args)?;
                 let name = mangle_fn(callee_sid);
                 if dst_ty == "void" {
-                    writeln!(self.out, "  call void @{}({})", name, args).map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  call void @{}({})", name, args)
+                        .map_err(|e| e.to_string())?;
                     self.set_default(i.dst, i.ty)?;
                 } else {
                     writeln!(self.out, "  {dst} = call {dst_ty} @{}({})", name, args)
+                        .map_err(|e| e.to_string())?;
+                    self.set_local(i.dst, i.ty, dst_ty, dst);
+                }
+            }
+            MpirOp::SuspendCall {
+                callee_sid, args, ..
+            } => {
+                // v0.1: async lowering should run before codegen; emit as a regular call.
+                let args = self.call_args(args)?;
+                let name = mangle_fn(callee_sid);
+                if dst_ty == "void" {
+                    writeln!(self.out, "  call void @{}({})", name, args)
+                        .map_err(|e| e.to_string())?;
+                    self.set_default(i.dst, i.ty)?;
+                } else {
+                    writeln!(self.out, "  {dst} = call {dst_ty} @{}({})", name, args)
+                        .map_err(|e| e.to_string())?;
+                    self.set_local(i.dst, i.ty, dst_ty, dst);
+                }
+            }
+            MpirOp::SuspendAwait { fut } => {
+                // v0.1: poll in a busy loop until Ready, then take the value.
+                let fut = self.ensure_ptr_value(fut)?;
+                let poll_label = self.label("await_poll");
+                let ready_label = self.label("await_ready");
+                let poll_state = self.tmp();
+                let is_ready = self.tmp();
+                writeln!(self.out, "  br label %{poll_label}").map_err(|e| e.to_string())?;
+                writeln!(self.out, "{poll_label}:").map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  {poll_state} = call i32 @mp_rt_future_poll(ptr {fut})"
+                )
+                .map_err(|e| e.to_string())?;
+                writeln!(self.out, "  {is_ready} = icmp ne i32 {poll_state}, 0")
+                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  br i1 {is_ready}, label %{ready_label}, label %{poll_label}"
+                )
+                .map_err(|e| e.to_string())?;
+                writeln!(self.out, "{ready_label}:").map_err(|e| e.to_string())?;
+                if dst_ty == "void" {
+                    writeln!(self.out, "  call void @mp_rt_future_take(ptr {fut}, ptr null)")
+                        .map_err(|e| e.to_string())?;
+                    self.set_default(i.dst, i.ty)?;
+                } else {
+                    let slot = self.tmp();
+                    writeln!(self.out, "  {slot} = alloca {dst_ty}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  call void @mp_rt_future_take(ptr {fut}, ptr {slot})")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  {dst} = load {dst_ty}, ptr {slot}")
                         .map_err(|e| e.to_string())?;
                     self.set_local(i.dst, i.ty, dst_ty, dst);
                 }
@@ -533,12 +622,14 @@ impl<'a> FnBuilder<'a> {
             }
             MpirOp::ArcRetainWeak { v } => {
                 let p = self.ensure_ptr_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_retain_weak(ptr {p})").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  call void @mp_rt_retain_weak(ptr {p})")
+                    .map_err(|e| e.to_string())?;
                 self.assign_or_copy_value(i.dst, i.ty, v)?;
             }
             MpirOp::ArcReleaseWeak { v } => {
                 let p = self.ensure_ptr_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_release_weak(ptr {p})").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  call void @mp_rt_release_weak(ptr {p})")
+                    .map_err(|e| e.to_string())?;
                 self.set_default(i.dst, i.ty)?;
             }
             MpirOp::ArrNew { elem_ty, cap } => {
@@ -563,9 +654,13 @@ impl<'a> FnBuilder<'a> {
                 let arr = self.ensure_ptr_value(arr)?;
                 let idx = self.cast_i64_value(idx)?;
                 let p = self.tmp();
-                writeln!(self.out, "  {p} = call ptr @mp_rt_arr_get(ptr {arr}, i64 {idx})")
+                writeln!(
+                    self.out,
+                    "  {p} = call ptr @mp_rt_arr_get(ptr {arr}, i64 {idx})"
+                )
+                .map_err(|e| e.to_string())?;
+                writeln!(self.out, "  {dst} = load {dst_ty}, ptr {p}")
                     .map_err(|e| e.to_string())?;
-                writeln!(self.out, "  {dst} = load {dst_ty}, ptr {p}").map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
             }
             MpirOp::ArrSet { arr, idx, val } => {
@@ -624,8 +719,11 @@ impl<'a> FnBuilder<'a> {
             MpirOp::ArrFilter { arr, func } => {
                 let arr = self.ensure_ptr_value(arr)?;
                 let func = self.ensure_ptr_value(func)?;
-                writeln!(self.out, "  {dst} = call ptr @mp_rt_arr_filter(ptr {arr}, ptr {func})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  {dst} = call ptr @mp_rt_arr_filter(ptr {arr}, ptr {func})"
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
             }
             MpirOp::ArrReduce { arr, init, func } => {
@@ -639,15 +737,69 @@ impl<'a> FnBuilder<'a> {
                     self.cg.size_of_ty(init.ty_id)
                 )
                 .map_err(|e| e.to_string())?;
-                writeln!(self.out, "  {dst} = load {dst_ty}, ptr {slot}").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  {dst} = load {dst_ty}, ptr {slot}")
+                    .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
             }
             MpirOp::ArrForeach { arr, func } => {
                 let arr = self.ensure_ptr_value(arr)?;
                 let func = self.ensure_ptr_value(func)?;
-                writeln!(self.out, "  call void @mp_rt_arr_foreach(ptr {arr}, ptr {func})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  call void @mp_rt_arr_foreach(ptr {arr}, ptr {func})"
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_default(i.dst, i.ty)?;
+            }
+            MpirOp::CallableCapture { fn_ref, captures } => {
+                let fn_name = mangle_fn(fn_ref);
+                let captures_ptr = if captures.is_empty() {
+                    "null".to_string()
+                } else {
+                    let captured = captures
+                        .iter()
+                        .map(|(_, v)| self.value(v))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let env_size = captured
+                        .iter()
+                        .map(|op| self.cg.size_of_ty(op.ty_id))
+                        .sum::<u64>();
+                    let packed_size = env_size + 8;
+                    let packed_slot = self.tmp();
+                    writeln!(self.out, "  {packed_slot} = alloca [{packed_size} x i8]")
+                        .map_err(|e| e.to_string())?;
+
+                    let size_ptr = self.tmp();
+                    writeln!(
+                        self.out,
+                        "  {size_ptr} = getelementptr i8, ptr {packed_slot}, i64 0"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  store i64 {env_size}, ptr {size_ptr}")
+                        .map_err(|e| e.to_string())?;
+
+                    let mut offset = 0u64;
+                    for op in &captured {
+                        let field_ptr = self.tmp();
+                        writeln!(
+                            self.out,
+                            "  {field_ptr} = getelementptr i8, ptr {packed_slot}, i64 {}",
+                            offset + 8
+                        )
+                        .map_err(|e| e.to_string())?;
+                        writeln!(self.out, "  store {} {}, ptr {field_ptr}", op.ty, op.repr)
+                            .map_err(|e| e.to_string())?;
+                        offset += self.cg.size_of_ty(op.ty_id);
+                    }
+                    packed_slot
+                };
+                writeln!(
+                    self.out,
+                    "  {dst} = call ptr @mp_rt_callable_new(ptr @{}, ptr {captures_ptr})",
+                    fn_name
+                )
+                .map_err(|e| e.to_string())?;
+                self.set_local(i.dst, i.ty, dst_ty, dst);
             }
             MpirOp::MapNew { key_ty, val_ty } => {
                 let key_size = self.cg.size_of_ty(*key_ty);
@@ -678,7 +830,8 @@ impl<'a> FnBuilder<'a> {
                     self.cg.size_of_ty(key.ty_id)
                 )
                 .map_err(|e| e.to_string())?;
-                writeln!(self.out, "  {dst} = load {dst_ty}, ptr {p}").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  {dst} = load {dst_ty}, ptr {p}")
+                    .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
             }
             MpirOp::MapGetRef { map, key } => {
@@ -725,7 +878,8 @@ impl<'a> FnBuilder<'a> {
             }
             MpirOp::MapKeys { map } => {
                 let map = self.ensure_ptr_value(map)?;
-                writeln!(self.out, "  {dst} = call ptr @mp_rt_map_keys(ptr {map})").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  {dst} = call ptr @mp_rt_map_keys(ptr {map})")
+                    .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
             }
             MpirOp::MapValues { map } => {
@@ -737,8 +891,11 @@ impl<'a> FnBuilder<'a> {
             MpirOp::StrConcat { a, b } => {
                 let a = self.ensure_ptr_value(a)?;
                 let b = self.ensure_ptr_value(b)?;
-                writeln!(self.out, "  {dst} = call ptr @mp_rt_str_concat(ptr {a}, ptr {b})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  {dst} = call ptr @mp_rt_str_concat(ptr {a}, ptr {b})"
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
             }
             MpirOp::StrLen { s } => {
@@ -752,8 +909,11 @@ impl<'a> FnBuilder<'a> {
                 let a = self.ensure_ptr_value(a)?;
                 let b = self.ensure_ptr_value(b)?;
                 let eq = self.tmp();
-                writeln!(self.out, "  {eq} = call i32 @mp_rt_str_eq(ptr {a}, ptr {b})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  {eq} = call i32 @mp_rt_str_eq(ptr {a}, ptr {b})"
+                )
+                .map_err(|e| e.to_string())?;
                 self.assign_cast_int(i.dst, i.ty, eq, "i32")?;
             }
             MpirOp::StrSlice { s, start, end } => {
@@ -771,8 +931,70 @@ impl<'a> FnBuilder<'a> {
                 let s = self.ensure_ptr_value(s)?;
                 let len_slot = self.tmp();
                 writeln!(self.out, "  {len_slot} = alloca i64").map_err(|e| e.to_string())?;
-                writeln!(self.out, "  {dst} = call ptr @mp_rt_str_bytes(ptr {s}, ptr {len_slot})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  {dst} = call ptr @mp_rt_str_bytes(ptr {s}, ptr {len_slot})"
+                )
+                .map_err(|e| e.to_string())?;
+                self.set_local(i.dst, i.ty, dst_ty, dst);
+            }
+            MpirOp::StrParseI64 { s } => {
+                let s = self.ensure_ptr_value(s)?;
+                let parsed = self.tmp();
+                writeln!(
+                    self.out,
+                    "  {parsed} = call i64 @mp_rt_str_parse_i64(ptr {s})"
+                )
+                .map_err(|e| e.to_string())?;
+                self.assign_cast_int(i.dst, i.ty, parsed, "i64")?;
+            }
+            MpirOp::StrParseU64 { s } => {
+                let s = self.ensure_ptr_value(s)?;
+                let parsed = self.tmp();
+                writeln!(
+                    self.out,
+                    "  {parsed} = call i64 @mp_rt_str_parse_u64(ptr {s})"
+                )
+                .map_err(|e| e.to_string())?;
+                self.assign_cast_int(i.dst, i.ty, parsed, "i64")?;
+            }
+            MpirOp::StrParseF64 { s } => {
+                let s = self.ensure_ptr_value(s)?;
+                writeln!(
+                    self.out,
+                    "  {dst} = call double @mp_rt_str_parse_f64(ptr {s})"
+                )
+                .map_err(|e| e.to_string())?;
+                self.set_local(i.dst, i.ty, dst_ty, dst);
+            }
+            MpirOp::StrParseBool { s } => {
+                let s = self.ensure_ptr_value(s)?;
+                let parsed = self.tmp();
+                writeln!(
+                    self.out,
+                    "  {parsed} = call i32 @mp_rt_str_parse_bool(ptr {s})"
+                )
+                .map_err(|e| e.to_string())?;
+                self.assign_cast_int(i.dst, i.ty, parsed, "i32")?;
+            }
+            MpirOp::JsonEncode { ty, v } => {
+                let v = self.ensure_ptr_value(v)?;
+                writeln!(
+                    self.out,
+                    "  {dst} = call ptr @mp_rt_json_encode(ptr {v}, i32 {})",
+                    ty.0
+                )
+                .map_err(|e| e.to_string())?;
+                self.set_local(i.dst, i.ty, dst_ty, dst);
+            }
+            MpirOp::JsonDecode { ty, s } => {
+                let s = self.ensure_ptr_value(s)?;
+                writeln!(
+                    self.out,
+                    "  {dst} = call ptr @mp_rt_json_decode(ptr {s}, i32 {})",
+                    ty.0
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
             }
             MpirOp::StrBuilderNew => {
@@ -783,42 +1005,60 @@ impl<'a> FnBuilder<'a> {
             MpirOp::StrBuilderAppendStr { b, s } => {
                 let b = self.ensure_ptr_value(b)?;
                 let s = self.ensure_ptr_value(s)?;
-                writeln!(self.out, "  call void @mp_rt_strbuilder_append_str(ptr {b}, ptr {s})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  call void @mp_rt_strbuilder_append_str(ptr {b}, ptr {s})"
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_default(i.dst, i.ty)?;
             }
             MpirOp::StrBuilderAppendI64 { b, v } => {
                 let b = self.ensure_ptr_value(b)?;
                 let v = self.cast_i64_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_strbuilder_append_i64(ptr {b}, i64 {v})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  call void @mp_rt_strbuilder_append_i64(ptr {b}, i64 {v})"
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_default(i.dst, i.ty)?;
             }
             MpirOp::StrBuilderAppendI32 { b, v } => {
                 let b = self.ensure_ptr_value(b)?;
                 let v = self.cast_i32_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_strbuilder_append_i32(ptr {b}, i32 {v})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  call void @mp_rt_strbuilder_append_i32(ptr {b}, i32 {v})"
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_default(i.dst, i.ty)?;
             }
             MpirOp::StrBuilderAppendF64 { b, v } => {
                 let b = self.ensure_ptr_value(b)?;
                 let v = self.cast_f64_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_strbuilder_append_f64(ptr {b}, double {v})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  call void @mp_rt_strbuilder_append_f64(ptr {b}, double {v})"
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_default(i.dst, i.ty)?;
             }
             MpirOp::StrBuilderAppendBool { b, v } => {
                 let b = self.ensure_ptr_value(b)?;
                 let v = self.cast_i32_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_strbuilder_append_bool(ptr {b}, i32 {v})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  call void @mp_rt_strbuilder_append_bool(ptr {b}, i32 {v})"
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_default(i.dst, i.ty)?;
             }
             MpirOp::StrBuilderBuild { b } => {
                 let b = self.ensure_ptr_value(b)?;
-                writeln!(self.out, "  {dst} = call ptr @mp_rt_strbuilder_build(ptr {b})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  {dst} = call ptr @mp_rt_strbuilder_build(ptr {b})"
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_local(i.dst, i.ty, dst_ty, dst);
             }
             MpirOp::Panic { msg } => {
@@ -856,8 +1096,11 @@ impl<'a> FnBuilder<'a> {
             MpirOpVoid::ArrForeach { arr, func } => {
                 let arr = self.ensure_ptr_value(arr)?;
                 let func = self.ensure_ptr_value(func)?;
-                writeln!(self.out, "  call void @mp_rt_arr_foreach(ptr {arr}, ptr {func})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  call void @mp_rt_arr_foreach(ptr {arr}, ptr {func})"
+                )
+                .map_err(|e| e.to_string())?;
             }
             MpirOpVoid::MapSet { map, key, val } => self.emit_map_set(map, key, val)?,
             MpirOpVoid::MapDeleteVoid { map, key } => {
@@ -874,38 +1117,59 @@ impl<'a> FnBuilder<'a> {
             MpirOpVoid::StrBuilderAppendStr { b, s } => {
                 let b = self.ensure_ptr_value(b)?;
                 let s = self.ensure_ptr_value(s)?;
-                writeln!(self.out, "  call void @mp_rt_strbuilder_append_str(ptr {b}, ptr {s})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  call void @mp_rt_strbuilder_append_str(ptr {b}, ptr {s})"
+                )
+                .map_err(|e| e.to_string())?;
             }
             MpirOpVoid::StrBuilderAppendI64 { b, v } => {
                 let b = self.ensure_ptr_value(b)?;
                 let v = self.cast_i64_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_strbuilder_append_i64(ptr {b}, i64 {v})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  call void @mp_rt_strbuilder_append_i64(ptr {b}, i64 {v})"
+                )
+                .map_err(|e| e.to_string())?;
             }
             MpirOpVoid::StrBuilderAppendI32 { b, v } => {
                 let b = self.ensure_ptr_value(b)?;
                 let v = self.cast_i32_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_strbuilder_append_i32(ptr {b}, i32 {v})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  call void @mp_rt_strbuilder_append_i32(ptr {b}, i32 {v})"
+                )
+                .map_err(|e| e.to_string())?;
             }
             MpirOpVoid::StrBuilderAppendF64 { b, v } => {
                 let b = self.ensure_ptr_value(b)?;
                 let v = self.cast_f64_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_strbuilder_append_f64(ptr {b}, double {v})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  call void @mp_rt_strbuilder_append_f64(ptr {b}, double {v})"
+                )
+                .map_err(|e| e.to_string())?;
             }
             MpirOpVoid::StrBuilderAppendBool { b, v } => {
                 let b = self.ensure_ptr_value(b)?;
                 let v = self.cast_i32_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_strbuilder_append_bool(ptr {b}, i32 {v})")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  call void @mp_rt_strbuilder_append_bool(ptr {b}, i32 {v})"
+                )
+                .map_err(|e| e.to_string())?;
             }
             MpirOpVoid::PtrStore { to, p, v } => {
                 let p = self.ensure_ptr_value(p)?;
                 let v = self.value(v)?;
-                writeln!(self.out, "  store {} {}, ptr {}", self.cg.llvm_ty(*to), v.repr, p)
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  store {} {}, ptr {}",
+                    self.cg.llvm_ty(*to),
+                    v.repr,
+                    p
+                )
+                .map_err(|e| e.to_string())?;
             }
             MpirOpVoid::Panic { msg } => {
                 let msg = self.ensure_ptr_value(msg)?;
@@ -924,11 +1188,13 @@ impl<'a> FnBuilder<'a> {
             }
             MpirOpVoid::ArcRetainWeak { v } => {
                 let p = self.ensure_ptr_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_retain_weak(ptr {p})").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  call void @mp_rt_retain_weak(ptr {p})")
+                    .map_err(|e| e.to_string())?;
             }
             MpirOpVoid::ArcReleaseWeak { v } => {
                 let p = self.ensure_ptr_value(v)?;
-                writeln!(self.out, "  call void @mp_rt_release_weak(ptr {p})").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  call void @mp_rt_release_weak(ptr {p})")
+                    .map_err(|e| e.to_string())?;
             }
             other => {
                 return Err(format!(
@@ -1012,8 +1278,12 @@ impl<'a> FnBuilder<'a> {
         let rhs = self.value(rhs)?;
         let dst_ty = self.cg.llvm_ty(dst_ty_id);
         let dst = format!("%l{}", dst_id.0);
-        writeln!(self.out, "  {dst} = {op} {dst_ty} {}, {}", lhs.repr, rhs.repr)
-            .map_err(|e| e.to_string())?;
+        writeln!(
+            self.out,
+            "  {dst} = {op} {dst_ty} {}, {}",
+            lhs.repr, rhs.repr
+        )
+        .map_err(|e| e.to_string())?;
         self.set_local(dst_id, dst_ty_id, dst_ty, dst);
         Ok(())
     }
@@ -1042,8 +1312,11 @@ impl<'a> FnBuilder<'a> {
         let dst_name = format!("%l{}", dst.0);
         let expect = self.cg.llvm_ty(dst_ty);
         if expect == pair_ty {
-            writeln!(self.out, "  {dst_name} = add {pair_ty} {call_tmp}, zeroinitializer")
-                .map_err(|e| e.to_string())?;
+            writeln!(
+                self.out,
+                "  {dst_name} = add {pair_ty} {call_tmp}, zeroinitializer"
+            )
+            .map_err(|e| e.to_string())?;
             self.set_local(dst, dst_ty, expect, dst_name);
             return Ok(());
         }
@@ -1054,15 +1327,24 @@ impl<'a> FnBuilder<'a> {
         )
         .map_err(|e| e.to_string())?;
         let ov_tmp = self.tmp();
-        writeln!(self.out, "  {ov_tmp} = extractvalue {pair_ty} {call_tmp}, 1")
-            .map_err(|e| e.to_string())?;
+        writeln!(
+            self.out,
+            "  {ov_tmp} = extractvalue {pair_ty} {call_tmp}, 1"
+        )
+        .map_err(|e| e.to_string())?;
         let none_tag = self.tmp();
         writeln!(self.out, "  {none_tag} = xor i1 {ov_tmp}, true").map_err(|e| e.to_string())?;
         let agg0 = self.tmp();
-        writeln!(self.out, "  {agg0} = insertvalue {expect} undef, {int_ty} {val_tmp}, 0")
-            .map_err(|e| e.to_string())?;
-        writeln!(self.out, "  {dst_name} = insertvalue {expect} {agg0}, i1 {none_tag}, 1")
-            .map_err(|e| e.to_string())?;
+        writeln!(
+            self.out,
+            "  {agg0} = insertvalue {expect} undef, {int_ty} {val_tmp}, 0"
+        )
+        .map_err(|e| e.to_string())?;
+        writeln!(
+            self.out,
+            "  {dst_name} = insertvalue {expect} {agg0}, i1 {none_tag}, 1"
+        )
+        .map_err(|e| e.to_string())?;
         self.set_local(dst, dst_ty, expect, dst_name);
         Ok(())
     }
@@ -1085,13 +1367,22 @@ impl<'a> FnBuilder<'a> {
         }
 
         if src_ty == "ptr" && dst_ty == "ptr" {
-            writeln!(self.out, "  {dst} = bitcast ptr {} to ptr", src.repr).map_err(|e| e.to_string())?;
+            writeln!(self.out, "  {dst} = bitcast ptr {} to ptr", src.repr)
+                .map_err(|e| e.to_string())?;
         } else if src_ty == "ptr" && is_int_ty(&dst_ty) {
-            writeln!(self.out, "  {dst} = ptrtoint ptr {} to {}", src.repr, dst_ty)
-                .map_err(|e| e.to_string())?;
+            writeln!(
+                self.out,
+                "  {dst} = ptrtoint ptr {} to {}",
+                src.repr, dst_ty
+            )
+            .map_err(|e| e.to_string())?;
         } else if is_int_ty(&src_ty) && dst_ty == "ptr" {
-            writeln!(self.out, "  {dst} = inttoptr {} {} to ptr", src_ty, src.repr)
-                .map_err(|e| e.to_string())?;
+            writeln!(
+                self.out,
+                "  {dst} = inttoptr {} {} to ptr",
+                src_ty, src.repr
+            )
+            .map_err(|e| e.to_string())?;
         } else if is_int_ty(&src_ty) && is_int_ty(&dst_ty) {
             let src_bits = int_bits(&src_ty).unwrap_or(64);
             let dst_bits = int_bits(&dst_ty).unwrap_or(64);
@@ -1108,42 +1399,72 @@ impl<'a> FnBuilder<'a> {
                 "trunc"
             };
             if op == "add" {
-                writeln!(self.out, "  {dst} = add {} {}, 0", dst_ty, src.repr).map_err(|e| e.to_string())?;
-            } else {
-                writeln!(self.out, "  {dst} = {op} {} {} to {}", src_ty, src.repr, dst_ty)
+                writeln!(self.out, "  {dst} = add {} {}, 0", dst_ty, src.repr)
                     .map_err(|e| e.to_string())?;
+            } else {
+                writeln!(
+                    self.out,
+                    "  {dst} = {op} {} {} to {}",
+                    src_ty, src.repr, dst_ty
+                )
+                .map_err(|e| e.to_string())?;
             }
         } else if is_float_ty(&src_ty) && is_float_ty(&dst_ty) {
             let src_bits = float_bits(&src_ty).unwrap_or(64);
             let dst_bits = float_bits(&dst_ty).unwrap_or(64);
-            let op = if src_bits < dst_bits { "fpext" } else { "fptrunc" };
-            writeln!(self.out, "  {dst} = {op} {} {} to {}", src_ty, src.repr, dst_ty)
-                .map_err(|e| e.to_string())?;
+            let op = if src_bits < dst_bits {
+                "fpext"
+            } else {
+                "fptrunc"
+            };
+            writeln!(
+                self.out,
+                "  {dst} = {op} {} {} to {}",
+                src_ty, src.repr, dst_ty
+            )
+            .map_err(|e| e.to_string())?;
         } else if is_int_ty(&src_ty) && is_float_ty(&dst_ty) {
             let op = if self.cg.is_signed_int(src.ty_id) {
                 "sitofp"
             } else {
                 "uitofp"
             };
-            writeln!(self.out, "  {dst} = {op} {} {} to {}", src_ty, src.repr, dst_ty)
-                .map_err(|e| e.to_string())?;
+            writeln!(
+                self.out,
+                "  {dst} = {op} {} {} to {}",
+                src_ty, src.repr, dst_ty
+            )
+            .map_err(|e| e.to_string())?;
         } else if is_float_ty(&src_ty) && is_int_ty(&dst_ty) {
             let op = if self.cg.is_signed_int(dst_ty_id) {
                 "fptosi"
             } else {
                 "fptoui"
             };
-            writeln!(self.out, "  {dst} = {op} {} {} to {}", src_ty, src.repr, dst_ty)
-                .map_err(|e| e.to_string())?;
+            writeln!(
+                self.out,
+                "  {dst} = {op} {} {} to {}",
+                src_ty, src.repr, dst_ty
+            )
+            .map_err(|e| e.to_string())?;
         } else {
-            writeln!(self.out, "  {dst} = bitcast {} {} to {}", src_ty, src.repr, dst_ty)
-                .map_err(|e| e.to_string())?;
+            writeln!(
+                self.out,
+                "  {dst} = bitcast {} {} to {}",
+                src_ty, src.repr, dst_ty
+            )
+            .map_err(|e| e.to_string())?;
         }
         self.set_local(dst_id, dst_ty_id, dst_ty, dst);
         Ok(())
     }
 
-    fn emit_arr_set(&mut self, arr: &MpirValue, idx: &MpirValue, val: &MpirValue) -> Result<(), String> {
+    fn emit_arr_set(
+        &mut self,
+        arr: &MpirValue,
+        idx: &MpirValue,
+        val: &MpirValue,
+    ) -> Result<(), String> {
         let arr = self.ensure_ptr_value(arr)?;
         let idx = self.cast_i64_value(idx)?;
         let val = self.value(val)?;
@@ -1191,7 +1512,8 @@ impl<'a> FnBuilder<'a> {
                 )
                 .map_err(|e| e.to_string())?;
                 let loaded = self.tmp();
-                writeln!(self.out, "  {loaded} = load {inner_ty}, ptr {out}").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  {loaded} = load {inner_ty}, ptr {out}")
+                    .map_err(|e| e.to_string())?;
                 let ok = self.tmp();
                 writeln!(self.out, "  {ok} = icmp eq i32 {stat}, 1").map_err(|e| e.to_string())?;
                 let agg0 = self.tmp();
@@ -1201,8 +1523,11 @@ impl<'a> FnBuilder<'a> {
                 )
                 .map_err(|e| e.to_string())?;
                 let dst = format!("%l{}", dst_id.0);
-                writeln!(self.out, "  {dst} = insertvalue {dst_ty} {agg0}, i1 {ok}, 1")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  {dst} = insertvalue {dst_ty} {agg0}, i1 {ok}, 1"
+                )
+                .map_err(|e| e.to_string())?;
                 self.set_local(dst_id, dst_ty_id, dst_ty.to_string(), dst);
             }
             _ => {
@@ -1217,7 +1542,8 @@ impl<'a> FnBuilder<'a> {
                 .map_err(|e| e.to_string())?;
                 let _ = stat;
                 let dst = format!("%l{}", dst_id.0);
-                writeln!(self.out, "  {dst} = load {dst_ty}, ptr {out}").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  {dst} = load {dst_ty}, ptr {out}")
+                    .map_err(|e| e.to_string())?;
                 self.set_local(dst_id, dst_ty_id, dst_ty.to_string(), dst);
             }
         }
@@ -1292,8 +1618,12 @@ impl<'a> FnBuilder<'a> {
             )
             .map_err(|e| e.to_string())?;
         } else if is_int_ty(&src.ty) && dst_ty_str == "ptr" {
-            writeln!(self.out, "  {dst_name} = inttoptr {} {} to ptr", src.ty, src.repr)
-                .map_err(|e| e.to_string())?;
+            writeln!(
+                self.out,
+                "  {dst_name} = inttoptr {} {} to ptr",
+                src.ty, src.repr
+            )
+            .map_err(|e| e.to_string())?;
         } else if is_int_ty(&src.ty) && is_int_ty(&dst_ty_str) {
             let sb = int_bits(&src.ty).unwrap_or(64);
             let db = int_bits(&dst_ty_str).unwrap_or(64);
@@ -1419,10 +1749,7 @@ impl<'a> FnBuilder<'a> {
                     .get(&id.0)
                     .map(|t| format!(" (declared ty {})", self.cg.llvm_ty(*t)))
                     .unwrap_or_default();
-                format!(
-                    "undefined local %{} in fn '{}'{}",
-                    id.0, self.f.name, ty
-                )
+                format!("undefined local %{} in fn '{}'{}", id.0, self.f.name, ty)
             }),
             MpirValue::Const(c) => Ok(Operand {
                 ty: self.cg.llvm_ty(c.ty),
@@ -1478,7 +1805,8 @@ impl<'a> FnBuilder<'a> {
             return Ok(tmp);
         }
         if op.ty == "ptr" {
-            writeln!(self.out, "  {tmp} = icmp ne ptr {}, null", op.repr).map_err(|e| e.to_string())?;
+            writeln!(self.out, "  {tmp} = icmp ne ptr {}, null", op.repr)
+                .map_err(|e| e.to_string())?;
             return Ok(tmp);
         }
         Err(format!("cannot lower condition value of type {}", op.ty))
@@ -1494,22 +1822,33 @@ impl<'a> FnBuilder<'a> {
         let dst_ty_s = self.cg.llvm_ty(dst_ty);
         let dst_name = format!("%l{}", dst.0);
         if dst_ty_s == src_ty {
-            writeln!(self.out, "  {dst_name} = add {src_ty} {src_repr}, 0").map_err(|e| e.to_string())?;
+            writeln!(self.out, "  {dst_name} = add {src_ty} {src_repr}, 0")
+                .map_err(|e| e.to_string())?;
         } else if is_int_ty(src_ty) && is_int_ty(&dst_ty_s) {
             let sb = int_bits(src_ty).unwrap_or(64);
             let db = int_bits(&dst_ty_s).unwrap_or(64);
             if sb > db {
-                writeln!(self.out, "  {dst_name} = trunc {src_ty} {src_repr} to {dst_ty_s}")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  {dst_name} = trunc {src_ty} {src_repr} to {dst_ty_s}"
+                )
+                .map_err(|e| e.to_string())?;
             } else if sb < db {
-                writeln!(self.out, "  {dst_name} = zext {src_ty} {src_repr} to {dst_ty_s}")
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  {dst_name} = zext {src_ty} {src_repr} to {dst_ty_s}"
+                )
+                .map_err(|e| e.to_string())?;
             } else {
-                writeln!(self.out, "  {dst_name} = add {src_ty} {src_repr}, 0").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  {dst_name} = add {src_ty} {src_repr}, 0")
+                    .map_err(|e| e.to_string())?;
             }
         } else {
-            writeln!(self.out, "  {dst_name} = bitcast {src_ty} {src_repr} to {dst_ty_s}")
-                .map_err(|e| e.to_string())?;
+            writeln!(
+                self.out,
+                "  {dst_name} = bitcast {src_ty} {src_repr} to {dst_ty_s}"
+            )
+            .map_err(|e| e.to_string())?;
         }
         self.set_local(dst, dst_ty, dst_ty_s, dst_name);
         Ok(())
@@ -1529,7 +1868,8 @@ impl<'a> FnBuilder<'a> {
                 writeln!(self.out, "  {tmp} = trunc {} {} to i64", op.ty, op.repr)
                     .map_err(|e| e.to_string())?;
             } else {
-                writeln!(self.out, "  {tmp} = add i64 {}, 0", op.repr).map_err(|e| e.to_string())?;
+                writeln!(self.out, "  {tmp} = add i64 {}, 0", op.repr)
+                    .map_err(|e| e.to_string())?;
             }
             return Ok(tmp);
         }
@@ -1555,7 +1895,8 @@ impl<'a> FnBuilder<'a> {
                 writeln!(self.out, "  {tmp} = trunc {} {} to i32", op.ty, op.repr)
                     .map_err(|e| e.to_string())?;
             } else {
-                writeln!(self.out, "  {tmp} = add i32 {}, 0", op.repr).map_err(|e| e.to_string())?;
+                writeln!(self.out, "  {tmp} = add i32 {}, 0", op.repr)
+                    .map_err(|e| e.to_string())?;
             }
             return Ok(tmp);
         }
@@ -1578,8 +1919,12 @@ impl<'a> FnBuilder<'a> {
                 writeln!(self.out, "  {tmp} = fpext {} {} to double", op.ty, op.repr)
                     .map_err(|e| e.to_string())?;
             } else {
-                writeln!(self.out, "  {tmp} = fptrunc {} {} to double", op.ty, op.repr)
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    self.out,
+                    "  {tmp} = fptrunc {} {} to double",
+                    op.ty, op.repr
+                )
+                .map_err(|e| e.to_string())?;
             }
             return Ok(tmp);
         }
@@ -1639,13 +1984,22 @@ impl<'a> FnBuilder<'a> {
         format!("%t{}", self.tmp_idx)
     }
 
+    fn label(&mut self, prefix: &str) -> String {
+        self.tmp_idx = self.tmp_idx.wrapping_add(1);
+        format!("{prefix}_{}", self.tmp_idx)
+    }
+
     fn zero_lit(&self, ty: &str) -> String {
         match ty {
             "half" | "float" | "double" => "0.0".to_string(),
             "ptr" => "null".to_string(),
             "void" => "0".to_string(),
             t if t.starts_with('i') => "0".to_string(),
-            t if t.starts_with('{') || t.starts_with('[') || t.starts_with('<') || t.starts_with("%mp_t") => {
+            t if t.starts_with('{')
+                || t.starts_with('[')
+                || t.starts_with('<')
+                || t.starts_with("%mp_t") =>
+            {
                 "zeroinitializer".to_string()
             }
             _ => "0".to_string(),
@@ -1714,8 +2068,8 @@ fn normalize_icmp_pred(pred: &str) -> &str {
 
 fn normalize_fcmp_pred(pred: &str) -> &str {
     match pred {
-        "false" | "oeq" | "ogt" | "oge" | "olt" | "ole" | "one" | "ord" | "uno" | "ueq"
-        | "ugt" | "uge" | "ult" | "ule" | "une" | "true" => pred,
+        "false" | "oeq" | "ogt" | "oge" | "olt" | "ole" | "one" | "ord" | "uno" | "ueq" | "ugt"
+        | "uge" | "ult" | "ule" | "une" | "true" => pred,
         "eq" => "oeq",
         "ne" => "one",
         "gt" => "ogt",
@@ -1838,7 +2192,8 @@ pub fn parse_c_header(header_path: &Path) -> Result<Vec<ExternFnDecl>, String> {
         r"(?m)^\s*(?:extern\s+)?([A-Za-z_][A-Za-z0-9_\s\*]*?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^;{}()]*)\)\s*;",
     )
     .map_err(|e| e.to_string())?;
-    let param_re = Regex::new(r"^\s*(.+?)\s*([A-Za-z_][A-Za-z0-9_]*)\s*$").map_err(|e| e.to_string())?;
+    let param_re =
+        Regex::new(r"^\s*(.+?)\s*([A-Za-z_][A-Za-z0-9_]*)\s*$").map_err(|e| e.to_string())?;
 
     let no_block = block_comment_re.replace_all(&src, "");
     let no_line = line_comment_re.replace_all(&no_block, "");
@@ -1876,7 +2231,9 @@ pub fn parse_c_header(header_path: &Path) -> Result<Vec<ExternFnDecl>, String> {
                     continue;
                 }
                 if raw_param == "..." {
-                    return Err(format!("variadic extern function '{name}' is not supported yet"));
+                    return Err(format!(
+                        "variadic extern function '{name}' is not supported yet"
+                    ));
                 }
 
                 let (raw_ty, raw_name) = if let Some(pm) = param_re.captures(raw_param) {
@@ -1930,11 +2287,7 @@ pub fn generate_extern_mp(decls: &[ExternFnDecl], lib_name: &str) -> String {
         } else {
             ""
         };
-        let _ = writeln!(
-            out,
-            "  fn @{fn_name}({params}) -> {}{}",
-            decl.ret_ty, attrs
-        );
+        let _ = writeln!(out, "  fn @{fn_name}({params}) -> {}{}", decl.ret_ty, attrs);
     }
 
     let _ = writeln!(out, "}}");
@@ -1996,7 +2349,9 @@ fn is_pointer_mp_type(ty: &str) -> bool {
 
 fn map_c_type(raw_ty: &str) -> Option<String> {
     let mut ty = raw_ty.trim().to_string();
-    for qualifier in ["const", "volatile", "register", "static", "extern", "inline"] {
+    for qualifier in [
+        "const", "volatile", "register", "static", "extern", "inline",
+    ] {
         ty = Regex::new(&format!(r"\b{qualifier}\b"))
             .ok()?
             .replace_all(&ty, "")
@@ -2233,9 +2588,9 @@ mod tests {
                         }),
                     }],
                     void_ops: vec![],
-                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(
-                        magpie_types::LocalId(0),
-                    ))),
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        0,
+                    )))),
                 }],
                 locals: vec![MpirLocalDecl {
                     id: magpie_types::LocalId(0),
@@ -2248,7 +2603,10 @@ mod tests {
         };
 
         let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
-        assert!(llvm_ir.contains("define"), "expected function definitions in IR");
+        assert!(
+            llvm_ir.contains("define"),
+            "expected function definitions in IR"
+        );
         assert!(llvm_ir.contains("ret"), "expected return instruction in IR");
     }
 
