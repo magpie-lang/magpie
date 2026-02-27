@@ -178,7 +178,7 @@ Magpie source files are module-centric and SSA-oriented.
 ### 4.1 Comments
 
 - Line comment: `;...`
-- Doc comment token: `;;;...`
+- Doc comment token: `;;...` (double semicolon, NOT triple)
 
 ### 4.2 Token classes
 
@@ -382,7 +382,7 @@ All use:
 
 ### Heap/object/SSA
 - `new Type { field=v,... }`
-- `getfield { obj=..., field=name }`
+- `getfield { obj=..., field=name }` (keys accepted in any order)
 - `phi Type { [bb1:v1], [bb2:v2],... }`
 
 ### Enum
@@ -423,7 +423,7 @@ All use:
 ## 9.2 Void op families
 
 - `call_void`, `call_void.indirect`
-- `setfield { obj=..., field=..., val=... }`
+- `setfield { obj=..., field=..., val=... }` (keys accepted in any order)
 - `panic { msg=... }`
 - `ptr.store<T> { p=..., v=... }`
 - `arr.set`, `arr.push`, `arr.sort`, `arr.foreach`
@@ -590,6 +590,90 @@ This avoids both:
 ; compiler/runtime manage release points for %s2 and %s
 ```
 
+### 12.5 Ownership State Machine
+
+```
+                    ┌────────────┐
+       new -------->│   Unique   │ (initial state, refcount=1)
+                    │  (owned)   │
+                    └──┬──┬──┬───┘
+                       │  │  │
+           share       │  │  │  borrow.shared
+         (consumes)    │  │  │  (temporary)
+                       │  │  │
+        ┌──────────────┘  │  └──────────────┐
+        v                 │                  v
+  ┌───────────┐           │           ┌───────────┐
+  │  Shared   │           │           │  Borrow   │
+  │ (ARC, RC) │           │           │(read-only)│
+  └──┬────┬───┘           │           └───────────┘
+     │    │               │
+     │    │ weak.         │ borrow.mut
+     │    │ downgrade     │ (temporary, exclusive)
+     │    │               │
+     │  ┌─v────────┐   ┌─v───────────┐
+     │  │   Weak   │   │  MutBorrow  │
+     │  │(non-own) │   │ (exclusive) │
+     │  └──────────┘   └─────────────┘
+     │
+     │ clone.shared (increments refcount)
+     v
+  ┌───────────┐
+  │  Shared   │ (additional reference)
+  │  (clone)  │
+  └───────────┘
+
+  RULES:
+  - Borrows are block-scoped (cannot cross br/cbr boundaries)
+  - Borrows cannot appear in phi nodes
+  - Functions cannot return borrow values
+  - mutborrow is exclusive: no other borrows or moves while active
+  - share consumes the unique handle
+  - ARC retain/release inserted automatically by Stage 8
+```
+
+### 12.6 Type System Hierarchy
+
+```
+  ┌─────────────────────────────────────────────────┐
+  │                   All Types                      │
+  ├──────────────────┬──────────────────────────────┤
+  │   Value Types    │        Heap Types             │
+  │  (stack/inline)  │     (ARC-managed handle)      │
+  ├──────────────────┼──────────────────────────────┤
+  │ Primitives:      │ Builtins:                     │
+  │  i8..i128        │  Str                          │
+  │  u8..u128        │  Array<T>                     │
+  │  f16, f32, f64   │  Map<K, V>                    │
+  │  bool, unit      │  TStrBuilder                  │
+  │  i1, u1          │  TFuture<T>                   │
+  │                  │  TMutex<T>, TRwLock<T>        │
+  │ Value Structs:   │  TCell<T>                     │
+  │  value struct T  │  TChannelSend/Recv<T>         │
+  │                  │                               │
+  │ Value Enums:     │ User Heap Types:              │
+  │  TOption<T>      │  heap struct TName            │
+  │  TResult<O, E>   │  heap enum TName              │
+  │                  │                               │
+  │                  │ Callable:                      │
+  │                  │  TCallable<TSig>               │
+  │                  │                               │
+  │                  │ Pointer (unsafe):              │
+  │                  │  rawptr<T>                     │
+  └──────────────────┴──────────────────────────────┘
+
+  Ownership modifiers (apply to heap types only):
+    (none)     = unique owned handle
+    shared     = reference-counted (ARC)
+    borrow     = immutable reference
+    mutborrow  = mutable exclusive reference
+    weak       = non-owning reference
+
+  Note: TOption and TResult are VALUE enums.
+  shared/weak modifiers on TOption/TResult are rejected (MPT0002/MPT0003).
+  Str has built-in hash, eq, ord impls (no explicit impl needed for Map keys).
+```
+
 ---
 
 ## 13) Compiler Architecture
@@ -633,6 +717,105 @@ Driver stage names:
 13. `stage12_mms_update`
 
 This staged structure is intentionally visible in output timing and diagnostics.
+
+### 14.1 Pipeline Diagram
+
+```
+  .mp source
+      │
+      v
+┌─────────────────────┐
+│ Stage 1: Lex/Parse  │──> .ast.txt
+│   magpie_lex         │
+│   magpie_parse       │
+│   magpie_csnf        │
+└──────────┬──────────┘
+           v
+┌─────────────────────┐
+│ Stage 2: Resolve    │    (imports, symbol tables)
+│   magpie_sema        │
+└──────────┬──────────┘
+           v
+┌─────────────────────┐
+│ Stage 3: Typecheck  │    (AST -> HIR, type validation)
+│   magpie_sema        │
+│   magpie_types       │
+└──────────┬──────────┘
+           v
+┌─────────────────────┐
+│ Stage 3.5: Async    │    (coroutine state machines)
+│   Lowering           │    suspend.call -> dispatch switch
+└──────────┬──────────┘
+           v
+┌─────────────────────┐
+│ Stage 4: Verify HIR │    (SSA, borrow invariants)
+│   magpie_hir         │
+└──────────┬──────────┘
+           v
+┌─────────────────────┐
+│ Stage 5: Ownership  │    (move/borrow/alias rules)
+│   magpie_own         │
+└──────────┬──────────┘
+           v
+┌─────────────────────┐
+│ Stage 6: Lower MPIR │──> .mpir
+│   magpie_mpir        │
+└──────────┬──────────┘
+           v
+┌─────────────────────┐
+│ Stage 7: Verify MPIR│    (SID/CFG/type invariants)
+│   magpie_mpir        │
+└──────────┬──────────┘
+           v
+┌─────────────────────┐
+│ Stage 8: ARC Insert │    (retain/release insertion)
+│   magpie_arc         │
+└──────────┬──────────┘
+           v
+┌─────────────────────┐
+│ Stage 9: ARC Opt    │    (elide redundant refcounting)
+│   magpie_arc         │
+└──────────┬──────────┘
+           v
+┌─────────────────────┐
+│ Stage 10: Codegen   │──> .ll (LLVM IR), .gpu_registry.ll
+│   magpie_codegen_llvm│
+│   magpie_gpu         │
+└──────────┬──────────┘
+           v
+┌─────────────────────┐
+│ Stage 11: Link      │──> native executable / shared lib
+│   clang -x ir        │    (or lli for interpretation)
+│   libmagpie_rt.a     │
+└──────────┬──────────┘
+           v
+┌─────────────────────┐
+│ Stage 12: MMS Update│──> .mms_index.json
+│   magpie_memory      │
+└─────────────────────┘
+```
+
+### 14.2 Crate Architecture
+
+```
+                    magpie_cli
+                        │
+                    magpie_driver ─────────────────────────────┐
+                   /    │    \                                  │
+          magpie_lex  magpie_sema  magpie_codegen_llvm    magpie_web
+              │         │    │           │                     │
+        magpie_parse  magpie_hir  magpie_arc            magpie_jit
+              │         │           │
+          magpie_ast  magpie_own  magpie_mpir
+              │         │           │
+          magpie_csnf magpie_types magpie_gpu
+                        │
+                    magpie_diag    magpie_rt (runtime)
+                                   magpie_pkg
+                                   magpie_memory
+                                   magpie_ctx
+                                   magpie_mono
+```
 
 ---
 
@@ -840,9 +1023,9 @@ exports { @main }
 imports { }
 digest "0000000000000000"
 
-fn @main() -> i64 {
+fn @main() -> i32 {
 bb0:
- ret const.i64 0
+ ret const.i32 0
 }
 ```
 

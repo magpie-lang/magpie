@@ -103,7 +103,7 @@ Useful emit kinds from driver planning:
 
 ### Comments
 - `; ...` line comment
-- `;;; ...` doc comment token (`DocComment`)
+- `;; ...` doc comment token (`DocComment`) — NOTE: use `;;` (double), NOT `;;;` (triple causes parse errors)
 
 ### Name classes
 - Module path segments: plain identifiers (`ident`)
@@ -367,7 +367,7 @@ Use exactly these names and keys.
 
 ### Struct / enum / SSA
 - `new Type { field=V, ... }`
-- `getfield { obj=V, field=name }`  (**strict key order obj,field in parser branch**)
+- `getfield { obj=V, field=name }`  (**keys accepted in any order**)
 - `phi Type { [bbN:V], [bbM:V], ... }`
 - `enum.new<Variant> { key=V, ... }`
 - `enum.tag { v=V }`
@@ -445,7 +445,7 @@ Use exactly these names and keys.
 
 - `call_void @fn<TypeArgs?> { key=Arg, ... }`
 - `call_void.indirect V { key=Arg, ... }`
-- `setfield { obj=V, field=name, val=V }` (**must use `val=`, not `value=`**)
+- `setfield { obj=V, field=name, val=V }` (**keys accepted in any order; must use `val=`, not `value=`**)
 - `panic { msg=V }`
 - `ptr.store<Type> { p=V, v=V }` (unsafe context)
 - `arr.set { arr=V, idx=V, val=V }`
@@ -597,7 +597,9 @@ Driver stage `stage3_5_async_lowering` lowers async functions by:
 4. inserting dispatch `switch` over resume states
 5. rewriting callsites to lowered async sids to prepend state argument `0`
 
-After lowering, function `is_async` is set false in HIR used downstream.
+After lowering, function `is_async` remains `true` so that downstream HIR and MPIR verifiers
+can skip SSA domination checks for async coroutine state machines (the dispatch switch block
+legitimately breaks standard domination by introducing extra predecessors to resume blocks).
 
 Note: diagnostic constant `MPAS0001` exists in diag codes, but current code path does not emit it directly.
 
@@ -613,11 +615,13 @@ exports { @main }
 imports { }
 digest "0000000000000000"
 
-fn @main() -> i64 {
+fn @main() -> i32 {
 bb0:
-  ret const.i64 0
+  ret const.i32 0
 }
 ```
+
+**Important:** The type suffix in `const.<Type>` determines the constant's type. Use `const.i32 0` for i32, `const.i64 0` for i64. Mismatched types (e.g., `ret const.i64 0` in a function returning `i32`) will produce LLVM IR errors.
 
 ## 9.2 Borrow-safe struct mutation/read split
 
@@ -750,12 +754,17 @@ Every bug fix should add one of:
 1. **Header order is strict** in parser.
 2. **Call argument keys are not semantic** today; order is what lowering preserves.
 3. `setfield` uses `val=` key (not `value=`).
-4. `getfield`/`setfield` have explicit key-order parsing logic.
+4. `getfield`/`setfield` accept keys in any order (obj/field/val).
 5. Borrows cannot appear in phi or cross blocks.
 6. `map.get` by-value result requires Dupable map value type.
 7. `TOption`/`TResult` reject shared/weak ownership prefix.
 8. Arc op tokens exist in lexer but are not surface source operations.
 9. Async lowering rewrites function shape; debug post-lowering IR, not just source intent.
+10. `Str` has built-in `hash`, `eq`, `ord` impls — no explicit `impl` needed for `Map<Str, V>`.
+11. Collection read ops (`arr.len`, `map.contains_key`) require `borrow`/`mutborrow` receiver.
+12. Collection write ops (`arr.push`, `map.set`) require `mutborrow` receiver.
+13. `const.<Type>` suffix determines the constant's type — `const.i32 0` is NOT the same as `const.i64 0`.
+14. Module paths can contain keywords (e.g., `module std.async` is valid).
 
 ---
 
