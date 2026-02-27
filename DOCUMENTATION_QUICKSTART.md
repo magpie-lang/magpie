@@ -14,6 +14,8 @@ cargo build -p magpie_cli
 cargo run -p magpie_cli -- --help
 ```
 
+Important: CLI global flags (like `--entry`, `--emit`, `--output`) go **before** the subcommand.
+
 ---
 
 ## 2) Create a Project
@@ -21,7 +23,7 @@ cargo run -p magpie_cli -- --help
 ```bash
 cargo run -p magpie_cli -- new demo
 cd demo
-cargo run -p magpie_cli -- build --output json
+cargo run -p magpie_cli -- --output json build
 ```
 
 ---
@@ -45,8 +47,8 @@ bb0:
 Build/run:
 
 ```bash
-cargo run -p magpie_cli -- build --entry src/main.mp --emit mpir,llvm-ir,exe --output json
-cargo run -p magpie_cli -- run --entry src/main.mp
+cargo run -p magpie_cli -- --entry src/main.mp --emit mpir,llvm-ir,exe --output json build
+cargo run -p magpie_cli -- --entry src/main.mp run
 ```
 
 ---
@@ -56,13 +58,13 @@ cargo run -p magpie_cli -- run --entry src/main.mp
 1. Build with machine output + debug artifacts:
 
 ```bash
-cargo run -p magpie_cli -- build --entry src/main.mp --emit mpir,llvm-ir,mpdbg --output json
+cargo run -p magpie_cli -- --entry src/main.mp --emit mpir,llvm-ir,mpdbg --output json build
 ```
 
 2. Explain code:
 
 ```bash
-cargo run -p magpie_cli -- explain MPT2014 --output json
+cargo run -p magpie_cli -- --output json explain MPT2014
 ```
 
 3. Fix smallest issue first and rebuild.
@@ -138,31 +140,31 @@ cargo run -p magpie_cli -- fmt --fix-meta
 
 ### Parse only
 ```bash
-cargo run -p magpie_cli -- parse --entry src/main.mp --output json
+cargo run -p magpie_cli -- --entry src/main.mp --output json parse
 ```
 
 ### Graphs
 ```bash
-cargo run -p magpie_cli -- graph symbols --entry src/main.mp --output json
-cargo run -p magpie_cli -- graph deps --entry src/main.mp --output json
-cargo run -p magpie_cli -- graph ownership --entry src/main.mp --output json
-cargo run -p magpie_cli -- graph cfg --entry src/main.mp --output json
+cargo run -p magpie_cli -- --entry src/main.mp --output json graph symbols
+cargo run -p magpie_cli -- --entry src/main.mp --output json graph deps
+cargo run -p magpie_cli -- --entry src/main.mp --output json graph ownership
+cargo run -p magpie_cli -- --entry src/main.mp --output json graph cfg
 ```
 
 ### MPIR verify
 ```bash
-cargo run -p magpie_cli -- mpir verify --entry src/main.mp --output json
+cargo run -p magpie_cli -- --entry src/main.mp --output json mpir verify
 ```
 
 ### FFI import
 ```bash
-cargo run -p magpie_cli -- ffi import --header mylib.h --out ffi_bindings.mp --output json
+cargo run -p magpie_cli -- --output json ffi import --header mylib.h --out ffi_bindings.mp
 ```
 
 ### Memory index/query
 ```bash
-cargo run -p magpie_cli -- memory build --entry src/main.mp --output json
-cargo run -p magpie_cli -- memory query -q "borrow phi" -k 10 --entry src/main.mp --output json
+cargo run -p magpie_cli -- --entry src/main.mp --output json memory build
+cargo run -p magpie_cli -- --entry src/main.mp --output json memory query -q "borrow phi" -k 10
 ```
 
 ---
@@ -170,12 +172,13 @@ cargo run -p magpie_cli -- memory query -q "borrow phi" -k 10 --entry src/main.m
 ## 10) LLM/Agent Mode Flags
 
 ```bash
-cargo run -p magpie_cli -- build \
+cargo run -p magpie_cli -- \
   --entry src/main.mp \
   --llm \
   --llm-token-budget 12000 \
   --llm-budget-policy balanced \
-  --output json
+  --output json \
+  build
 ```
 
 Useful:
@@ -193,4 +196,3 @@ Useful:
 - Diagnostics + CLI args: sections **16–18**
 - Formal grammar/opcode appendices: **Appendix A–D**
 - Evidence matrix: **Appendix E–F**
-
