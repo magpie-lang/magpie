@@ -3378,7 +3378,7 @@ impl<'a> FnBuilder<'a> {
             writeln!(self.out, "  {is_ok} = icmp eq i32 {status}, 0").map_err(|e| e.to_string())?;
 
             let ok0 = self.tmp();
-            writeln!(self.out, "  {ok0} = insertvalue {agg_ty} undef, i1 1, 0")
+            writeln!(self.out, "  {ok0} = insertvalue {agg_ty} undef, i1 0, 0")
                 .map_err(|e| e.to_string())?;
             let ok1 = self.tmp();
             writeln!(
@@ -3394,7 +3394,7 @@ impl<'a> FnBuilder<'a> {
             .map_err(|e| e.to_string())?;
 
             let err0 = self.tmp();
-            writeln!(self.out, "  {err0} = insertvalue {agg_ty} undef, i1 0, 0")
+            writeln!(self.out, "  {err0} = insertvalue {agg_ty} undef, i1 1, 0")
                 .map_err(|e| e.to_string())?;
             let err1 = self.tmp();
             writeln!(
@@ -5348,6 +5348,8 @@ mod tests {
         let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
         assert!(llvm_ir.contains("call i32 @mp_rt_str_try_parse_i64"));
         assert!(llvm_ir.contains("insertvalue { i1, i64, ptr }"));
+        assert!(llvm_ir.contains("insertvalue { i1, i64, ptr } undef, i1 0, 0"));
+        assert!(llvm_ir.contains("insertvalue { i1, i64, ptr } undef, i1 1, 0"));
         assert!(!llvm_ir.contains("str_parse_i64_panic"));
         assert!(!llvm_ir.contains("call void @mp_rt_panic"));
     }
@@ -5432,6 +5434,8 @@ mod tests {
         let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
         assert!(llvm_ir.contains("call i32 @mp_rt_json_try_decode"));
         assert!(llvm_ir.contains("insertvalue { i1, ptr, ptr }"));
+        assert!(llvm_ir.contains("insertvalue { i1, ptr, ptr } undef, i1 0, 0"));
+        assert!(llvm_ir.contains("insertvalue { i1, ptr, ptr } undef, i1 1, 0"));
         assert!(!llvm_ir.contains("json_decode_panic"));
         assert!(!llvm_ir.contains("call void @mp_rt_panic"));
     }
