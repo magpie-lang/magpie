@@ -846,7 +846,27 @@ fn execute_binary(path: &str, extra_args: &[String]) -> i32 {
 }
 
 fn execute_with_lli(path: &str, extra_args: &[String]) -> i32 {
-    match Command::new("lli").arg(path).args(extra_args).status() {
+    let mut cmd = Command::new("lli");
+
+    // Load the runtime shared library if available, otherwise try the static lib
+    if let Some(dylib) = find_runtime_dylib() {
+        cmd.arg("-load").arg(&dylib);
+    }
+
+    // Also load any GPU registry .ll files alongside the main .ll
+    let main_path = Path::new(path);
+    if let Some(parent) = main_path.parent() {
+        if let Some(stem) = main_path.file_stem().and_then(|s| s.to_str()) {
+            let gpu_registry = parent.join(format!("{}.gpu_registry.ll", stem));
+            if gpu_registry.exists() {
+                cmd.arg("-extra-module").arg(&gpu_registry);
+            }
+        }
+    }
+
+    cmd.arg(path).args(extra_args);
+
+    match cmd.status() {
         Ok(status) => status.code().unwrap_or(1),
         Err(err) => {
             eprintln!("Error: could not execute program: {}", err);
@@ -854,6 +874,30 @@ fn execute_with_lli(path: &str, extra_args: &[String]) -> i32 {
             1
         }
     }
+}
+
+fn find_runtime_dylib() -> Option<String> {
+    let search_paths = [
+        "target/debug",
+        "target/release",
+    ];
+    let dylib_names = if cfg!(target_os = "macos") {
+        vec!["libmagpie_rt.dylib"]
+    } else if cfg!(target_os = "windows") {
+        vec!["magpie_rt.dll"]
+    } else {
+        vec!["libmagpie_rt.so"]
+    };
+
+    for dir in &search_paths {
+        for name in &dylib_names {
+            let path = Path::new(dir).join(name);
+            if path.exists() {
+                return Some(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
 }
 
 fn parse_csv(value: &str) -> Vec<String> {

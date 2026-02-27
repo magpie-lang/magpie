@@ -990,14 +990,21 @@ impl<'a, 'd> Parser<'a, 'd> {
             TokenKind::GetField => {
                 self.advance();
                 self.expect(TokenKind::LBrace);
-                self.expect_key("obj");
-                self.expect(TokenKind::Eq);
-                let obj = self.parse_value_ref(None)?;
-                self.expect(TokenKind::Comma);
-                self.expect_key("field");
-                self.expect(TokenKind::Eq);
-                let field = self.parse_ident().unwrap_or_default();
+                let mut obj = None;
+                let mut field = None;
+                while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                    let key = self.parse_ident().unwrap_or_default();
+                    self.expect(TokenKind::Eq);
+                    match key.as_str() {
+                        "obj" => obj = self.parse_value_ref(None),
+                        "field" => field = Some(self.parse_ident().unwrap_or_default()),
+                        _ => { self.error_here(format!("Unknown key `{}` in getfield", key)); break; }
+                    }
+                    self.eat(TokenKind::Comma);
+                }
                 self.expect(TokenKind::RBrace);
+                let obj = obj.or_else(|| { self.error_here("Missing key `obj` in getfield"); None })?;
+                let field = field.unwrap_or_else(|| { self.error_here("Missing key `field` in getfield"); String::new() });
                 Some(AstOp::GetField { obj, field })
             }
 
@@ -1572,18 +1579,24 @@ impl<'a, 'd> Parser<'a, 'd> {
             TokenKind::SetField => {
                 self.advance();
                 self.expect(TokenKind::LBrace);
-                self.expect_key("obj");
-                self.expect(TokenKind::Eq);
-                let obj = self.parse_value_ref(None)?;
-                self.expect(TokenKind::Comma);
-                self.expect_key("field");
-                self.expect(TokenKind::Eq);
-                let field = self.parse_ident().unwrap_or_default();
-                self.expect(TokenKind::Comma);
-                self.expect_key("val");
-                self.expect(TokenKind::Eq);
-                let val = self.parse_value_ref(None)?;
+                let mut obj = None;
+                let mut field = None;
+                let mut val = None;
+                while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                    let key = self.parse_ident().unwrap_or_default();
+                    self.expect(TokenKind::Eq);
+                    match key.as_str() {
+                        "obj" => obj = self.parse_value_ref(None),
+                        "field" => field = Some(self.parse_ident().unwrap_or_default()),
+                        "val" => val = self.parse_value_ref(None),
+                        _ => { self.error_here(format!("Unknown key `{}` in setfield", key)); break; }
+                    }
+                    self.eat(TokenKind::Comma);
+                }
                 self.expect(TokenKind::RBrace);
+                let obj = obj.or_else(|| { self.error_here("Missing key `obj` in setfield"); None })?;
+                let field = field.unwrap_or_else(|| { self.error_here("Missing key `field` in setfield"); String::new() });
+                let val = val.or_else(|| { self.error_here("Missing key `val` in setfield"); None })?;
                 Some(AstOpVoid::SetField { obj, field, val })
             }
             TokenKind::Panic => {
@@ -2067,7 +2080,32 @@ impl<'a, 'd> Parser<'a, 'd> {
     }
 
     fn parse_const_expr_with_hint(&mut self, hint: Option<AstType>) -> Option<AstConstExpr> {
-        self.expect(TokenKind::ConstOp);
+        let const_tok = self.expect(TokenKind::ConstOp);
+
+        // Extract type suffix from `const.i32`, `const.f64`, `const.Str`, etc.
+        let suffix_type = const_tok.as_ref().and_then(|tok| {
+            let suffix = tok.text.as_str();
+            if suffix.is_empty() {
+                None
+            } else if is_prim_type(suffix) {
+                Some(AstType {
+                    ownership: None,
+                    base: AstBaseType::Prim(suffix.to_string()),
+                })
+            } else if suffix == "Str" {
+                Some(AstType {
+                    ownership: None,
+                    base: AstBaseType::Builtin(AstBuiltinType::Str),
+                })
+            } else if suffix == "bool" {
+                Some(AstType {
+                    ownership: None,
+                    base: AstBaseType::Prim("bool".to_string()),
+                })
+            } else {
+                None
+            }
+        });
 
         let explicit_type = if self.const_expr_has_inline_type() {
             self.parse_type_node()
@@ -2077,6 +2115,7 @@ impl<'a, 'd> Parser<'a, 'd> {
 
         let lit = self.parse_const_lit()?;
         let ty = explicit_type
+            .or(suffix_type)
             .or(hint)
             .unwrap_or_else(|| self.infer_const_type(&lit));
         Some(AstConstExpr { ty, lit })
@@ -2214,11 +2253,42 @@ impl<'a, 'd> Parser<'a, 'd> {
 
     fn parse_module_path(&mut self) -> Option<ModulePath> {
         let mut segments = Vec::new();
-        segments.push(self.parse_ident()?);
+        segments.push(self.parse_ident_or_keyword()?);
         while self.eat(TokenKind::Dot).is_some() {
-            segments.push(self.parse_ident()?);
+            segments.push(self.parse_ident_or_keyword()?);
         }
         Some(ModulePath { segments })
+    }
+
+    /// Accept an identifier or a keyword token as a name (for module paths where
+    /// keywords like `async` may appear as segments).
+    fn parse_ident_or_keyword(&mut self) -> Option<String> {
+        let kind = self.peek().kind;
+        match kind {
+            TokenKind::Ident => Some(self.advance().text),
+            _ if Self::keyword_as_ident(kind).is_some() => {
+                self.advance();
+                Some(Self::keyword_as_ident(kind).unwrap().to_string())
+            }
+            _ => {
+                self.error_here("Expected identifier.");
+                None
+            }
+        }
+    }
+
+    fn keyword_as_ident(kind: TokenKind) -> Option<&'static str> {
+        match kind {
+            TokenKind::Async => Some("async"),
+            TokenKind::Unsafe => Some("unsafe"),
+            TokenKind::Gpu => Some("gpu"),
+            TokenKind::Target => Some("target"),
+            TokenKind::Heap => Some("heap"),
+            TokenKind::Value => Some("value"),
+            TokenKind::Fn => Some("fn"),
+            TokenKind::Meta => Some("meta"),
+            _ => None,
+        }
     }
 
     fn parse_fn_name(&mut self) -> Option<String> {
@@ -2756,10 +2826,10 @@ mod tests {
             ast.header.node.module_path.node.segments,
             vec!["test", "collections"]
         );
-        // 2 impl + 2 fn
-        assert_eq!(ast.decls.len(), 4);
-        assert!(matches!(ast.decls[0].node, AstDecl::Impl(_)));
-        assert!(matches!(ast.decls[1].node, AstDecl::Impl(_)));
+        // 2 fn (Str has built-in hash/eq impls)
+        assert_eq!(ast.decls.len(), 2);
+        assert!(matches!(ast.decls[0].node, AstDecl::Fn(_)));
+        assert!(matches!(ast.decls[1].node, AstDecl::Fn(_)));
     }
 
     #[test]
@@ -2769,8 +2839,11 @@ mod tests {
             ast.header.node.module_path.node.segments,
             vec!["test", "async_example"]
         );
-        assert_eq!(ast.decls.len(), 1);
-        assert!(matches!(ast.decls[0].node, AstDecl::AsyncFn(_)));
+        // 2 helper fns + 1 async fn
+        assert_eq!(ast.decls.len(), 3);
+        assert!(matches!(ast.decls[0].node, AstDecl::Fn(_)));
+        assert!(matches!(ast.decls[1].node, AstDecl::Fn(_)));
+        assert!(matches!(ast.decls[2].node, AstDecl::AsyncFn(_)));
     }
 
     #[test]

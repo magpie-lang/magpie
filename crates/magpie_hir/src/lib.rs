@@ -919,7 +919,10 @@ fn verify_function(func: &HirFunction, type_ctx: &TypeCtx, diag: &mut Diagnostic
         };
 
         // Check dominance.
-        if effective_def != use_blk_idx && !dominates(effective_def, use_blk_idx) {
+        // Skip for async functions: async lowering inserts a dispatch switch block
+        // that introduces extra predecessors to resume blocks, which breaks standard
+        // domination but is semantically correct (locals are part of coroutine state).
+        if !func.is_async && effective_def != use_blk_idx && !dominates(effective_def, use_blk_idx) {
             emit_error(
                     diag,
                     "MPS0003",

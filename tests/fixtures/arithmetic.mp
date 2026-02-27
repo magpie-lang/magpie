@@ -1,16 +1,16 @@
 module test.arithmetic
 exports { @add, @checked_add }
 imports { }
-digest "0000000000000000"
+digest "191ba41acdc8e7e544162b0c7d87738c9ca4c65c00b59098bb7ce18de0786c58"
 
-fn @add(%a: i32, %b: i32) -> i32 {
-bb0:
-  %sum: i32 = i.add { lhs=%a, rhs=%b }
-  ret %sum
+fn @add(%a: i32, %b: i32) -> i32 meta { } {
+  bb0:
+    %sum: i32 = i.add { lhs=%a, rhs=%b }
+    ret %sum
 }
 
-fn @checked_add(%a: i32, %b: i32) -> TOption<i32> {
-bb0:
-  %result: TOption<i32> = i.add.checked { lhs=%a, rhs=%b }
-  ret %result
+fn @checked_add(%a: i32, %b: i32) -> TOption<i32> meta { } {
+  bb0:
+    %result: TOption<i32> = i.add.checked { lhs=%a, rhs=%b }
+    ret %result
 }

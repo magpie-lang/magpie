@@ -528,10 +528,11 @@ impl<'a> Lexer<'a> {
                 }
                 if dotted.starts_with("const.") {
                     self.pos = dotted_end;
+                    let suffix = &dotted["const.".len()..];
                     return Token::new(
                         TokenKind::ConstOp,
                         self.span(start, self.pos),
-                        String::new(),
+                        suffix.to_string(),
                     );
                 }
             }

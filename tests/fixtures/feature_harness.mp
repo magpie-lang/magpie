@@ -26,13 +26,13 @@ fn @exercise_struct_fields() -> i64 meta { } {
     %y0: i64 = const.i64 20
     %p: TPoint = new TPoint { x=%x0, y=%y0 }
     %pm: mutborrow TPoint = borrow.mut { v=%p }
-    setfield { obj=%pm, field=y, val=const.i64 22 }
+    setfield { field=y, obj=%pm, val=const.i64 22 }
     br bb1
 
   bb1:
     %pb: borrow TPoint = borrow.shared { v=%p }
-    %x1: i64 = getfield { obj=%pb, field=x }
-    %y1: i64 = getfield { obj=%pb, field=y }
+    %x1: i64 = getfield { field=x, obj=%pb }
+    %y1: i64 = getfield { field=y, obj=%pb }
     %s: i64 = i.add { lhs=%x1, rhs=%y1 }
     ret %s
 }
@@ -67,7 +67,7 @@ fn @exercise_collections() -> i64 meta { } {
     arr.push { arr=%arr, val=const.i64 1 }
     arr.push { arr=%arr, val=const.i64 2 }
     arr.sort { arr=%arr }
-    map.set { map=%m, key=const.i64 1, val=const.i64 7 }
+    map.set { key=const.i64 1, map=%m, val=const.i64 7 }
     br bb1
 
   bb1:
@@ -75,7 +75,7 @@ fn @exercise_collections() -> i64 meta { } {
     %contains: bool = arr.contains { arr=%arr_b, val=const.i64 2 }
     %len: i64 = arr.len { arr=%arr_b }
     %m_b: borrow Map<i64, i64> = borrow.shared { v=%m }
-    %has: bool = map.contains_key { map=%m_b, key=const.i64 1 }
+    %has: bool = map.contains_key { key=const.i64 1, map=%m_b }
     %mlen: i64 = map.len { map=%m_b }
     %r0: i64 = i.add { lhs=%len, rhs=%mlen }
     ret %r0
