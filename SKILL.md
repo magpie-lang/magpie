@@ -80,12 +80,13 @@ Binary-only triage loop:
 
 Core commands:
 
+- CLI rule: place global flags before the subcommand (e.g., `magpie --entry src/main.mp --output json build`).
 - Build:
-  - `cargo run -p magpie_cli -- build --entry <path> --emit <kinds>`
+  - `cargo run -p magpie_cli -- --entry <path> --emit <kinds> build`
 - Run:
-  - `cargo run -p magpie_cli -- run --entry <path> --emit <kinds>`
+  - `cargo run -p magpie_cli -- --entry <path> --emit <kinds> run`
 - Parse only:
-  - `cargo run -p magpie_cli -- parse --entry <path>`
+  - `cargo run -p magpie_cli -- --entry <path> parse`
 - Test crate:
   - `cargo test -p <crate>`
 - Integration fixtures:
@@ -729,9 +730,9 @@ Do not skip intermediate layers; partial implementation causes stage-mismatch re
 ## 13.2 End-to-end compile/run
 
 - Build fixture with multiple emits:
-  - `cargo run -p magpie_cli -- build --entry tests/fixtures/feature_harness.mp --emit mpir,llvm-ir,mpdbg,exe`
+  - `cargo run -p magpie_cli -- --entry tests/fixtures/feature_harness.mp --emit mpir,llvm-ir,mpdbg,exe build`
 - Run:
-  - `cargo run -p magpie_cli -- run --entry tests/fixtures/feature_harness.mp`
+  - `cargo run -p magpie_cli -- --entry tests/fixtures/feature_harness.mp run`
 
 ## 13.3 Regression expectations
 
@@ -968,7 +969,7 @@ Use this whenever you only have the compiler binary.
 ### 20.0 Rapid workflow for any code
 
 1. Reproduce:
-   - `magpie build --entry <file.mp> --output json --emit mpir,llvm-ir,mpdbg`
+   - `magpie --entry <file.mp> --output json --emit mpir,llvm-ir,mpdbg build`
 2. Explain:
    - `magpie explain <CODE>`
 3. Apply minimal fix.
@@ -982,7 +983,7 @@ For each code below, **Bad** is a minimal failing pattern and **Fix** is the sma
 
 Bad:
 ```bash
-magpie build --entry ./missing/main.mp
+magpie --entry ./missing/main.mp build
 ```
 
 Fix:
@@ -999,7 +1000,7 @@ bb0:
   ret const.i64 0
 }
 MP
-magpie build --entry ./src/main.mp
+magpie --entry ./src/main.mp build
 ```
 
 #### MPP0002 — Syntax/tokenization error
@@ -1036,14 +1037,14 @@ bb0:
 
 Bad:
 ```bash
-magpie build --entry src/main.mp --emit llvm-ir --output json
+magpie --entry src/main.mp --emit llvm-ir --output json build
 # writing artifact fails due to unwritable destination/disk issues
 ```
 
 Fix:
 ```bash
 # ensure writable working/output dirs and free disk, then rebuild
-magpie build --entry src/main.mp --emit llvm-ir --output json
+magpie --entry src/main.mp --emit llvm-ir --output json build
 ```
 
 ### 20.2 Resolve / SSA / unsafe-context codes (MPS*)
@@ -1924,25 +1925,25 @@ extern "c" module ffi {
 
 Bad:
 ```bash
-magpie build --entry src/main.mp --emit foo
+magpie --entry src/main.mp --emit foo build
 ```
 
 Fix:
 ```bash
-magpie build --entry src/main.mp --emit exe,llvm-ir,mpir
+magpie --entry src/main.mp --emit exe,llvm-ir,mpir build
 ```
 
 #### MPL0002 — requested artifact missing
 
 Bad:
 ```bash
-magpie build --entry src/main.mp --emit exe,shared-lib
+magpie --entry src/main.mp --emit exe,shared-lib build
 # build reports success path issue but one requested artifact absent
 ```
 
 Fix:
 ```bash
-magpie build --entry src/main.mp --emit exe --output json
+magpie --entry src/main.mp --emit exe --output json build
 # resolve upstream codegen/link errors until requested artifact exists
 ```
 
@@ -1950,12 +1951,12 @@ magpie build --entry src/main.mp --emit exe --output json
 
 Bad:
 ```bash
-magpie build --entry src/main.mp --llm --llm-token-budget 100
+magpie --entry src/main.mp --llm --llm-token-budget 100 build
 ```
 
 Fix:
 ```bash
-magpie build --entry src/main.mp --llm --llm-token-budget 12000
+magpie --entry src/main.mp --llm --llm-token-budget 12000 build
 # or use --llm-budget-policy minimal
 ```
 
@@ -1963,12 +1964,12 @@ magpie build --entry src/main.mp --llm --llm-token-budget 12000
 
 Bad:
 ```bash
-magpie build --entry src/main.mp --llm --llm-tokenizer custom:missing
+magpie --entry src/main.mp --llm --llm-tokenizer custom:missing build
 ```
 
 Fix:
 ```bash
-magpie build --entry src/main.mp --llm --llm-tokenizer approx:utf8_4chars
+magpie --entry src/main.mp --llm --llm-tokenizer approx:utf8_4chars build
 ```
 
 #### MPL2001 / MPL2002 / MPL2003 / MPL2005 / MPL2007 / MPL2020 / MPL2021
@@ -1989,28 +1990,28 @@ Fix patterns:
 
 Bad:
 ```bash
-magpie build --entry src/main.mp --emit exe
+magpie --entry src/main.mp --emit exe build
 # native link toolchain missing/misconfigured
 ```
 
 Fix:
 ```bash
 # install/repair linker toolchain for target triple, then rebuild
-magpie build --entry src/main.mp --emit exe
+magpie --entry src/main.mp --emit exe build
 ```
 
 #### MPLINK02 — fallback link also unavailable
 
 Bad:
 ```bash
-magpie build --entry src/main.mp --emit exe
+magpie --entry src/main.mp --emit exe build
 ```
 
 Fix:
 ```bash
 # ensure clang/llc/system linker availability for target
 # until fixed, use --emit llvm-ir,mpir for non-native debugging
-magpie build --entry src/main.mp --emit llvm-ir,mpir
+magpie --entry src/main.mp --emit llvm-ir,mpir build
 ```
 
 ### 20.8 MPIR pipeline code
@@ -2019,14 +2020,14 @@ magpie build --entry src/main.mp --emit llvm-ir,mpir
 
 Bad pattern:
 ```bash
-magpie build --entry src/main.mp --emit mpir
+magpie --entry src/main.mp --emit mpir build
 # lowering receives empty resolved module set
 ```
 
 Fix pattern:
 ```bash
 # verify entry file parses/resolves and exports expected module/function symbols
-magpie build --entry src/main.mp --emit mpir --output json
+magpie --entry src/main.mp --emit mpir --output json build
 ```
 
 ### 20.9 Family fallback for codes not listed above
