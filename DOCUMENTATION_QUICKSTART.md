@@ -934,6 +934,11 @@ bb0:
 }
 ```
 
+Compatibility note:
+- `str.parse_*` is currently exposed in source as value-producing ops for compatibility.
+- Under the hood, runtime ABI calls are now fallible (`mp_rt_str_try_parse_*` / `mp_rt_json_try_*`) with explicit status checks in codegen.
+- Legacy runtime wrappers (`mp_rt_str_parse_*`, `mp_rt_json_encode`, `mp_rt_json_decode`) are deprecated temporary shims and are planned for removal after migration.
+
 String opcodes:
 
 | Opcode | Description |
@@ -1275,6 +1280,14 @@ setfield { field=x, obj=%pm, val=const.i64 5 }
 | `MPK*` | Package / Dependency | Manifest errors, missing dependency |
 | `MPM*` | Memory / Index | Memory index query failures |
 | `MPHIR*` | HIR invariants | Internal HIR structural violations |
+
+### Parse/JSON migration diagnostics
+
+| Code | Meaning |
+|---|---|
+| `MPT2033` | Parse/JSON result type shape is invalid (expected legacy or `TResult<ok, err>`) |
+| `MPT2034` | Parse/JSON input is not `Str`/`borrow Str` (or input type is unknown) |
+| `MPT2035` | `json.encode<T>` value type does not match `T` (or value type is unknown) |
 
 ### Fast diagnostic loop
 

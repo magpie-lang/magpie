@@ -36,7 +36,7 @@ High-level crates:
 - `crates/magpie_pkg`, `magpie_memory`, `magpie_ctx`, `magpie_web`, `magpie_gpu` — tooling and platform subsystems
 
 Other important paths:
-- `tests/fixtures/` — language fixture programs, including `feature_harness.mp`
+- `tests/fixtures/` — language fixture programs, including `feature_harness.mp` and `tresult_parse_json.mp`
 - `std/` — standard library modules used by Magpie projects
 - `DOCUMENTATION.md` — full technical documentation
 - `DOCUMENTATION_QUICKSTART.md` — fast command reference
@@ -187,11 +187,20 @@ Top-level commands in `magpie`:
 - `ffi import`
 - `graph` (`symbols`, `deps`, `ownership`, `cfg`)
 
+## Parse/JSON migration note
+
+Parse and JSON runtime ABI now has dual APIs:
+- Preferred: fallible `*_try_*` symbols (`mp_rt_str_try_parse_*`, `mp_rt_json_try_*`) that return status codes.
+- Legacy: `mp_rt_str_parse_*`, `mp_rt_json_encode`, `mp_rt_json_decode` are deprecated compatibility wrappers.
+
+At source level, compatibility value-style ops still exist, and `TResult` parse/json fixtures are included for end-to-end coverage.
+
 ## Feature harness program
 
 A broad language feature harness is included at:
 
 - `tests/fixtures/feature_harness.mp`
+- `tests/fixtures/tresult_parse_json.mp`
 
 Build it:
 

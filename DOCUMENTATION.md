@@ -414,6 +414,11 @@ All use:
 - `str.parse_i64`, `str.parse_u64`, `str.parse_f64`, `str.parse_bool`
 - `json.encode<T>`, `json.decode<T>`
 
+Runtime ABI note (current migration model):
+- Compiler lowering uses fallible runtime calls (`mp_rt_str_try_parse_*`, `mp_rt_json_try_*`) and checks status codes.
+- In the temporary compatibility path, non-OK status still routes to `mp_rt_panic` to preserve legacy user-visible behavior.
+- Legacy runtime wrappers (`mp_rt_str_parse_*`, `mp_rt_json_encode/decode`) are compatibility shims and are deprecated. New integrations should call only `*_try_*` APIs.
+
 ### GPU values
 - `gpu.thread_id`, `gpu.workgroup_id`, `gpu.workgroup_size`, `gpu.global_id`
 - `gpu.buffer_load<T>`, `gpu.buffer_len<T>`
@@ -869,6 +874,14 @@ Common code families:
 - `MPW*` web
 - `MPK*` package/dependency
 - `MPM*` memory/index
+
+Parse/JSON sema diagnostics (migration-focused):
+
+| Code | Meaning | Trigger |
+|---|---|---|
+| `MPT2033` | Parse/JSON result shape mismatch | Result type is neither legacy shape nor `TResult<ok, err>` shape expected by the opcode |
+| `MPT2034` | Parse/JSON input type mismatch | Parse/decode input is unknown or not `Str` / `borrow Str` |
+| `MPT2035` | `json.encode<T>` value type mismatch | Encoded value type does not match generic target `T` (or value type is unknown) |
 
 Explain command:
 
@@ -1361,6 +1374,10 @@ gpu.shared<count, T>
 gpu.launch { device=V, kernel=@fn, grid=Arg, block=Arg, args=Arg }
 gpu.launch_async { device=V, kernel=@fn, grid=Arg, block=Arg, args=Arg }
 ```
+
+Compatibility note:
+- The source op names above are stable.
+- Internally, parse/json codegen now targets `*_try_*` runtime symbols with explicit status branching at the ABI boundary.
 
 ---
 
