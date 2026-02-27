@@ -181,6 +181,7 @@ impl<'a> LlvmTextCodegen<'a> {
             "declare i32 @mp_rt_str_cmp(ptr, ptr)",
             "declare ptr @mp_rt_str_slice(ptr, i64, i64)",
             "declare ptr @mp_rt_str_bytes(ptr, ptr)",
+            "declare ptr @mp_rt_str_from_utf8(ptr, i64)",
             "declare i64 @mp_std_hash_str(ptr)",
             "declare i64 @mp_rt_bytes_hash(ptr, i64)",
             "declare i32 @mp_rt_bytes_eq(ptr, ptr, i64)",
@@ -790,7 +791,10 @@ impl<'a> FnBuilder<'a> {
         let dst = format!("%l{}", i.dst.0);
         match &i.op {
             MpirOp::Const(c) => {
-                let lit = self.const_lit(c)?;
+                let lit = match &c.lit {
+                    HirConstLit::StringLit(s) => self.emit_string_literal_runtime(s)?,
+                    _ => self.const_lit(c)?,
+                };
                 self.locals.insert(
                     i.dst.0,
                     Operand {
@@ -1828,12 +1832,7 @@ impl<'a> FnBuilder<'a> {
         let dst_name = format!("%l{}", dst.0);
         let expect = self.cg.llvm_ty(dst_ty);
         if expect == pair_ty {
-            writeln!(
-                self.out,
-                "  {dst_name} = add {pair_ty} {call_tmp}, zeroinitializer"
-            )
-            .map_err(|e| e.to_string())?;
-            self.set_local(dst, dst_ty, expect, dst_name);
+            self.set_local(dst, dst_ty, expect, call_tmp);
             return Ok(());
         }
         let val_tmp = self.tmp();
@@ -3461,7 +3460,7 @@ impl<'a> FnBuilder<'a> {
         Ok(())
     }
 
-    fn value(&self, v: &MpirValue) -> Result<Operand, String> {
+    fn value(&mut self, v: &MpirValue) -> Result<Operand, String> {
         match v {
             MpirValue::Local(id) => self.locals.get(&id.0).cloned().ok_or_else(|| {
                 let ty = self
@@ -3471,12 +3470,55 @@ impl<'a> FnBuilder<'a> {
                     .unwrap_or_default();
                 format!("undefined local %{} in fn '{}'{}", id.0, self.f.name, ty)
             }),
-            MpirValue::Const(c) => Ok(Operand {
-                ty: self.cg.llvm_ty(c.ty),
-                ty_id: c.ty,
-                repr: self.const_lit(c)?,
-            }),
+            MpirValue::Const(c) => {
+                let repr = match &c.lit {
+                    HirConstLit::StringLit(s) => self.emit_string_literal_runtime(s)?,
+                    _ => self.const_lit(c)?,
+                };
+                Ok(Operand {
+                    ty: self.cg.llvm_ty(c.ty),
+                    ty_id: c.ty,
+                    repr,
+                })
+            }
         }
+    }
+
+    fn emit_string_literal_runtime(&mut self, s: &str) -> Result<String, String> {
+        if s.is_empty() {
+            let dst = self.tmp();
+            writeln!(
+                self.out,
+                "  {dst} = call ptr @mp_rt_str_from_utf8(ptr null, i64 0)"
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(dst);
+        }
+
+        let bytes = s.as_bytes();
+        let arr_ty = format!("[{} x i8]", bytes.len());
+        let arr_lit = llvm_bytes_literal(bytes);
+
+        let slot = self.tmp();
+        writeln!(self.out, "  {slot} = alloca {arr_ty}").map_err(|e| e.to_string())?;
+        writeln!(self.out, "  store {arr_ty} c\"{arr_lit}\", ptr {slot}")
+            .map_err(|e| e.to_string())?;
+
+        let data_ptr = self.tmp();
+        writeln!(
+            self.out,
+            "  {data_ptr} = getelementptr inbounds {arr_ty}, ptr {slot}, i64 0, i64 0"
+        )
+        .map_err(|e| e.to_string())?;
+
+        let dst = self.tmp();
+        writeln!(
+            self.out,
+            "  {dst} = call ptr @mp_rt_str_from_utf8(ptr {data_ptr}, i64 {})",
+            bytes.len()
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(dst)
     }
 
     fn const_lit(&self, c: &HirConst) -> Result<String, String> {
@@ -3781,6 +3823,13 @@ fn llvm_c_string_literal(s: &str) -> (usize, String) {
         .map(|b| format!("\\{:02X}", b))
         .collect::<String>();
     (bytes.len(), encoded)
+}
+
+fn llvm_bytes_literal(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("\\{:02X}", b))
+        .collect::<String>()
 }
 
 fn llvm_quote(s: &str) -> String {
@@ -4674,6 +4723,102 @@ mod tests {
 
         let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
         assert!(llvm_ir.contains("define { i1, i8, ptr }"));
+    }
+
+    #[test]
+    fn test_codegen_checked_add_option_does_not_emit_invalid_aggregate_add() {
+        let mut type_ctx = TypeCtx::new();
+        let i64_ty = type_ctx.lookup_by_prim(PrimType::I64);
+        let opt_i64_ty = type_ctx.intern(TypeKind::BuiltinOption { inner: i64_ty });
+
+        let module = MpirModule {
+            sid: Sid("M:CHECKEDOPT0".to_string()),
+            path: "checked_opt.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:CHECKEDOPT0".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: opt_i64_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![MpirInstr {
+                        dst: magpie_types::LocalId(0),
+                        ty: opt_i64_ty,
+                        op: MpirOp::IAddChecked {
+                            lhs: MpirValue::Const(HirConst {
+                                ty: i64_ty,
+                                lit: HirConstLit::IntLit(1),
+                            }),
+                            rhs: MpirValue::Const(HirConst {
+                                ty: i64_ty,
+                                lit: HirConstLit::IntLit(2),
+                            }),
+                        },
+                    }],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        0,
+                    )))),
+                }],
+                locals: vec![MpirLocalDecl {
+                    id: magpie_types::LocalId(0),
+                    ty: opt_i64_ty,
+                    name: "sum".to_string(),
+                }],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("@llvm.sadd.with.overflow.i64"));
+        assert!(!llvm_ir.contains("add { i64, i1 }"));
+    }
+
+    #[test]
+    fn test_codegen_const_str_materializes_runtime_string() {
+        let type_ctx = TypeCtx::new();
+        let str_ty = fixed_type_ids::STR;
+
+        let module = MpirModule {
+            sid: Sid("M:STRCONST00".to_string()),
+            path: "str_const.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:STRCONST00".to_string()),
+                name: "make".to_string(),
+                params: vec![],
+                ret_ty: str_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![MpirInstr {
+                        dst: magpie_types::LocalId(0),
+                        ty: str_ty,
+                        op: MpirOp::Const(HirConst {
+                            ty: str_ty,
+                            lit: HirConstLit::StringLit("hello".to_string()),
+                        }),
+                    }],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        0,
+                    )))),
+                }],
+                locals: vec![MpirLocalDecl {
+                    id: magpie_types::LocalId(0),
+                    ty: str_ty,
+                    name: "s".to_string(),
+                }],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("declare ptr @mp_rt_str_from_utf8(ptr, i64)"));
+        assert!(llvm_ir.contains("alloca [5 x i8]"));
+        assert!(llvm_ir.contains("call ptr @mp_rt_str_from_utf8"));
     }
 
     #[test]
