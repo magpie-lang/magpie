@@ -4055,6 +4055,121 @@ pub fn typecheck_module(
                             );
                         }
                     }
+                    HirOp::StrParseI64 { s } => {
+                        sema_check_parse_op_shape(
+                            "str.parse_i64",
+                            instr.ty,
+                            fixed_type_ids::I64,
+                            s,
+                            &local_types,
+                            type_ctx,
+                            diag,
+                        );
+                    }
+                    HirOp::StrParseU64 { s } => {
+                        sema_check_parse_op_shape(
+                            "str.parse_u64",
+                            instr.ty,
+                            fixed_type_ids::U64,
+                            s,
+                            &local_types,
+                            type_ctx,
+                            diag,
+                        );
+                    }
+                    HirOp::StrParseF64 { s } => {
+                        sema_check_parse_op_shape(
+                            "str.parse_f64",
+                            instr.ty,
+                            fixed_type_ids::F64,
+                            s,
+                            &local_types,
+                            type_ctx,
+                            diag,
+                        );
+                    }
+                    HirOp::StrParseBool { s } => {
+                        sema_check_parse_op_shape(
+                            "str.parse_bool",
+                            instr.ty,
+                            fixed_type_ids::BOOL,
+                            s,
+                            &local_types,
+                            type_ctx,
+                            diag,
+                        );
+                    }
+                    HirOp::JsonEncode { ty, v } => {
+                        let Some(v_ty) = sema_value_type(v, &local_types) else {
+                            emit_error(
+                                diag,
+                                "MPT2035",
+                                None,
+                                "json.encode value has unknown type.".to_string(),
+                            );
+                            continue;
+                        };
+                        if v_ty != *ty {
+                            emit_error(
+                                diag,
+                                "MPT2035",
+                                None,
+                                format!(
+                                    "json.encode<T> requires value type T (expected {}, got {}).",
+                                    type_id_str(*ty, type_ctx),
+                                    type_id_str(v_ty, type_ctx)
+                                ),
+                            );
+                        }
+
+                        if !sema_is_legacy_or_result_shape(instr.ty, fixed_type_ids::STR, type_ctx)
+                        {
+                            emit_error(
+                                diag,
+                                "MPT2033",
+                                None,
+                                format!(
+                                    "json.encode result type must be Str (legacy) or TResult<Str, E>; got {}.",
+                                    type_id_str(instr.ty, type_ctx)
+                                ),
+                            );
+                        }
+                    }
+                    HirOp::JsonDecode { ty, s } => {
+                        let Some(src_ty) = sema_value_type(s, &local_types) else {
+                            emit_error(
+                                diag,
+                                "MPT2034",
+                                None,
+                                "json.decode input has unknown type.".to_string(),
+                            );
+                            continue;
+                        };
+                        if !sema_is_str_handle(src_ty, type_ctx) {
+                            emit_error(
+                                diag,
+                                "MPT2034",
+                                None,
+                                format!(
+                                    "json.decode input must be Str/borrow Str, got {}.",
+                                    type_id_str(src_ty, type_ctx)
+                                ),
+                            );
+                        }
+
+                        if !sema_is_legacy_or_result_rawptr_shape(instr.ty, type_ctx) {
+                            emit_error(
+                                diag,
+                                "MPT2033",
+                                None,
+                                format!(
+                                    "json.decode<T> result type must be rawptr<...> (legacy) or TResult<rawptr<...>, E>; got {} (decode target T is {}).",
+                                    type_id_str(instr.ty, type_ctx),
+                                    type_id_str(*ty, type_ctx)
+                                ),
+                            );
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -4343,6 +4458,87 @@ fn sema_value_type(v: &HirValue, locals: &HashMap<LocalId, TypeId>) -> Option<Ty
 
 fn sema_is_primitive_type(ty: TypeId, type_ctx: &TypeCtx) -> bool {
     matches!(type_ctx.lookup(ty), Some(TypeKind::Prim(_)))
+}
+
+fn sema_is_str_handle(ty: TypeId, type_ctx: &TypeCtx) -> bool {
+    matches!(
+        type_ctx.lookup(ty),
+        Some(TypeKind::HeapHandle {
+            base: HeapBase::BuiltinStr,
+            ..
+        })
+    )
+}
+
+fn sema_is_legacy_or_result_shape(dst_ty: TypeId, expected_ok: TypeId, type_ctx: &TypeCtx) -> bool {
+    if dst_ty == expected_ok {
+        return true;
+    }
+    matches!(
+        type_ctx.lookup(dst_ty),
+        Some(TypeKind::BuiltinResult { ok, .. }) if *ok == expected_ok
+    )
+}
+
+fn sema_is_raw_ptr(ty: TypeId, type_ctx: &TypeCtx) -> bool {
+    matches!(type_ctx.lookup(ty), Some(TypeKind::RawPtr { .. }))
+}
+
+fn sema_is_legacy_or_result_rawptr_shape(dst_ty: TypeId, type_ctx: &TypeCtx) -> bool {
+    if sema_is_raw_ptr(dst_ty, type_ctx) {
+        return true;
+    }
+    matches!(
+        type_ctx.lookup(dst_ty),
+        Some(TypeKind::BuiltinResult { ok, .. }) if sema_is_raw_ptr(*ok, type_ctx)
+    )
+}
+
+fn sema_check_parse_op_shape(
+    op_name: &str,
+    dst_ty: TypeId,
+    expected_ok: TypeId,
+    s: &HirValue,
+    local_types: &HashMap<LocalId, TypeId>,
+    type_ctx: &TypeCtx,
+    diag: &mut DiagnosticBag,
+) {
+    let Some(src_ty) = sema_value_type(s, local_types) else {
+        emit_error(
+            diag,
+            "MPT2034",
+            None,
+            format!("{} input has unknown type.", op_name),
+        );
+        return;
+    };
+    if !sema_is_str_handle(src_ty, type_ctx) {
+        emit_error(
+            diag,
+            "MPT2034",
+            None,
+            format!(
+                "{} input must be Str/borrow Str, got {}.",
+                op_name,
+                type_id_str(src_ty, type_ctx)
+            ),
+        );
+    }
+
+    if !sema_is_legacy_or_result_shape(dst_ty, expected_ok, type_ctx) {
+        emit_error(
+            diag,
+            "MPT2033",
+            None,
+            format!(
+                "{} result type must be {} (legacy) or TResult<{}, E>; got {}.",
+                op_name,
+                type_id_str(expected_ok, type_ctx),
+                type_id_str(expected_ok, type_ctx),
+                type_id_str(dst_ty, type_ctx)
+            ),
+        );
+    }
 }
 
 fn sema_check_binary_numeric(
@@ -5344,6 +5540,229 @@ mod tests {
             !diag.diagnostics.iter().any(|d| d.code == "MPF0001"),
             "unexpected MPF0001 diagnostics: {:?}",
             diag.diagnostics
+        );
+    }
+
+    #[test]
+    fn typecheck_str_parse_i64_rejects_invalid_result_type() {
+        let type_ctx = TypeCtx::new();
+        let fn_sid = generate_sid('F', "demo.parse_shape");
+
+        let module = HirModule {
+            module_id: ModuleId(0),
+            sid: generate_sid('M', "demo.parse_shape"),
+            path: "demo.parse_shape".to_string(),
+            functions: vec![HirFunction {
+                fn_id: FnId(0),
+                sid: fn_sid.clone(),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: fixed_type_ids::I32,
+                blocks: vec![HirBlock {
+                    id: BlockId(0),
+                    instrs: vec![
+                        HirInstr {
+                            dst: LocalId(0),
+                            ty: fixed_type_ids::STR,
+                            op: HirOp::Const(HirConst {
+                                ty: fixed_type_ids::STR,
+                                lit: HirConstLit::StringLit("123".to_string()),
+                            }),
+                        },
+                        HirInstr {
+                            dst: LocalId(1),
+                            ty: fixed_type_ids::I32,
+                            op: HirOp::StrParseI64 {
+                                s: HirValue::Local(LocalId(0)),
+                            },
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: HirTerminator::Ret(Some(HirValue::Const(HirConst {
+                        ty: fixed_type_ids::I32,
+                        lit: HirConstLit::IntLit(0),
+                    }))),
+                }],
+                is_async: false,
+                is_unsafe: false,
+            }],
+            globals: vec![],
+            type_decls: vec![],
+        };
+
+        let mut sym = SymbolTable::default();
+        sym.functions.insert(
+            "main".to_string(),
+            FnSymbol {
+                name: "main".to_string(),
+                fqn: "demo.parse_shape.main".to_string(),
+                sid: fn_sid,
+                params: vec![],
+                ret_ty: fixed_type_ids::I32,
+                is_unsafe: false,
+            },
+        );
+
+        let mut diag = DiagnosticBag::new(32);
+        let result = typecheck_module(&module, &type_ctx, &sym, &mut diag);
+        assert!(result.is_err(), "expected parse result shape to be rejected");
+        assert!(
+            diag.diagnostics.iter().any(|d| d.code == "MPT2033"),
+            "expected MPT2033 diagnostics, got {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typecheck_str_parse_i64_accepts_tresult_shape() {
+        let mut type_ctx = TypeCtx::new();
+        let fn_sid = generate_sid('F', "demo.parse_shape_ok");
+        let parse_result_ty = type_ctx.intern(TypeKind::BuiltinResult {
+            ok: fixed_type_ids::I64,
+            err: fixed_type_ids::STR,
+        });
+
+        let module = HirModule {
+            module_id: ModuleId(0),
+            sid: generate_sid('M', "demo.parse_shape_ok"),
+            path: "demo.parse_shape_ok".to_string(),
+            functions: vec![HirFunction {
+                fn_id: FnId(0),
+                sid: fn_sid.clone(),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: fixed_type_ids::I32,
+                blocks: vec![HirBlock {
+                    id: BlockId(0),
+                    instrs: vec![
+                        HirInstr {
+                            dst: LocalId(0),
+                            ty: fixed_type_ids::STR,
+                            op: HirOp::Const(HirConst {
+                                ty: fixed_type_ids::STR,
+                                lit: HirConstLit::StringLit("123".to_string()),
+                            }),
+                        },
+                        HirInstr {
+                            dst: LocalId(1),
+                            ty: parse_result_ty,
+                            op: HirOp::StrParseI64 {
+                                s: HirValue::Local(LocalId(0)),
+                            },
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: HirTerminator::Ret(Some(HirValue::Const(HirConst {
+                        ty: fixed_type_ids::I32,
+                        lit: HirConstLit::IntLit(0),
+                    }))),
+                }],
+                is_async: false,
+                is_unsafe: false,
+            }],
+            globals: vec![],
+            type_decls: vec![],
+        };
+
+        let mut sym = SymbolTable::default();
+        sym.functions.insert(
+            "main".to_string(),
+            FnSymbol {
+                name: "main".to_string(),
+                fqn: "demo.parse_shape_ok.main".to_string(),
+                sid: fn_sid,
+                params: vec![],
+                ret_ty: fixed_type_ids::I32,
+                is_unsafe: false,
+            },
+        );
+
+        let mut diag = DiagnosticBag::new(32);
+        let result = typecheck_module(&module, &type_ctx, &sym, &mut diag);
+        assert!(
+            result.is_ok(),
+            "expected TResult parse shape to pass typecheck: {:?}",
+            diag.diagnostics
+        );
+    }
+
+    #[test]
+    fn typecheck_json_decode_rejects_non_rawptr_result_shape() {
+        let type_ctx = TypeCtx::new();
+        let fn_sid = generate_sid('F', "demo.json_decode_shape");
+
+        let module = HirModule {
+            module_id: ModuleId(0),
+            sid: generate_sid('M', "demo.json_decode_shape"),
+            path: "demo.json_decode_shape".to_string(),
+            functions: vec![HirFunction {
+                fn_id: FnId(0),
+                sid: fn_sid.clone(),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: fixed_type_ids::I32,
+                blocks: vec![HirBlock {
+                    id: BlockId(0),
+                    instrs: vec![
+                        HirInstr {
+                            dst: LocalId(0),
+                            ty: fixed_type_ids::STR,
+                            op: HirOp::Const(HirConst {
+                                ty: fixed_type_ids::STR,
+                                lit: HirConstLit::StringLit("123".to_string()),
+                            }),
+                        },
+                        HirInstr {
+                            dst: LocalId(1),
+                            ty: fixed_type_ids::I32,
+                            op: HirOp::JsonDecode {
+                                ty: fixed_type_ids::I32,
+                                s: HirValue::Local(LocalId(0)),
+                            },
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: HirTerminator::Ret(Some(HirValue::Const(HirConst {
+                        ty: fixed_type_ids::I32,
+                        lit: HirConstLit::IntLit(0),
+                    }))),
+                }],
+                is_async: false,
+                is_unsafe: false,
+            }],
+            globals: vec![],
+            type_decls: vec![],
+        };
+
+        let mut sym = SymbolTable::default();
+        sym.functions.insert(
+            "main".to_string(),
+            FnSymbol {
+                name: "main".to_string(),
+                fqn: "demo.json_decode_shape.main".to_string(),
+                sid: fn_sid,
+                params: vec![],
+                ret_ty: fixed_type_ids::I32,
+                is_unsafe: false,
+            },
+        );
+
+        let mut diag = DiagnosticBag::new(32);
+        let result = typecheck_module(&module, &type_ctx, &sym, &mut diag);
+        assert!(
+            result.is_err(),
+            "expected json.decode non-rawptr result shape to be rejected"
+        );
+        assert!(
+            diag.diagnostics.iter().any(|d| d.code == "MPT2033"),
+            "expected MPT2033 diagnostics, got {:?}",
+            diag.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
         );
     }
 

@@ -255,6 +255,17 @@ fn json_response(status: i32, request_id: &str, body: serde_json::Value) -> TRes
     }
 }
 
+fn route_param_value_is_valid(ty: &RouteParamType, raw: &str) -> bool {
+    match ty {
+        RouteParamType::I32 => raw.parse::<i32>().is_ok(),
+        RouteParamType::I64 => raw.parse::<i64>().is_ok(),
+        RouteParamType::U32 => raw.parse::<u32>().is_ok(),
+        RouteParamType::U64 => raw.parse::<u64>().is_ok(),
+        RouteParamType::Bool => raw.parse::<bool>().is_ok(),
+        RouteParamType::Str => true,
+    }
+}
+
 pub fn dispatch(service: &TService, req: &TRequest, ctx: &TContext) -> TResponse {
     let method = req.method.to_ascii_uppercase();
     let req_path = if req.path.starts_with('/') {
@@ -297,6 +308,27 @@ pub fn dispatch(service: &TService, req: &TRequest, ctx: &TContext) -> TResponse
         };
 
         if let Some(params) = match_route(&pattern, effective_path) {
+            for segment in &pattern.segments {
+                if let RouteSegment::Param { name, ty } = segment {
+                    if let Some(raw) = params.get(name) {
+                        if !route_param_value_is_valid(ty, raw) {
+                            return json_response(
+                                400,
+                                &ctx.request_id,
+                                serde_json::json!({
+                                    "error": "bad_request",
+                                    "message": format!(
+                                        "invalid route param '{}' for type '{}'",
+                                        name,
+                                        route_param_type_name(ty)
+                                    ),
+                                    "request_id": ctx.request_id,
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
             return json_response(
                 200,
                 &ctx.request_id,
@@ -422,6 +454,39 @@ mod tests {
             resp.headers.get("x-request-id").map(String::as_str),
             Some("req-123")
         );
+    }
+
+    #[test]
+    fn dispatch_returns_400_for_typed_route_param_parse_failure() {
+        let service = TService {
+            prefix: "/api".to_string(),
+            routes: vec![TRoute {
+                method: "GET".to_string(),
+                pattern: "/users/{id:u64}".to_string(),
+                handler_name: "get_user".to_string(),
+            }],
+            middleware: Vec::new(),
+        };
+
+        let req = TRequest {
+            method: "GET".to_string(),
+            path: "/api/users/not-a-number".to_string(),
+            ..TRequest::default()
+        };
+        let ctx = TContext {
+            request_id: "req-parse-fail".to_string(),
+            ..TContext::default()
+        };
+
+        let resp = dispatch(&service, &req, &ctx);
+        assert_eq!(resp.status, 400);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body_bytes).expect("response should be JSON");
+        assert_eq!(body["error"], "bad_request");
+        assert!(body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("invalid route param 'id'"));
     }
 
     #[test]
