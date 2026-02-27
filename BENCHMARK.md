@@ -21,7 +21,7 @@
 | **Node.js** | v25.6.1 |
 | **TypeScript** | tsc 5.8.3 |
 | **LLVM** | Homebrew LLVM 21.1.8 (clang backend) |
-| **Date** | 2026-02-27 |
+| **Date** | 2026-02-28 |
 
 ---
 
@@ -33,10 +33,10 @@ All three programs implement **identical computation** across 9 functions:
 Program Flow
 ============
 
-  clamp_score(score)          ──►  Clamp to [0, 100] via branching
+  validate_score(score)       ──►  Validate [0,100] → TResult<i64, Str> / Result / union
   classify_grade(score)       ──►  Grade bucket: A/B/C/F via threshold cascade
   compute_bonus(grade)        ──►  Lookup: A=500, B=300, C=100, F=0
-  eval_employee(name, score)  ──►  Create struct + clamp + classify + bonus + weighted sum
+  eval_employee(name, score)  ──►  Create struct + validate + classify + bonus + weighted sum
   roster_stats()              ──►  Array push × 5, sort, contains check, length
   grade_distribution(g1..g5)  ──►  Map set × 5, unique key count
   ownership_demo()            ──►  Struct → share → clone × 2
