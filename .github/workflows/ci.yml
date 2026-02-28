@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Formatting check
+        run: cargo fmt --all -- --check
+
+      - name: Build workspace
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --locked
+
+      - name: CLI help smoke test
+        run: cargo run -p magpie_cli -- --help
+
+      - name: CLI compile smoke test (no native link required)
+        run: |
+          cargo run -p magpie_cli -- \
+            --entry tests/fixtures/hello.mp \
+            --emit mpir,llvm-ir \
+            --output json \
+            build
