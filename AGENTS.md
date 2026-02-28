@@ -74,7 +74,6 @@ Diagnostic triage rule:
 
 Runtime/FFI risk gate:
 - Changes in runtime/FFI paths (`magpie_rt`, FFI import/link surfaces, ABI-facing code) require at least one integration fixture run and recorded verification evidence in the PR.
-- For parse/json ABI migration coverage, include `cargo test --test integration_test tresult_parse_json_fixture_parses_and_builds -- --nocapture`.
 
 ## Commit & Pull Request Guidelines
 Recent history favors short, imperative commit subjects, often with optional conventional prefixes (for example `fix(driver): ...`, `docs(benchmark): ...`).  
