@@ -5434,9 +5434,11 @@ fn finalize_build_result(mut result: BuildResult, config: &DriverConfig) -> Buil
             } else if !Path::new(artifact).exists() {
                 // Check for multi-module indexed variants (e.g. hello.0.mpir, hello.1.mpir)
                 let p = Path::new(artifact);
-                if let (Some(parent), Some(stem), Some(ext)) =
-                    (p.parent(), p.file_stem().and_then(|s| s.to_str()), p.extension().and_then(|e| e.to_str()))
-                {
+                if let (Some(parent), Some(stem), Some(ext)) = (
+                    p.parent(),
+                    p.file_stem().and_then(|s| s.to_str()),
+                    p.extension().and_then(|e| e.to_str()),
+                ) {
                     let mut idx = 0;
                     loop {
                         let indexed = parent.join(format!("{stem}.{idx}.{ext}"));

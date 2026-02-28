@@ -105,7 +105,8 @@ fn fixtures_build_via_driver_pipeline() {
     let hello_entry = prepare_fixture_for_build(&fixture_path("hello.mp"));
     let arithmetic_entry = prepare_fixture_for_build(&fixture_path("arithmetic.mp"));
     let harness_entry = prepare_fixture_for_build(&fixture_path("feature_harness.mp"));
-    let tresult_parse_json_entry = prepare_fixture_for_build(&fixture_path("tresult_parse_json.mp"));
+    let tresult_parse_json_entry =
+        prepare_fixture_for_build(&fixture_path("tresult_parse_json.mp"));
     build_entry(&hello_entry);
     build_entry(&arithmetic_entry);
     build_entry(&harness_entry);

@@ -70,7 +70,11 @@ impl<'a> LlvmTextCodegen<'a> {
     fn codegen_module(&mut self) -> Result<String, String> {
         let mut out = String::new();
         let module_init = mangle_init_types(&self.mpir.sid);
-        let main_fn = self.mpir.functions.iter().find(|f| f.name == "main" || f.name == "@main");
+        let main_fn = self
+            .mpir
+            .functions
+            .iter()
+            .find(|f| f.name == "main" || f.name == "@main");
 
         writeln!(out, "; ModuleID = '{}'", llvm_quote(&self.mpir.path))
             .map_err(|e| e.to_string())?;
