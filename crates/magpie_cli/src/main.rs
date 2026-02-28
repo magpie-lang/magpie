@@ -877,10 +877,7 @@ fn execute_with_lli(path: &str, extra_args: &[String]) -> i32 {
 }
 
 fn find_runtime_dylib() -> Option<String> {
-    let search_paths = [
-        "target/debug",
-        "target/release",
-    ];
+    let search_paths = ["target/debug", "target/release"];
     let dylib_names = if cfg!(target_os = "macos") {
         vec!["libmagpie_rt.dylib"]
     } else if cfg!(target_os = "windows") {

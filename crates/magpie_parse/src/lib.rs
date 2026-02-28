@@ -998,13 +998,22 @@ impl<'a, 'd> Parser<'a, 'd> {
                     match key.as_str() {
                         "obj" => obj = self.parse_value_ref(None),
                         "field" => field = Some(self.parse_ident().unwrap_or_default()),
-                        _ => { self.error_here(format!("Unknown key `{}` in getfield", key)); break; }
+                        _ => {
+                            self.error_here(format!("Unknown key `{}` in getfield", key));
+                            break;
+                        }
                     }
                     self.eat(TokenKind::Comma);
                 }
                 self.expect(TokenKind::RBrace);
-                let obj = obj.or_else(|| { self.error_here("Missing key `obj` in getfield"); None })?;
-                let field = field.unwrap_or_else(|| { self.error_here("Missing key `field` in getfield"); String::new() });
+                let obj = obj.or_else(|| {
+                    self.error_here("Missing key `obj` in getfield");
+                    None
+                })?;
+                let field = field.unwrap_or_else(|| {
+                    self.error_here("Missing key `field` in getfield");
+                    String::new()
+                });
                 Some(AstOp::GetField { obj, field })
             }
 
@@ -1589,14 +1598,26 @@ impl<'a, 'd> Parser<'a, 'd> {
                         "obj" => obj = self.parse_value_ref(None),
                         "field" => field = Some(self.parse_ident().unwrap_or_default()),
                         "val" => val = self.parse_value_ref(None),
-                        _ => { self.error_here(format!("Unknown key `{}` in setfield", key)); break; }
+                        _ => {
+                            self.error_here(format!("Unknown key `{}` in setfield", key));
+                            break;
+                        }
                     }
                     self.eat(TokenKind::Comma);
                 }
                 self.expect(TokenKind::RBrace);
-                let obj = obj.or_else(|| { self.error_here("Missing key `obj` in setfield"); None })?;
-                let field = field.unwrap_or_else(|| { self.error_here("Missing key `field` in setfield"); String::new() });
-                let val = val.or_else(|| { self.error_here("Missing key `val` in setfield"); None })?;
+                let obj = obj.or_else(|| {
+                    self.error_here("Missing key `obj` in setfield");
+                    None
+                })?;
+                let field = field.unwrap_or_else(|| {
+                    self.error_here("Missing key `field` in setfield");
+                    String::new()
+                });
+                let val = val.or_else(|| {
+                    self.error_here("Missing key `val` in setfield");
+                    None
+                })?;
                 Some(AstOpVoid::SetField { obj, field, val })
             }
             TokenKind::Panic => {
