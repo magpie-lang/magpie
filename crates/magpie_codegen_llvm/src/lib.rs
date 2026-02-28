@@ -70,7 +70,11 @@ impl<'a> LlvmTextCodegen<'a> {
     fn codegen_module(&mut self) -> Result<String, String> {
         let mut out = String::new();
         let module_init = mangle_init_types(&self.mpir.sid);
-        let main_fn = self.mpir.functions.iter().find(|f| f.name == "main" || f.name == "@main");
+        let main_fn = self
+            .mpir
+            .functions
+            .iter()
+            .find(|f| f.name == "main" || f.name == "@main");
 
         writeln!(out, "; ModuleID = '{}'", llvm_quote(&self.mpir.path))
             .map_err(|e| e.to_string())?;
@@ -1432,7 +1436,8 @@ impl<'a> FnBuilder<'a> {
                 writeln!(self.out, "  {out_slot} = alloca i64").map_err(|e| e.to_string())?;
                 let err_slot = self.tmp();
                 writeln!(self.out, "  {err_slot} = alloca ptr").map_err(|e| e.to_string())?;
-                writeln!(self.out, "  store ptr null, ptr {err_slot}").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {err_slot}")
+                    .map_err(|e| e.to_string())?;
                 let status = self.tmp();
                 writeln!(
                     self.out,
@@ -1440,9 +1445,31 @@ impl<'a> FnBuilder<'a> {
                 )
                 .map_err(|e| e.to_string())?;
                 if matches!(self.cg.kind_of(i.ty), Some(TypeKind::BuiltinResult { .. })) {
-                    let parsed = self.tmp();
-                    writeln!(self.out, "  {parsed} = load i64, ptr {out_slot}")
+                    let is_ok = self.tmp();
+                    writeln!(self.out, "  {is_ok} = icmp eq i32 {status}, 0")
                         .map_err(|e| e.to_string())?;
+                    let ok_label = self.label("str_parse_i64_result_ok");
+                    let fail_label = self.label("str_parse_i64_result_fail");
+                    let join_label = self.label("str_parse_i64_result_join");
+                    writeln!(
+                        self.out,
+                        "  br i1 {is_ok}, label %{ok_label}, label %{fail_label}"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
+                    let parsed_ok = self.tmp();
+                    writeln!(self.out, "  {parsed_ok} = load i64, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{fail_label}:").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{join_label}:").map_err(|e| e.to_string())?;
+                    let parsed = self.tmp();
+                    writeln!(
+                        self.out,
+                        "  {parsed} = phi i64 [{parsed_ok}, %{ok_label}], [0, %{fail_label}]"
+                    )
+                    .map_err(|e| e.to_string())?;
                     let err = self.tmp();
                     writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
                         .map_err(|e| e.to_string())?;
@@ -1478,7 +1505,8 @@ impl<'a> FnBuilder<'a> {
                 writeln!(self.out, "  {out_slot} = alloca i64").map_err(|e| e.to_string())?;
                 let err_slot = self.tmp();
                 writeln!(self.out, "  {err_slot} = alloca ptr").map_err(|e| e.to_string())?;
-                writeln!(self.out, "  store ptr null, ptr {err_slot}").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {err_slot}")
+                    .map_err(|e| e.to_string())?;
                 let status = self.tmp();
                 writeln!(
                     self.out,
@@ -1486,9 +1514,31 @@ impl<'a> FnBuilder<'a> {
                 )
                 .map_err(|e| e.to_string())?;
                 if matches!(self.cg.kind_of(i.ty), Some(TypeKind::BuiltinResult { .. })) {
-                    let parsed = self.tmp();
-                    writeln!(self.out, "  {parsed} = load i64, ptr {out_slot}")
+                    let is_ok = self.tmp();
+                    writeln!(self.out, "  {is_ok} = icmp eq i32 {status}, 0")
                         .map_err(|e| e.to_string())?;
+                    let ok_label = self.label("str_parse_u64_result_ok");
+                    let fail_label = self.label("str_parse_u64_result_fail");
+                    let join_label = self.label("str_parse_u64_result_join");
+                    writeln!(
+                        self.out,
+                        "  br i1 {is_ok}, label %{ok_label}, label %{fail_label}"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
+                    let parsed_ok = self.tmp();
+                    writeln!(self.out, "  {parsed_ok} = load i64, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{fail_label}:").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{join_label}:").map_err(|e| e.to_string())?;
+                    let parsed = self.tmp();
+                    writeln!(
+                        self.out,
+                        "  {parsed} = phi i64 [{parsed_ok}, %{ok_label}], [0, %{fail_label}]"
+                    )
+                    .map_err(|e| e.to_string())?;
                     let err = self.tmp();
                     writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
                         .map_err(|e| e.to_string())?;
@@ -1524,7 +1574,8 @@ impl<'a> FnBuilder<'a> {
                 writeln!(self.out, "  {out_slot} = alloca double").map_err(|e| e.to_string())?;
                 let err_slot = self.tmp();
                 writeln!(self.out, "  {err_slot} = alloca ptr").map_err(|e| e.to_string())?;
-                writeln!(self.out, "  store ptr null, ptr {err_slot}").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {err_slot}")
+                    .map_err(|e| e.to_string())?;
                 let status = self.tmp();
                 writeln!(
                     self.out,
@@ -1532,9 +1583,31 @@ impl<'a> FnBuilder<'a> {
                 )
                 .map_err(|e| e.to_string())?;
                 if matches!(self.cg.kind_of(i.ty), Some(TypeKind::BuiltinResult { .. })) {
-                    let parsed = self.tmp();
-                    writeln!(self.out, "  {parsed} = load double, ptr {out_slot}")
+                    let is_ok = self.tmp();
+                    writeln!(self.out, "  {is_ok} = icmp eq i32 {status}, 0")
                         .map_err(|e| e.to_string())?;
+                    let ok_label = self.label("str_parse_f64_result_ok");
+                    let fail_label = self.label("str_parse_f64_result_fail");
+                    let join_label = self.label("str_parse_f64_result_join");
+                    writeln!(
+                        self.out,
+                        "  br i1 {is_ok}, label %{ok_label}, label %{fail_label}"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
+                    let parsed_ok = self.tmp();
+                    writeln!(self.out, "  {parsed_ok} = load double, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{fail_label}:").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{join_label}:").map_err(|e| e.to_string())?;
+                    let parsed = self.tmp();
+                    writeln!(
+                        self.out,
+                        "  {parsed} = phi double [{parsed_ok}, %{ok_label}], [0.0, %{fail_label}]"
+                    )
+                    .map_err(|e| e.to_string())?;
                     let err = self.tmp();
                     writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
                         .map_err(|e| e.to_string())?;
@@ -1570,7 +1643,8 @@ impl<'a> FnBuilder<'a> {
                 writeln!(self.out, "  {out_slot} = alloca i32").map_err(|e| e.to_string())?;
                 let err_slot = self.tmp();
                 writeln!(self.out, "  {err_slot} = alloca ptr").map_err(|e| e.to_string())?;
-                writeln!(self.out, "  store ptr null, ptr {err_slot}").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {err_slot}")
+                    .map_err(|e| e.to_string())?;
                 let status = self.tmp();
                 writeln!(
                     self.out,
@@ -1578,15 +1652,34 @@ impl<'a> FnBuilder<'a> {
                 )
                 .map_err(|e| e.to_string())?;
                 if matches!(self.cg.kind_of(i.ty), Some(TypeKind::BuiltinResult { .. })) {
-                    let parsed_i32 = self.tmp();
-                    writeln!(self.out, "  {parsed_i32} = load i32, ptr {out_slot}")
+                    let is_ok = self.tmp();
+                    writeln!(self.out, "  {is_ok} = icmp eq i32 {status}, 0")
                         .map_err(|e| e.to_string())?;
-                    let parsed_i1 = self.tmp();
+                    let ok_label = self.label("str_parse_bool_result_ok");
+                    let fail_label = self.label("str_parse_bool_result_fail");
+                    let join_label = self.label("str_parse_bool_result_join");
                     writeln!(
                         self.out,
-                        "  {parsed_i1} = icmp ne i32 {parsed_i32}, 0"
+                        "  br i1 {is_ok}, label %{ok_label}, label %{fail_label}"
                     )
                     .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
+                    let parsed_ok_i32 = self.tmp();
+                    writeln!(self.out, "  {parsed_ok_i32} = load i32, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{fail_label}:").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{join_label}:").map_err(|e| e.to_string())?;
+                    let parsed_i32 = self.tmp();
+                    writeln!(
+                        self.out,
+                        "  {parsed_i32} = phi i32 [{parsed_ok_i32}, %{ok_label}], [0, %{fail_label}]"
+                    )
+                        .map_err(|e| e.to_string())?;
+                    let parsed_i1 = self.tmp();
+                    writeln!(self.out, "  {parsed_i1} = icmp ne i32 {parsed_i32}, 0")
+                        .map_err(|e| e.to_string())?;
                     let err = self.tmp();
                     writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
                         .map_err(|e| e.to_string())?;
@@ -1620,10 +1713,12 @@ impl<'a> FnBuilder<'a> {
                 let v = self.ensure_ptr_value(v)?;
                 let out_slot = self.tmp();
                 writeln!(self.out, "  {out_slot} = alloca ptr").map_err(|e| e.to_string())?;
-                writeln!(self.out, "  store ptr null, ptr {out_slot}").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {out_slot}")
+                    .map_err(|e| e.to_string())?;
                 let err_slot = self.tmp();
                 writeln!(self.out, "  {err_slot} = alloca ptr").map_err(|e| e.to_string())?;
-                writeln!(self.out, "  store ptr null, ptr {err_slot}").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {err_slot}")
+                    .map_err(|e| e.to_string())?;
                 let status = self.tmp();
                 writeln!(
                     self.out,
@@ -1668,10 +1763,12 @@ impl<'a> FnBuilder<'a> {
                 let s = self.ensure_ptr_value(s)?;
                 let out_slot = self.tmp();
                 writeln!(self.out, "  {out_slot} = alloca ptr").map_err(|e| e.to_string())?;
-                writeln!(self.out, "  store ptr null, ptr {out_slot}").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {out_slot}")
+                    .map_err(|e| e.to_string())?;
                 let err_slot = self.tmp();
                 writeln!(self.out, "  {err_slot} = alloca ptr").map_err(|e| e.to_string())?;
-                writeln!(self.out, "  store ptr null, ptr {err_slot}").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {err_slot}")
+                    .map_err(|e| e.to_string())?;
                 let status = self.tmp();
                 writeln!(
                     self.out,

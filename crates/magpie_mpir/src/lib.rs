@@ -1008,7 +1008,10 @@ fn verify_function(
                 // Skip dominance check for async functions: async lowering inserts
                 // a dispatch switch block that breaks standard domination but is
                 // semantically correct (locals are part of coroutine state).
-                if !func.is_async && effective_def != use_blk_idx && !dominates(effective_def, use_blk_idx) {
+                if !func.is_async
+                    && effective_def != use_blk_idx
+                    && !dominates(effective_def, use_blk_idx)
+                {
                     emit_error(
                         diag,
                         "MPS0003",

@@ -5607,7 +5607,10 @@ mod tests {
 
         let mut diag = DiagnosticBag::new(32);
         let result = typecheck_module(&module, &type_ctx, &sym, &mut diag);
-        assert!(result.is_err(), "expected parse result shape to be rejected");
+        assert!(
+            result.is_err(),
+            "expected parse result shape to be rejected"
+        );
         assert!(
             diag.diagnostics.iter().any(|d| d.code == "MPT2033"),
             "expected MPT2033 diagnostics, got {:?}",
