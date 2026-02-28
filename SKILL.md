@@ -587,6 +587,10 @@ Core checks from `typecheck_module` and helpers:
   - `enum.new` invalid variant for `TOption`/`TResult`/user enum etc `MPT2023..MPT2027`
 - Trait impl signature checks `MPT2028..MPT2031`
 - Explicit impl references unknown local function `MPT2032`
+- Parse/JSON migration checks:
+  - result shape mismatch `MPT2033`
+  - input string-handle mismatch/unknown `MPT2034`
+  - `json.encode<T>` value-type mismatch/unknown `MPT2035`
 
 ## 7.3 HIR invariants (`MPHIR*` + SSA)
 
@@ -857,7 +861,7 @@ Stage                     | Primary Codes           | Secondary / Cross-stage
 stage1 (lex/parse)        | MPP0001, MPP0002        | --
 stage2 (resolve)          | MPS0001-MPS0006         | MPF0001, MPS0020-0025
 stage3 (typecheck)        | MPT0001-MPT0003         | MPT1005, MPT1020, MPT1021
-                          | MPT2001-MPT2032         | MPT1023, MPT1030, MPT1200
+                          | MPT2001-MPT2035         | MPT1023, MPT1030, MPT1200
 stage3_5 (async lower)    | MPAS0001 (reserved)     | is_async stays TRUE
 stage4 (verify HIR)       | MPHIR01, MPHIR02        | MPHIR03, MPS0001-0003
 stage5 (ownership)        | MPO0003, MPO0004        | MPO0007, MPO0011
@@ -1214,11 +1218,11 @@ Projection result semantics (ownership layer):
 | `str.len`, `str.slice`, `str.bytes` | input `s` must be borrow/mutborrow | `MPO0004` |
 | `str.eq` | both `a`, `b` must be borrow/mutborrow | `MPO0004` |
 | `str.concat` | operands tracked as value consumers; downstream type compatibility | ownership + downstream |
-| `str.parse_*` | currently limited dedicated static checks in ownership/typecheck layers | downstream/backend checks |
+| `str.parse_*` | input must be `Str`/`borrow Str`; result must be legacy primitive or `TResult<ok, err>` | `MPT2033`, `MPT2034` |
 | `str.builder.new` | creates builder handle | downstream |
 | `str.builder.append_*` | builder target is mutating => unique/mutborrow required | `MPO0004` |
 | `str.builder.build` | builder target is mutating/consuming boundary | `MPO0004` + consumption model |
-| `json.encode` / `json.decode` | generic type + value/string compatibility mostly downstream | sema type-id existence + downstream |
+| `json.encode` / `json.decode` | `encode`: value must match generic `T`; `decode`: input must be string handle; result must be legacy/rawptr or `TResult<rawptr<...>, err>` | `MPT2033`, `MPT2034`, `MPT2035` |
 
 ### 17.10 GPU matrix
 
@@ -1358,6 +1362,9 @@ Use this when diagnosing "use of moved value" (`MPO0007`) vs "move while borrowe
 | MPT2030    | typecheck     | Trait impl first param must be borrow target type     |
 | MPT2031    | typecheck     | Trait impl params must both match borrow target       |
 | MPT2032    | typecheck     | Impl target function missing                          |
+| MPT2033    | typecheck     | Parse/JSON result type shape mismatch                 |
+| MPT2034    | typecheck     | Parse/JSON input must be Str/borrow Str               |
+| MPT2035    | typecheck     | json.encode<T> value type mismatch                    |
 | MPO0003    | ownership     | Borrow escapes scope                                  |
 | MPO0004    | ownership     | Wrong ownership mode for mut/read op                  |
 | MPO0007    | ownership     | Use after move                                        |

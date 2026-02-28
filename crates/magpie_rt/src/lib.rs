@@ -99,6 +99,13 @@ pub const TYPE_ID_F32: u32 = 14;
 pub const TYPE_ID_F64: u32 = 15;
 pub const TYPE_ID_TCALLABLE: u32 = 26;
 
+pub const MP_RT_OK: i32 = 0;
+pub const MP_RT_ERR_INVALID_UTF8: i32 = 1;
+pub const MP_RT_ERR_INVALID_FORMAT: i32 = 2;
+pub const MP_RT_ERR_UNSUPPORTED_TYPE: i32 = 3;
+pub const MP_RT_ERR_NULL_OUT_PTR: i32 = 4;
+pub const MP_RT_ERR_NULL_INPUT: i32 = 5;
+
 // ---------------------------------------------------------------------------
 // Global type registry
 // ---------------------------------------------------------------------------
@@ -1353,6 +1360,37 @@ unsafe fn str_to_rust_str<'a>(s: *mut MpRtHeader) -> &'a str {
     std::str::from_utf8(bytes).expect("invalid utf-8 string")
 }
 
+#[inline]
+unsafe fn str_to_rust_str_checked<'a>(s: *mut MpRtHeader) -> Result<&'a str, i32> {
+    if s.is_null() {
+        return Err(MP_RT_ERR_NULL_INPUT);
+    }
+    if (*s).type_id != TYPE_ID_STR {
+        return Err(MP_RT_ERR_UNSUPPORTED_TYPE);
+    }
+    let base = str_payload_base(s);
+    let len = *(base as *const u64) as usize;
+    let bytes = std::slice::from_raw_parts(base.add(8), len);
+    std::str::from_utf8(bytes).map_err(|_| MP_RT_ERR_INVALID_UTF8)
+}
+
+#[inline]
+unsafe fn set_errmsg(out_errmsg: *mut *mut MpRtHeader, msg: &str) {
+    let owned = mp_rt_str_from_utf8(msg.as_ptr(), msg.len() as u64);
+    if out_errmsg.is_null() {
+        mp_rt_release_strong(owned);
+        return;
+    }
+    *out_errmsg = owned;
+}
+
+#[inline]
+unsafe fn clear_slot<T>(slot: *mut *mut T) {
+    if !slot.is_null() {
+        *slot = std::ptr::null_mut();
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn mp_rt_str_parse_i64(s: *mut MpRtHeader) -> i64 {
     str_to_rust_str(s)
@@ -1383,6 +1421,146 @@ pub unsafe extern "C" fn mp_rt_str_parse_bool(s: *mut MpRtHeader) -> i32 {
         1
     } else {
         0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_str_try_parse_i64(
+    s: *mut MpRtHeader,
+    out: *mut i64,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> i32 {
+    clear_slot(out_errmsg);
+    if out.is_null() {
+        set_errmsg(out_errmsg, "out must not be null");
+        return MP_RT_ERR_NULL_OUT_PTR;
+    }
+    let src = match str_to_rust_str_checked(s) {
+        Ok(src) => src,
+        Err(code) => {
+            match code {
+                MP_RT_ERR_NULL_INPUT => set_errmsg(out_errmsg, "input string must not be null"),
+                MP_RT_ERR_UNSUPPORTED_TYPE => set_errmsg(out_errmsg, "input must be a Str handle"),
+                MP_RT_ERR_INVALID_UTF8 => set_errmsg(out_errmsg, "input string is not valid UTF-8"),
+                _ => set_errmsg(out_errmsg, "string parse failed"),
+            }
+            return code;
+        }
+    };
+    match src.parse::<i64>() {
+        Ok(value) => {
+            *out = value;
+            MP_RT_OK
+        }
+        Err(err) => {
+            set_errmsg(out_errmsg, &format!("str.parse_i64 failed: {err}"));
+            MP_RT_ERR_INVALID_FORMAT
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_str_try_parse_u64(
+    s: *mut MpRtHeader,
+    out: *mut u64,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> i32 {
+    clear_slot(out_errmsg);
+    if out.is_null() {
+        set_errmsg(out_errmsg, "out must not be null");
+        return MP_RT_ERR_NULL_OUT_PTR;
+    }
+    let src = match str_to_rust_str_checked(s) {
+        Ok(src) => src,
+        Err(code) => {
+            match code {
+                MP_RT_ERR_NULL_INPUT => set_errmsg(out_errmsg, "input string must not be null"),
+                MP_RT_ERR_UNSUPPORTED_TYPE => set_errmsg(out_errmsg, "input must be a Str handle"),
+                MP_RT_ERR_INVALID_UTF8 => set_errmsg(out_errmsg, "input string is not valid UTF-8"),
+                _ => set_errmsg(out_errmsg, "string parse failed"),
+            }
+            return code;
+        }
+    };
+    match src.parse::<u64>() {
+        Ok(value) => {
+            *out = value;
+            MP_RT_OK
+        }
+        Err(err) => {
+            set_errmsg(out_errmsg, &format!("str.parse_u64 failed: {err}"));
+            MP_RT_ERR_INVALID_FORMAT
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_str_try_parse_f64(
+    s: *mut MpRtHeader,
+    out: *mut f64,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> i32 {
+    clear_slot(out_errmsg);
+    if out.is_null() {
+        set_errmsg(out_errmsg, "out must not be null");
+        return MP_RT_ERR_NULL_OUT_PTR;
+    }
+    let src = match str_to_rust_str_checked(s) {
+        Ok(src) => src,
+        Err(code) => {
+            match code {
+                MP_RT_ERR_NULL_INPUT => set_errmsg(out_errmsg, "input string must not be null"),
+                MP_RT_ERR_UNSUPPORTED_TYPE => set_errmsg(out_errmsg, "input must be a Str handle"),
+                MP_RT_ERR_INVALID_UTF8 => set_errmsg(out_errmsg, "input string is not valid UTF-8"),
+                _ => set_errmsg(out_errmsg, "string parse failed"),
+            }
+            return code;
+        }
+    };
+    match src.parse::<f64>() {
+        Ok(value) => {
+            *out = value;
+            MP_RT_OK
+        }
+        Err(err) => {
+            set_errmsg(out_errmsg, &format!("str.parse_f64 failed: {err}"));
+            MP_RT_ERR_INVALID_FORMAT
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_str_try_parse_bool(
+    s: *mut MpRtHeader,
+    out: *mut i32,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> i32 {
+    clear_slot(out_errmsg);
+    if out.is_null() {
+        set_errmsg(out_errmsg, "out must not be null");
+        return MP_RT_ERR_NULL_OUT_PTR;
+    }
+    let src = match str_to_rust_str_checked(s) {
+        Ok(src) => src,
+        Err(code) => {
+            match code {
+                MP_RT_ERR_NULL_INPUT => set_errmsg(out_errmsg, "input string must not be null"),
+                MP_RT_ERR_UNSUPPORTED_TYPE => set_errmsg(out_errmsg, "input must be a Str handle"),
+                MP_RT_ERR_INVALID_UTF8 => set_errmsg(out_errmsg, "input string is not valid UTF-8"),
+                _ => set_errmsg(out_errmsg, "string parse failed"),
+            }
+            return code;
+        }
+    };
+    match src.parse::<bool>() {
+        Ok(value) => {
+            *out = if value { 1 } else { 0 };
+            MP_RT_OK
+        }
+        Err(err) => {
+            set_errmsg(out_errmsg, &format!("str.parse_bool failed: {err}"));
+            MP_RT_ERR_INVALID_FORMAT
+        }
     }
 }
 
@@ -1421,8 +1599,16 @@ fn json_unescape_str(s: &str) -> String {
     out
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn mp_rt_json_encode(obj: *mut u8, type_id: u32) -> *mut MpRtHeader {
+unsafe fn json_encode_fallible(
+    obj: *mut u8,
+    type_id: u32,
+) -> Result<*mut MpRtHeader, (i32, String)> {
+    if obj.is_null() {
+        return Err((
+            MP_RT_ERR_NULL_INPUT,
+            "input value must not be null".to_string(),
+        ));
+    }
     let json = match type_id {
         TYPE_ID_BOOL => {
             if *(obj as *const u8) != 0 {
@@ -1442,62 +1628,194 @@ pub unsafe extern "C" fn mp_rt_json_encode(obj: *mut u8, type_id: u32) -> *mut M
         TYPE_ID_F32 => (*(obj as *const f32)).to_string(),
         TYPE_ID_F64 => (*(obj as *const f64)).to_string(),
         TYPE_ID_STR => {
-            let s = str_to_rust_str(obj as *mut MpRtHeader);
+            let s = match str_to_rust_str_checked(obj as *mut MpRtHeader) {
+                Ok(s) => s,
+                Err(MP_RT_ERR_INVALID_UTF8) => {
+                    return Err((
+                        MP_RT_ERR_INVALID_UTF8,
+                        "input string is not valid UTF-8".to_string(),
+                    ))
+                }
+                Err(_) => {
+                    return Err((
+                        MP_RT_ERR_UNSUPPORTED_TYPE,
+                        "input must be a Str handle".to_string(),
+                    ))
+                }
+            };
             format!("\"{}\"", json_escape_str(s))
         }
-        _ => panic!("JSON: unsupported type"),
+        _ => {
+            return Err((
+                MP_RT_ERR_UNSUPPORTED_TYPE,
+                format!("JSON encode unsupported type_id: {type_id}"),
+            ))
+        }
     };
-
-    mp_rt_str_from_utf8(json.as_ptr(), json.len() as u64)
+    Ok(mp_rt_str_from_utf8(json.as_ptr(), json.len() as u64))
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mp_rt_json_decode(json_str: *mut MpRtHeader, type_id: u32) -> *mut u8 {
-    let src = str_to_rust_str(json_str).trim();
-    match type_id {
-        TYPE_ID_BOOL => Box::into_raw(Box::new(
-            if src.parse::<bool>().expect("JSON bool parse failed") {
-                1_u8
-            } else {
-                0_u8
-            },
-        )),
-        TYPE_ID_I8 => {
-            Box::into_raw(Box::new(src.parse::<i8>().expect("JSON i8 parse failed"))) as *mut u8
+pub unsafe extern "C" fn mp_rt_json_encode(obj: *mut u8, type_id: u32) -> *mut MpRtHeader {
+    match json_encode_fallible(obj, type_id) {
+        Ok(encoded) => encoded,
+        Err((_code, msg)) => panic!("{msg}"),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_json_try_encode(
+    obj: *mut u8,
+    type_id: u32,
+    out_str: *mut *mut MpRtHeader,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> i32 {
+    clear_slot(out_str);
+    clear_slot(out_errmsg);
+    if out_str.is_null() {
+        set_errmsg(out_errmsg, "out_str must not be null");
+        return MP_RT_ERR_NULL_OUT_PTR;
+    }
+    match json_encode_fallible(obj, type_id) {
+        Ok(encoded) => {
+            *out_str = encoded;
+            MP_RT_OK
         }
-        TYPE_ID_I16 => {
-            Box::into_raw(Box::new(src.parse::<i16>().expect("JSON i16 parse failed"))) as *mut u8
+        Err((code, msg)) => {
+            set_errmsg(out_errmsg, &msg);
+            code
         }
-        TYPE_ID_I32 => {
-            Box::into_raw(Box::new(src.parse::<i32>().expect("JSON i32 parse failed"))) as *mut u8
-        }
-        TYPE_ID_I64 => {
-            Box::into_raw(Box::new(src.parse::<i64>().expect("JSON i64 parse failed"))) as *mut u8
-        }
-        TYPE_ID_U8 => Box::into_raw(Box::new(src.parse::<u8>().expect("JSON u8 parse failed"))),
-        TYPE_ID_U16 => {
-            Box::into_raw(Box::new(src.parse::<u16>().expect("JSON u16 parse failed"))) as *mut u8
-        }
-        TYPE_ID_U32 => {
-            Box::into_raw(Box::new(src.parse::<u32>().expect("JSON u32 parse failed"))) as *mut u8
-        }
-        TYPE_ID_U64 => {
-            Box::into_raw(Box::new(src.parse::<u64>().expect("JSON u64 parse failed"))) as *mut u8
-        }
-        TYPE_ID_F32 => {
-            Box::into_raw(Box::new(src.parse::<f32>().expect("JSON f32 parse failed"))) as *mut u8
-        }
-        TYPE_ID_F64 => {
-            Box::into_raw(Box::new(src.parse::<f64>().expect("JSON f64 parse failed"))) as *mut u8
-        }
+    }
+}
+
+unsafe fn json_decode_fallible(
+    json_str: *mut MpRtHeader,
+    type_id: u32,
+) -> Result<*mut u8, (i32, String)> {
+    let src = str_to_rust_str_checked(json_str).map_err(|code| match code {
+        MP_RT_ERR_NULL_INPUT => (code, "json input must not be null".to_string()),
+        MP_RT_ERR_UNSUPPORTED_TYPE => (code, "json input must be a Str handle".to_string()),
+        MP_RT_ERR_INVALID_UTF8 => (code, "json input is not valid UTF-8".to_string()),
+        _ => (code, "json decode failed".to_string()),
+    })?;
+    let src = src.trim();
+    let value = match type_id {
+        TYPE_ID_BOOL => Box::into_raw(Box::new(src.parse::<bool>().map_err(|err| {
+            (
+                MP_RT_ERR_INVALID_FORMAT,
+                format!("JSON bool parse failed: {err}"),
+            )
+        })? as u8)),
+        TYPE_ID_I8 => Box::into_raw(Box::new(src.parse::<i8>().map_err(|err| {
+            (
+                MP_RT_ERR_INVALID_FORMAT,
+                format!("JSON i8 parse failed: {err}"),
+            )
+        })?)) as *mut u8,
+        TYPE_ID_I16 => Box::into_raw(Box::new(src.parse::<i16>().map_err(|err| {
+            (
+                MP_RT_ERR_INVALID_FORMAT,
+                format!("JSON i16 parse failed: {err}"),
+            )
+        })?)) as *mut u8,
+        TYPE_ID_I32 => Box::into_raw(Box::new(src.parse::<i32>().map_err(|err| {
+            (
+                MP_RT_ERR_INVALID_FORMAT,
+                format!("JSON i32 parse failed: {err}"),
+            )
+        })?)) as *mut u8,
+        TYPE_ID_I64 => Box::into_raw(Box::new(src.parse::<i64>().map_err(|err| {
+            (
+                MP_RT_ERR_INVALID_FORMAT,
+                format!("JSON i64 parse failed: {err}"),
+            )
+        })?)) as *mut u8,
+        TYPE_ID_U8 => Box::into_raw(Box::new(src.parse::<u8>().map_err(|err| {
+            (
+                MP_RT_ERR_INVALID_FORMAT,
+                format!("JSON u8 parse failed: {err}"),
+            )
+        })?)) as *mut u8,
+        TYPE_ID_U16 => Box::into_raw(Box::new(src.parse::<u16>().map_err(|err| {
+            (
+                MP_RT_ERR_INVALID_FORMAT,
+                format!("JSON u16 parse failed: {err}"),
+            )
+        })?)) as *mut u8,
+        TYPE_ID_U32 => Box::into_raw(Box::new(src.parse::<u32>().map_err(|err| {
+            (
+                MP_RT_ERR_INVALID_FORMAT,
+                format!("JSON u32 parse failed: {err}"),
+            )
+        })?)) as *mut u8,
+        TYPE_ID_U64 => Box::into_raw(Box::new(src.parse::<u64>().map_err(|err| {
+            (
+                MP_RT_ERR_INVALID_FORMAT,
+                format!("JSON u64 parse failed: {err}"),
+            )
+        })?)) as *mut u8,
+        TYPE_ID_F32 => Box::into_raw(Box::new(src.parse::<f32>().map_err(|err| {
+            (
+                MP_RT_ERR_INVALID_FORMAT,
+                format!("JSON f32 parse failed: {err}"),
+            )
+        })?)) as *mut u8,
+        TYPE_ID_F64 => Box::into_raw(Box::new(src.parse::<f64>().map_err(|err| {
+            (
+                MP_RT_ERR_INVALID_FORMAT,
+                format!("JSON f64 parse failed: {err}"),
+            )
+        })?)) as *mut u8,
         TYPE_ID_STR => {
             if src.len() < 2 || !src.starts_with('"') || !src.ends_with('"') {
-                panic!("JSON: unsupported type");
+                return Err((
+                    MP_RT_ERR_INVALID_FORMAT,
+                    "JSON string must be quoted".to_string(),
+                ));
             }
             let unescaped = json_unescape_str(&src[1..src.len() - 1]);
             mp_rt_str_from_utf8(unescaped.as_ptr(), unescaped.len() as u64) as *mut u8
         }
-        _ => panic!("JSON: unsupported type"),
+        _ => {
+            return Err((
+                MP_RT_ERR_UNSUPPORTED_TYPE,
+                format!("JSON decode unsupported type_id: {type_id}"),
+            ))
+        }
+    };
+    Ok(value)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_json_decode(json_str: *mut MpRtHeader, type_id: u32) -> *mut u8 {
+    match json_decode_fallible(json_str, type_id) {
+        Ok(decoded) => decoded,
+        Err((_code, msg)) => panic!("{msg}"),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mp_rt_json_try_decode(
+    json_str: *mut MpRtHeader,
+    type_id: u32,
+    out_val: *mut *mut u8,
+    out_errmsg: *mut *mut MpRtHeader,
+) -> i32 {
+    clear_slot(out_val);
+    clear_slot(out_errmsg);
+    if out_val.is_null() {
+        set_errmsg(out_errmsg, "out_val must not be null");
+        return MP_RT_ERR_NULL_OUT_PTR;
+    }
+    match json_decode_fallible(json_str, type_id) {
+        Ok(decoded) => {
+            *out_val = decoded;
+            MP_RT_OK
+        }
+        Err((code, msg)) => {
+            set_errmsg(out_errmsg, &msg);
+            code
+        }
     }
 }
 
@@ -3376,6 +3694,65 @@ mod tests {
             let s = make_str("-12345");
             assert_eq!(mp_rt_str_parse_i64(s), -12345);
             mp_rt_release_strong(s);
+        }
+    }
+
+    #[test]
+    fn test_str_try_parse_i64_success_and_failure() {
+        unsafe {
+            let good = make_str("-12345");
+            let mut parsed = 0_i64;
+            let mut errmsg: *mut MpRtHeader = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_str_try_parse_i64(good, &mut parsed as *mut i64, &mut errmsg),
+                MP_RT_OK
+            );
+            assert_eq!(parsed, -12345);
+            assert!(errmsg.is_null());
+            mp_rt_release_strong(good);
+
+            let bad = make_str("oops");
+            let mut parsed_bad = 0_i64;
+            let mut bad_errmsg: *mut MpRtHeader = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_str_try_parse_i64(bad, &mut parsed_bad as *mut i64, &mut bad_errmsg),
+                MP_RT_ERR_INVALID_FORMAT
+            );
+            assert!(!bad_errmsg.is_null());
+            mp_rt_release_strong(bad_errmsg);
+            mp_rt_release_strong(bad);
+        }
+    }
+
+    #[test]
+    fn test_json_try_encode_decode_roundtrip_i64() {
+        unsafe {
+            let input = 987_i64;
+            let mut json: *mut MpRtHeader = std::ptr::null_mut();
+            let mut errmsg: *mut MpRtHeader = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_json_try_encode(
+                    (&input as *const i64).cast::<u8>() as *mut u8,
+                    TYPE_ID_I64,
+                    &mut json,
+                    &mut errmsg,
+                ),
+                MP_RT_OK
+            );
+            assert!(!json.is_null());
+            assert!(errmsg.is_null());
+
+            let mut decoded: *mut u8 = std::ptr::null_mut();
+            assert_eq!(
+                mp_rt_json_try_decode(json, TYPE_ID_I64, &mut decoded, &mut errmsg),
+                MP_RT_OK
+            );
+            assert!(!decoded.is_null());
+            assert!(errmsg.is_null());
+            assert_eq!(*(decoded as *const i64), input);
+
+            drop(Box::from_raw(decoded as *mut i64));
+            mp_rt_release_strong(json);
         }
     }
 
