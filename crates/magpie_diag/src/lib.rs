@@ -572,6 +572,9 @@ pub fn explain_code(code: &str) -> Option<String> {
         "MPLINK01" => "Primary native link path failed; fallback started. Fix template: install/configure `llc` + system linker, or rely on clang IR fallback.",
         "MPLINK02" => "Native linking unavailable after fallback. Fix template: install linker toolchain for target triple; use LLVM IR artifacts until toolchain is fixed.",
         "MPT2032" => "Impl binding target missing. Example: `impl trait for Type = @fn` references a function that cannot be resolved. Fix template: define/import the function and ensure the fn_ref matches exactly.",
+        "MPT2033" => "Parse/JSON result shape mismatch. Example: assigning `str.parse_*`/`json.*` to an incompatible destination type. Fix template: use legacy destination shape or `TResult<ok, err>` with the expected ok payload.",
+        "MPT2034" => "Parse/JSON input type mismatch. Example: parse/decode input is not `Str` or `borrow Str`, or input type is unknown. Fix template: pass a string handle and ensure the local's type resolves before the opcode.",
+        "MPT2035" => "json.encode generic/value mismatch. Example: `json.encode<T>` called with value type not equal to `T`. Fix template: align generic `T` with the value type (or cast/convert before encoding).",
         _ => {
             if normalized.starts_with(codes::MPO_PREFIX) {
                 "Ownership remediation: avoid using values after move, shorten borrow lifetimes, and clone only when sharing is required."
