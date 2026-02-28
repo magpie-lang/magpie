@@ -2290,6 +2290,31 @@ const uint8_t* mp_rt_str_bytes(MpRtHeader* str, uint64_t* out_len);
 void mp_rt_panic(MpRtHeader* str_msg) __attribute__((noreturn));
 ```
 
+For parse/json boundary hardening, the runtime MUST also expose fallible status-returning APIs:
+
+```c
+#define MP_RT_OK 0
+#define MP_RT_ERR_INVALID_UTF8 1
+#define MP_RT_ERR_INVALID_FORMAT 2
+#define MP_RT_ERR_UNSUPPORTED_TYPE 3
+#define MP_RT_ERR_NULL_OUT_PTR 4
+#define MP_RT_ERR_NULL_INPUT 5
+
+int32_t mp_rt_str_try_parse_i64(MpRtHeader* s, int64_t* out, MpRtHeader** out_errmsg);
+int32_t mp_rt_str_try_parse_u64(MpRtHeader* s, uint64_t* out, MpRtHeader** out_errmsg);
+int32_t mp_rt_str_try_parse_f64(MpRtHeader* s, double* out, MpRtHeader** out_errmsg);
+int32_t mp_rt_str_try_parse_bool(MpRtHeader* s, int32_t* out, MpRtHeader** out_errmsg);
+int32_t mp_rt_json_try_encode(uint8_t* obj, uint32_t type_id, MpRtHeader** out_str, MpRtHeader** out_errmsg);
+int32_t mp_rt_json_try_decode(MpRtHeader* json_str, uint32_t type_id, uint8_t** out_val, MpRtHeader** out_errmsg);
+```
+
+Error ownership contract:
+
+* On success: `status == MP_RT_OK` and `*out_errmsg == NULL` (when `out_errmsg` is non-NULL).
+* On error: runtime MAY allocate an error `Str` and store it in `*out_errmsg`; caller owns it and MUST release via `mp_rt_release_strong`.
+* If `out_errmsg == NULL`, runtime MUST still return status and drop any temporary error string internally.
+* Legacy panic-oriented entry points (`mp_rt_str_parse_*`, `mp_rt_json_encode`, `mp_rt_json_decode`) remain as compatibility wrappers over `*_try_*`.
+
 #### 20.1.3 `MpRtTypeInfo` struct
 
 ```c
@@ -3803,6 +3828,13 @@ Notes:
 | `str.parse_bool` | `(Str) -> TResult<bool, TParseError>` | Parse "true"/"false" to bool |
 
 `TParseError` is a heap struct: `heap struct TParseError { field message: Str }`
+
+Transitional compatibility note (v0.1 implementation status):
+
+* The language target model remains fallible (`TResult<_, TParseError>`).
+* Current lowering keeps legacy success-only parse/json op shapes for compatibility, but codegen MUST call fallible runtime ABI (`mp_rt_*_try_*`) and branch on status.
+* On non-OK status in this compatibility path, codegen currently calls `mp_rt_panic` with the runtime-provided error string.
+* Direct Rust `panic!`/`expect!` behavior at parse/json FFI boundaries is not allowed for recoverable input failures.
 
 ---
 

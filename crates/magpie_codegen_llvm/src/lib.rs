@@ -190,12 +190,12 @@ impl<'a> LlvmTextCodegen<'a> {
             "declare i64 @mp_rt_bytes_hash(ptr, i64)",
             "declare i32 @mp_rt_bytes_eq(ptr, ptr, i64)",
             "declare i32 @mp_rt_bytes_cmp(ptr, ptr, i64)",
-            "declare ptr @mp_rt_json_encode(ptr, i32)",
-            "declare ptr @mp_rt_json_decode(ptr, i32)",
-            "declare i64 @mp_rt_str_parse_i64(ptr)",
-            "declare i64 @mp_rt_str_parse_u64(ptr)",
-            "declare double @mp_rt_str_parse_f64(ptr)",
-            "declare i32 @mp_rt_str_parse_bool(ptr)",
+            "declare i32 @mp_rt_json_try_encode(ptr, i32, ptr, ptr)",
+            "declare i32 @mp_rt_json_try_decode(ptr, i32, ptr, ptr)",
+            "declare i32 @mp_rt_str_try_parse_i64(ptr, ptr, ptr)",
+            "declare i32 @mp_rt_str_try_parse_u64(ptr, ptr, ptr)",
+            "declare i32 @mp_rt_str_try_parse_f64(ptr, ptr, ptr)",
+            "declare i32 @mp_rt_str_try_parse_bool(ptr, ptr, ptr)",
             "declare ptr @mp_rt_strbuilder_new()",
             "declare void @mp_rt_strbuilder_append_str(ptr, ptr)",
             "declare void @mp_rt_strbuilder_append_i64(ptr, i64)",
@@ -1432,62 +1432,382 @@ impl<'a> FnBuilder<'a> {
             }
             MpirOp::StrParseI64 { s } => {
                 let s = self.ensure_ptr_value(s)?;
-                let parsed = self.tmp();
+                let out_slot = self.tmp();
+                writeln!(self.out, "  {out_slot} = alloca i64").map_err(|e| e.to_string())?;
+                let err_slot = self.tmp();
+                writeln!(self.out, "  {err_slot} = alloca ptr").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {err_slot}")
+                    .map_err(|e| e.to_string())?;
+                let status = self.tmp();
                 writeln!(
                     self.out,
-                    "  {parsed} = call i64 @mp_rt_str_parse_i64(ptr {s})"
+                    "  {status} = call i32 @mp_rt_str_try_parse_i64(ptr {s}, ptr {out_slot}, ptr {err_slot})"
                 )
                 .map_err(|e| e.to_string())?;
-                self.assign_cast_int(i.dst, i.ty, parsed, "i64")?;
+                if matches!(self.cg.kind_of(i.ty), Some(TypeKind::BuiltinResult { .. })) {
+                    let is_ok = self.tmp();
+                    writeln!(self.out, "  {is_ok} = icmp eq i32 {status}, 0")
+                        .map_err(|e| e.to_string())?;
+                    let ok_label = self.label("str_parse_i64_result_ok");
+                    let fail_label = self.label("str_parse_i64_result_fail");
+                    let join_label = self.label("str_parse_i64_result_join");
+                    writeln!(
+                        self.out,
+                        "  br i1 {is_ok}, label %{ok_label}, label %{fail_label}"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
+                    let parsed_ok = self.tmp();
+                    writeln!(self.out, "  {parsed_ok} = load i64, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{fail_label}:").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{join_label}:").map_err(|e| e.to_string())?;
+                    let parsed = self.tmp();
+                    writeln!(
+                        self.out,
+                        "  {parsed} = phi i64 [{parsed_ok}, %{ok_label}], [0, %{fail_label}]"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let err = self.tmp();
+                    writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
+                        .map_err(|e| e.to_string())?;
+                    self.assign_gpu_launch_result(i.dst, i.ty, status, Some(parsed), err)?;
+                } else {
+                    let ok = self.tmp();
+                    writeln!(self.out, "  {ok} = icmp eq i32 {status}, 0")
+                        .map_err(|e| e.to_string())?;
+                    let ok_label = self.label("str_parse_i64_ok");
+                    let panic_label = self.label("str_parse_i64_panic");
+                    writeln!(
+                        self.out,
+                        "  br i1 {ok}, label %{ok_label}, label %{panic_label}"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{panic_label}:").map_err(|e| e.to_string())?;
+                    let err = self.tmp();
+                    writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  call void @mp_rt_panic(ptr {err})")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  unreachable").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
+                    let parsed = self.tmp();
+                    writeln!(self.out, "  {parsed} = load i64, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    self.assign_cast_int(i.dst, i.ty, parsed, "i64")?;
+                }
             }
             MpirOp::StrParseU64 { s } => {
                 let s = self.ensure_ptr_value(s)?;
-                let parsed = self.tmp();
+                let out_slot = self.tmp();
+                writeln!(self.out, "  {out_slot} = alloca i64").map_err(|e| e.to_string())?;
+                let err_slot = self.tmp();
+                writeln!(self.out, "  {err_slot} = alloca ptr").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {err_slot}")
+                    .map_err(|e| e.to_string())?;
+                let status = self.tmp();
                 writeln!(
                     self.out,
-                    "  {parsed} = call i64 @mp_rt_str_parse_u64(ptr {s})"
+                    "  {status} = call i32 @mp_rt_str_try_parse_u64(ptr {s}, ptr {out_slot}, ptr {err_slot})"
                 )
                 .map_err(|e| e.to_string())?;
-                self.assign_cast_int(i.dst, i.ty, parsed, "i64")?;
+                if matches!(self.cg.kind_of(i.ty), Some(TypeKind::BuiltinResult { .. })) {
+                    let is_ok = self.tmp();
+                    writeln!(self.out, "  {is_ok} = icmp eq i32 {status}, 0")
+                        .map_err(|e| e.to_string())?;
+                    let ok_label = self.label("str_parse_u64_result_ok");
+                    let fail_label = self.label("str_parse_u64_result_fail");
+                    let join_label = self.label("str_parse_u64_result_join");
+                    writeln!(
+                        self.out,
+                        "  br i1 {is_ok}, label %{ok_label}, label %{fail_label}"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
+                    let parsed_ok = self.tmp();
+                    writeln!(self.out, "  {parsed_ok} = load i64, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{fail_label}:").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{join_label}:").map_err(|e| e.to_string())?;
+                    let parsed = self.tmp();
+                    writeln!(
+                        self.out,
+                        "  {parsed} = phi i64 [{parsed_ok}, %{ok_label}], [0, %{fail_label}]"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let err = self.tmp();
+                    writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
+                        .map_err(|e| e.to_string())?;
+                    self.assign_gpu_launch_result(i.dst, i.ty, status, Some(parsed), err)?;
+                } else {
+                    let ok = self.tmp();
+                    writeln!(self.out, "  {ok} = icmp eq i32 {status}, 0")
+                        .map_err(|e| e.to_string())?;
+                    let ok_label = self.label("str_parse_u64_ok");
+                    let panic_label = self.label("str_parse_u64_panic");
+                    writeln!(
+                        self.out,
+                        "  br i1 {ok}, label %{ok_label}, label %{panic_label}"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{panic_label}:").map_err(|e| e.to_string())?;
+                    let err = self.tmp();
+                    writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  call void @mp_rt_panic(ptr {err})")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  unreachable").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
+                    let parsed = self.tmp();
+                    writeln!(self.out, "  {parsed} = load i64, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    self.assign_cast_int(i.dst, i.ty, parsed, "i64")?;
+                }
             }
             MpirOp::StrParseF64 { s } => {
                 let s = self.ensure_ptr_value(s)?;
+                let out_slot = self.tmp();
+                writeln!(self.out, "  {out_slot} = alloca double").map_err(|e| e.to_string())?;
+                let err_slot = self.tmp();
+                writeln!(self.out, "  {err_slot} = alloca ptr").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {err_slot}")
+                    .map_err(|e| e.to_string())?;
+                let status = self.tmp();
                 writeln!(
                     self.out,
-                    "  {dst} = call double @mp_rt_str_parse_f64(ptr {s})"
+                    "  {status} = call i32 @mp_rt_str_try_parse_f64(ptr {s}, ptr {out_slot}, ptr {err_slot})"
                 )
                 .map_err(|e| e.to_string())?;
-                self.set_local(i.dst, i.ty, dst_ty, dst);
+                if matches!(self.cg.kind_of(i.ty), Some(TypeKind::BuiltinResult { .. })) {
+                    let is_ok = self.tmp();
+                    writeln!(self.out, "  {is_ok} = icmp eq i32 {status}, 0")
+                        .map_err(|e| e.to_string())?;
+                    let ok_label = self.label("str_parse_f64_result_ok");
+                    let fail_label = self.label("str_parse_f64_result_fail");
+                    let join_label = self.label("str_parse_f64_result_join");
+                    writeln!(
+                        self.out,
+                        "  br i1 {is_ok}, label %{ok_label}, label %{fail_label}"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
+                    let parsed_ok = self.tmp();
+                    writeln!(self.out, "  {parsed_ok} = load double, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{fail_label}:").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{join_label}:").map_err(|e| e.to_string())?;
+                    let parsed = self.tmp();
+                    writeln!(
+                        self.out,
+                        "  {parsed} = phi double [{parsed_ok}, %{ok_label}], [0.0, %{fail_label}]"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let err = self.tmp();
+                    writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
+                        .map_err(|e| e.to_string())?;
+                    self.assign_gpu_launch_result(i.dst, i.ty, status, Some(parsed), err)?;
+                } else {
+                    let ok = self.tmp();
+                    writeln!(self.out, "  {ok} = icmp eq i32 {status}, 0")
+                        .map_err(|e| e.to_string())?;
+                    let ok_label = self.label("str_parse_f64_ok");
+                    let panic_label = self.label("str_parse_f64_panic");
+                    writeln!(
+                        self.out,
+                        "  br i1 {ok}, label %{ok_label}, label %{panic_label}"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{panic_label}:").map_err(|e| e.to_string())?;
+                    let err = self.tmp();
+                    writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  call void @mp_rt_panic(ptr {err})")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  unreachable").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
+                    let parsed = self.tmp();
+                    writeln!(self.out, "  {parsed} = load double, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    self.set_local(i.dst, i.ty, dst_ty, parsed);
+                }
             }
             MpirOp::StrParseBool { s } => {
                 let s = self.ensure_ptr_value(s)?;
-                let parsed = self.tmp();
+                let out_slot = self.tmp();
+                writeln!(self.out, "  {out_slot} = alloca i32").map_err(|e| e.to_string())?;
+                let err_slot = self.tmp();
+                writeln!(self.out, "  {err_slot} = alloca ptr").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {err_slot}")
+                    .map_err(|e| e.to_string())?;
+                let status = self.tmp();
                 writeln!(
                     self.out,
-                    "  {parsed} = call i32 @mp_rt_str_parse_bool(ptr {s})"
+                    "  {status} = call i32 @mp_rt_str_try_parse_bool(ptr {s}, ptr {out_slot}, ptr {err_slot})"
                 )
                 .map_err(|e| e.to_string())?;
-                self.assign_cast_int(i.dst, i.ty, parsed, "i32")?;
+                if matches!(self.cg.kind_of(i.ty), Some(TypeKind::BuiltinResult { .. })) {
+                    let is_ok = self.tmp();
+                    writeln!(self.out, "  {is_ok} = icmp eq i32 {status}, 0")
+                        .map_err(|e| e.to_string())?;
+                    let ok_label = self.label("str_parse_bool_result_ok");
+                    let fail_label = self.label("str_parse_bool_result_fail");
+                    let join_label = self.label("str_parse_bool_result_join");
+                    writeln!(
+                        self.out,
+                        "  br i1 {is_ok}, label %{ok_label}, label %{fail_label}"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
+                    let parsed_ok_i32 = self.tmp();
+                    writeln!(self.out, "  {parsed_ok_i32} = load i32, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{fail_label}:").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  br label %{join_label}").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{join_label}:").map_err(|e| e.to_string())?;
+                    let parsed_i32 = self.tmp();
+                    writeln!(
+                        self.out,
+                        "  {parsed_i32} = phi i32 [{parsed_ok_i32}, %{ok_label}], [0, %{fail_label}]"
+                    )
+                        .map_err(|e| e.to_string())?;
+                    let parsed_i1 = self.tmp();
+                    writeln!(self.out, "  {parsed_i1} = icmp ne i32 {parsed_i32}, 0")
+                        .map_err(|e| e.to_string())?;
+                    let err = self.tmp();
+                    writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
+                        .map_err(|e| e.to_string())?;
+                    self.assign_gpu_launch_result(i.dst, i.ty, status, Some(parsed_i1), err)?;
+                } else {
+                    let ok = self.tmp();
+                    writeln!(self.out, "  {ok} = icmp eq i32 {status}, 0")
+                        .map_err(|e| e.to_string())?;
+                    let ok_label = self.label("str_parse_bool_ok");
+                    let panic_label = self.label("str_parse_bool_panic");
+                    writeln!(
+                        self.out,
+                        "  br i1 {ok}, label %{ok_label}, label %{panic_label}"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{panic_label}:").map_err(|e| e.to_string())?;
+                    let err = self.tmp();
+                    writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  call void @mp_rt_panic(ptr {err})")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  unreachable").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
+                    let parsed = self.tmp();
+                    writeln!(self.out, "  {parsed} = load i32, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    self.assign_cast_int(i.dst, i.ty, parsed, "i32")?;
+                }
             }
             MpirOp::JsonEncode { ty, v } => {
                 let v = self.ensure_ptr_value(v)?;
+                let out_slot = self.tmp();
+                writeln!(self.out, "  {out_slot} = alloca ptr").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {out_slot}")
+                    .map_err(|e| e.to_string())?;
+                let err_slot = self.tmp();
+                writeln!(self.out, "  {err_slot} = alloca ptr").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {err_slot}")
+                    .map_err(|e| e.to_string())?;
+                let status = self.tmp();
                 writeln!(
                     self.out,
-                    "  {dst} = call ptr @mp_rt_json_encode(ptr {v}, i32 {})",
+                    "  {status} = call i32 @mp_rt_json_try_encode(ptr {v}, i32 {}, ptr {out_slot}, ptr {err_slot})",
                     ty.0
                 )
                 .map_err(|e| e.to_string())?;
-                self.set_local(i.dst, i.ty, dst_ty, dst);
+                if matches!(self.cg.kind_of(i.ty), Some(TypeKind::BuiltinResult { .. })) {
+                    let json = self.tmp();
+                    writeln!(self.out, "  {json} = load ptr, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    let err = self.tmp();
+                    writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
+                        .map_err(|e| e.to_string())?;
+                    self.assign_gpu_launch_result(i.dst, i.ty, status, Some(json), err)?;
+                } else {
+                    let ok = self.tmp();
+                    writeln!(self.out, "  {ok} = icmp eq i32 {status}, 0")
+                        .map_err(|e| e.to_string())?;
+                    let ok_label = self.label("json_encode_ok");
+                    let panic_label = self.label("json_encode_panic");
+                    writeln!(
+                        self.out,
+                        "  br i1 {ok}, label %{ok_label}, label %{panic_label}"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{panic_label}:").map_err(|e| e.to_string())?;
+                    let err = self.tmp();
+                    writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  call void @mp_rt_panic(ptr {err})")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  unreachable").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
+                    let json = self.tmp();
+                    writeln!(self.out, "  {json} = load ptr, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    self.set_local(i.dst, i.ty, dst_ty, json);
+                }
             }
             MpirOp::JsonDecode { ty, s } => {
                 let s = self.ensure_ptr_value(s)?;
+                let out_slot = self.tmp();
+                writeln!(self.out, "  {out_slot} = alloca ptr").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {out_slot}")
+                    .map_err(|e| e.to_string())?;
+                let err_slot = self.tmp();
+                writeln!(self.out, "  {err_slot} = alloca ptr").map_err(|e| e.to_string())?;
+                writeln!(self.out, "  store ptr null, ptr {err_slot}")
+                    .map_err(|e| e.to_string())?;
+                let status = self.tmp();
                 writeln!(
                     self.out,
-                    "  {dst} = call ptr @mp_rt_json_decode(ptr {s}, i32 {})",
+                    "  {status} = call i32 @mp_rt_json_try_decode(ptr {s}, i32 {}, ptr {out_slot}, ptr {err_slot})",
                     ty.0
                 )
                 .map_err(|e| e.to_string())?;
-                self.set_local(i.dst, i.ty, dst_ty, dst);
+                if matches!(self.cg.kind_of(i.ty), Some(TypeKind::BuiltinResult { .. })) {
+                    let decoded = self.tmp();
+                    writeln!(self.out, "  {decoded} = load ptr, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    let err = self.tmp();
+                    writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
+                        .map_err(|e| e.to_string())?;
+                    self.assign_gpu_launch_result(i.dst, i.ty, status, Some(decoded), err)?;
+                } else {
+                    let ok = self.tmp();
+                    writeln!(self.out, "  {ok} = icmp eq i32 {status}, 0")
+                        .map_err(|e| e.to_string())?;
+                    let ok_label = self.label("json_decode_ok");
+                    let panic_label = self.label("json_decode_panic");
+                    writeln!(
+                        self.out,
+                        "  br i1 {ok}, label %{ok_label}, label %{panic_label}"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{panic_label}:").map_err(|e| e.to_string())?;
+                    let err = self.tmp();
+                    writeln!(self.out, "  {err} = load ptr, ptr {err_slot}")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  call void @mp_rt_panic(ptr {err})")
+                        .map_err(|e| e.to_string())?;
+                    writeln!(self.out, "  unreachable").map_err(|e| e.to_string())?;
+                    writeln!(self.out, "{ok_label}:").map_err(|e| e.to_string())?;
+                    let decoded = self.tmp();
+                    writeln!(self.out, "  {decoded} = load ptr, ptr {out_slot}")
+                        .map_err(|e| e.to_string())?;
+                    self.set_local(i.dst, i.ty, dst_ty, decoded);
+                }
             }
             MpirOp::GpuThreadId
             | MpirOp::GpuWorkgroupId
@@ -3155,7 +3475,7 @@ impl<'a> FnBuilder<'a> {
             writeln!(self.out, "  {is_ok} = icmp eq i32 {status}, 0").map_err(|e| e.to_string())?;
 
             let ok0 = self.tmp();
-            writeln!(self.out, "  {ok0} = insertvalue {agg_ty} undef, i1 1, 0")
+            writeln!(self.out, "  {ok0} = insertvalue {agg_ty} undef, i1 0, 0")
                 .map_err(|e| e.to_string())?;
             let ok1 = self.tmp();
             writeln!(
@@ -3171,7 +3491,7 @@ impl<'a> FnBuilder<'a> {
             .map_err(|e| e.to_string())?;
 
             let err0 = self.tmp();
-            writeln!(self.out, "  {err0} = insertvalue {agg_ty} undef, i1 0, 0")
+            writeln!(self.out, "  {err0} = insertvalue {agg_ty} undef, i1 1, 0")
                 .map_err(|e| e.to_string())?;
             let err1 = self.tmp();
             writeln!(
@@ -4924,6 +5244,297 @@ mod tests {
         assert!(llvm_ir.contains("declare ptr @mp_rt_str_from_utf8(ptr, i64)"));
         assert!(llvm_ir.contains("alloca [5 x i8]"));
         assert!(llvm_ir.contains("call ptr @mp_rt_str_from_utf8"));
+    }
+
+    #[test]
+    fn test_codegen_parse_json_use_fallible_runtime_apis() {
+        let mut type_ctx = TypeCtx::new();
+        let str_ty = fixed_type_ids::STR;
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let i64_ty = type_ctx.lookup_by_prim(PrimType::I64);
+        let raw_ptr_ty = type_ctx.intern(TypeKind::RawPtr {
+            to: fixed_type_ids::U8,
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:TRYFFI0000".to_string()),
+            path: "tryffi.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:TRYFFI0000".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![
+                        MpirInstr {
+                            dst: magpie_types::LocalId(0),
+                            ty: str_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: str_ty,
+                                lit: HirConstLit::StringLit("42".to_string()),
+                            }),
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(1),
+                            ty: i64_ty,
+                            op: MpirOp::StrParseI64 {
+                                s: MpirValue::Local(magpie_types::LocalId(0)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(2),
+                            ty: raw_ptr_ty,
+                            op: MpirOp::PtrNull { to: raw_ptr_ty },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(3),
+                            ty: str_ty,
+                            op: MpirOp::JsonEncode {
+                                ty: fixed_type_ids::I32,
+                                v: MpirValue::Local(magpie_types::LocalId(2)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(4),
+                            ty: raw_ptr_ty,
+                            op: MpirOp::JsonDecode {
+                                ty: fixed_type_ids::I32,
+                                s: MpirValue::Local(magpie_types::LocalId(3)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(5),
+                            ty: i32_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(0),
+                            }),
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        5,
+                    )))),
+                }],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: str_ty,
+                        name: "s".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: i64_ty,
+                        name: "parsed".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: raw_ptr_ty,
+                        name: "raw_ptr".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(3),
+                        ty: str_ty,
+                        name: "json".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(4),
+                        ty: raw_ptr_ty,
+                        name: "decoded".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(5),
+                        ty: i32_ty,
+                        name: "retv".to_string(),
+                    },
+                ],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("declare i32 @mp_rt_str_try_parse_i64(ptr, ptr, ptr)"));
+        assert!(llvm_ir.contains("declare i32 @mp_rt_json_try_encode(ptr, i32, ptr, ptr)"));
+        assert!(llvm_ir.contains("declare i32 @mp_rt_json_try_decode(ptr, i32, ptr, ptr)"));
+        assert!(llvm_ir.contains("call i32 @mp_rt_str_try_parse_i64"));
+        assert!(llvm_ir.contains("call i32 @mp_rt_json_try_encode"));
+        assert!(llvm_ir.contains("call i32 @mp_rt_json_try_decode"));
+        assert!(llvm_ir.contains("call void @mp_rt_panic(ptr"));
+        assert!(!llvm_ir.contains("call i64 @mp_rt_str_parse_i64"));
+        assert!(!llvm_ir.contains("call ptr @mp_rt_json_encode"));
+        assert!(!llvm_ir.contains("call ptr @mp_rt_json_decode"));
+    }
+
+    #[test]
+    fn test_codegen_parse_result_shape_builds_tresult_without_panic() {
+        let mut type_ctx = TypeCtx::new();
+        let str_ty = fixed_type_ids::STR;
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let i64_ty = type_ctx.lookup_by_prim(PrimType::I64);
+        let parse_result_ty = type_ctx.intern(TypeKind::BuiltinResult {
+            ok: i64_ty,
+            err: fixed_type_ids::STR,
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:TRYRESULT0".to_string()),
+            path: "try_result.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:TRYRESULT0".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![
+                        MpirInstr {
+                            dst: magpie_types::LocalId(0),
+                            ty: str_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: str_ty,
+                                lit: HirConstLit::StringLit("42".to_string()),
+                            }),
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(1),
+                            ty: parse_result_ty,
+                            op: MpirOp::StrParseI64 {
+                                s: MpirValue::Local(magpie_types::LocalId(0)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(2),
+                            ty: i32_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(0),
+                            }),
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        2,
+                    )))),
+                }],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: str_ty,
+                        name: "s".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: parse_result_ty,
+                        name: "r".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: i32_ty,
+                        name: "retv".to_string(),
+                    },
+                ],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("call i32 @mp_rt_str_try_parse_i64"));
+        assert!(llvm_ir.contains("insertvalue { i1, i64, ptr }"));
+        assert!(llvm_ir.contains("insertvalue { i1, i64, ptr } undef, i1 0, 0"));
+        assert!(llvm_ir.contains("insertvalue { i1, i64, ptr } undef, i1 1, 0"));
+        assert!(!llvm_ir.contains("str_parse_i64_panic"));
+        assert!(!llvm_ir.contains("call void @mp_rt_panic"));
+    }
+
+    #[test]
+    fn test_codegen_json_decode_result_shape_builds_tresult_without_panic() {
+        let mut type_ctx = TypeCtx::new();
+        let str_ty = fixed_type_ids::STR;
+        let i32_ty = type_ctx.lookup_by_prim(PrimType::I32);
+        let raw_ptr_ty = type_ctx.intern(TypeKind::RawPtr {
+            to: fixed_type_ids::U8,
+        });
+        let decode_result_ty = type_ctx.intern(TypeKind::BuiltinResult {
+            ok: raw_ptr_ty,
+            err: fixed_type_ids::STR,
+        });
+
+        let module = MpirModule {
+            sid: Sid("M:JSONRESULT0".to_string()),
+            path: "json_result.mp".to_string(),
+            type_table: MpirTypeTable { types: vec![] },
+            functions: vec![MpirFn {
+                sid: Sid("F:JSONRESULT0".to_string()),
+                name: "main".to_string(),
+                params: vec![],
+                ret_ty: i32_ty,
+                blocks: vec![MpirBlock {
+                    id: magpie_types::BlockId(0),
+                    instrs: vec![
+                        MpirInstr {
+                            dst: magpie_types::LocalId(0),
+                            ty: str_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: str_ty,
+                                lit: HirConstLit::StringLit("42".to_string()),
+                            }),
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(1),
+                            ty: decode_result_ty,
+                            op: MpirOp::JsonDecode {
+                                ty: fixed_type_ids::I32,
+                                s: MpirValue::Local(magpie_types::LocalId(0)),
+                            },
+                        },
+                        MpirInstr {
+                            dst: magpie_types::LocalId(2),
+                            ty: i32_ty,
+                            op: MpirOp::Const(HirConst {
+                                ty: i32_ty,
+                                lit: HirConstLit::IntLit(0),
+                            }),
+                        },
+                    ],
+                    void_ops: vec![],
+                    terminator: MpirTerminator::Ret(Some(MpirValue::Local(magpie_types::LocalId(
+                        2,
+                    )))),
+                }],
+                locals: vec![
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(0),
+                        ty: str_ty,
+                        name: "s".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(1),
+                        ty: decode_result_ty,
+                        name: "r".to_string(),
+                    },
+                    MpirLocalDecl {
+                        id: magpie_types::LocalId(2),
+                        ty: i32_ty,
+                        name: "retv".to_string(),
+                    },
+                ],
+                is_async: false,
+            }],
+            globals: vec![],
+        };
+
+        let llvm_ir = codegen_module(&module, &type_ctx).expect("codegen should succeed");
+        assert!(llvm_ir.contains("call i32 @mp_rt_json_try_decode"));
+        assert!(llvm_ir.contains("insertvalue { i1, ptr, ptr }"));
+        assert!(llvm_ir.contains("insertvalue { i1, ptr, ptr } undef, i1 0, 0"));
+        assert!(llvm_ir.contains("insertvalue { i1, ptr, ptr } undef, i1 1, 0"));
+        assert!(!llvm_ir.contains("json_decode_panic"));
+        assert!(!llvm_ir.contains("call void @mp_rt_panic"));
     }
 
     #[test]
