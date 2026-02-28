@@ -7,6 +7,10 @@ edition.workspace = true
 name = "integration_test"
 path = "../../tests/integration_test.rs"
 
+[[test]]
+name = "compiler_vectors_test"
+path = "../../tests/compiler_vectors_test.rs"
+
 [dependencies]
 magpie_ast = { path = "../magpie_ast" }
 magpie_lex = { path = "../magpie_lex" }
