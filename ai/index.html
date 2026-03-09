@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Backend - Magpie Language</title>
+    <meta name="description"
+        content="torch-magpie: A PyTorch reimplementation in Rust serving as the AI backend for Magpie.">
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Fira+Code:wght@400;500&display=swap"
+        rel="stylesheet">
+
+    <!-- CSS (linking to parent directory) -->
+    <link rel="stylesheet" href="../style.css">
+
+    <!-- Favicon -->
+    <link rel="icon"
+        href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐦</text></svg>">
+</head>
+
+<body>
+    <!-- Navbar -->
+    <nav class="navbar">
+        <div class="container nav-container">
+            <div class="logo">
+                <span class="logo-emoji">🐦</span>
+                <span class="logo-text">Magpie</span>
+            </div>
+            <div class="nav-links">
+                <a href="/">Home</a>
+                <a href="#why-torch-magpie">Why torch-magpie?</a>
+                <a href="#benchmarks">Benchmarks</a>
+                <a href="https://github.com/magpie-lang/torch-magpie/blob/main/DOCUMENTATION.md" target="_blank"
+                    class="nav-btn-secondary">Docs</a>
+                <a href="https://github.com/magpie-lang/magpie/blob/main/DOCUMENTATION_QUICKSTART.md" target="_blank"
+                    class="nav-btn-primary">Quickstart</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero Section -->
+    <section class="hero">
+        <div class="container hero-container">
+            <div class="hero-content">
+                <h1 class="hero-title"><span class="highlight">Magpie is an AI-native language.</span></h1>
+                <p class="hero-subtitle">Powered by <strong>torch-magpie</strong>: A complete PyTorch reimplementation
+                    in Rust, purpose-built as the tensor backend for the Magpie compiler. GPU-accelerated deep learning
+                    on Apple Silicon.</p>
+                <div class="hero-cta">
+                    <a href="https://github.com/magpie-lang/torch-magpie" target="_blank" class="btn btn-primary">View
+                        on GitHub</a>
+                    <a href="https://github.com/magpie-lang/torch-magpie/blob/main/DOCUMENTATION.md" target="_blank"
+                        class="btn btn-secondary">API Reference</a>
+                </div>
+            </div>
+
+            <!-- Terminal Chatbot -->
+            <div class="terminal-wrapper">
+                <div class="terminal-header">
+                    <div class="terminal-dots">
+                        <span class="dot red"></span>
+                        <span class="dot yellow"></span>
+                        <span class="dot green"></span>
+                    </div>
+                    <div class="terminal-title">torch-magpie-guide ~ bash</div>
+                </div>
+                <div class="terminal-body" id="chatWindow">
+                    <div class="chat-message bot-message">
+                        <span class="prompt">torch-magpie></span> Hello! I'm the torch-magpie guide. Ask me anything
+                        about the MLX-powered PyTorch backend.
+                    </div>
+                    <div class="chat-suggestions" id="chatSuggestions">
+                        <button class="suggestion-btn" data-query="Why is torch-magpie faster than MPS?">Why is
+                            torch-magpie faster than MPS?</button>
+                        <button class="suggestion-btn" data-query="How does MLX integration work?">How does MLX
+                            integration work?</button>
+                        <button class="suggestion-btn" data-query="Does it support Llama 100k context?">Does it support
+                            Llama 100k context?</button>
+                        <button class="suggestion-btn" data-query="Is the KV-cache kept on GPU?">Is the KV-cache kept on
+                            GPU?</button>
+                        <button class="suggestion-btn" data-query="What is the 3-Tier GPU Dispatch?">What is the 3-Tier
+                            GPU Dispatch?</button>
+                        <button class="suggestion-btn" data-query="Are transformer layers fused?">Are transformer layers
+                            fused?</button>
+                        <button class="suggestion-btn" data-query="Why a complete Rust rewrite?">Why a complete Rust
+                            rewrite?</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Why Section -->
+    <section id="why-torch-magpie" class="why-section">
+        <div class="container">
+            <div class="why-header">
+                <h2>Why torch-magpie?</h2>
+                <p>Modern deep learning frameworks introduce overhead for every tensor operation. Torch-magpie takes a
+                    different approach.</p>
+            </div>
+
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">⛓️</div>
+                    <h3>Fused Transformer Layers</h3>
+                    <p>It fuses entire transformer layers into lazy MLX computation graphs submitted as single Metal
+                        command buffers, eliminating intermediate tensor allocations.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🚀</div>
+                    <h3>GPU-Resident KV-Cache</h3>
+                    <p>Key/value caches are stored directly on the GPU. There is absolutely no CPU round-trip during
+                        autoregressive decoding, leading to maximum throughput.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">💾</div>
+                    <h3>Memory-Efficient Attention</h3>
+                    <p>Utilizing MLX's tiled scaled dot-product attention kernel allows for 100k-token prefill sequences
+                        that traditional PyTorch MPS cannot run due to memory constraints.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Benchmarks Section -->
+    <section id="benchmarks" class="benchmark-section bg-light">
+        <div class="container">
+            <h2 class="section-title">The Numbers Speak for Themselves</h2>
+            <p class="section-subtitle">Benchmarked on Apple M1 Pro (10-core CPU, 16-core GPU): PyTorch 2.8.0 MPS vs
+                torch-magpie MLX.</p>
+
+            <div class="benchmark-grid">
+                <!-- BERT Training -->
+                <div class="benchmark-card fade-up">
+                    <div class="card-header">
+                        <h3>BERT Training</h3>
+                        <span class="badge green">1.41x Speedup</span>
+                    </div>
+                    <p class="card-desc">Time per step (6L/768H, batch=4).</p>
+                    <div class="bar-chart">
+                        <div class="bar-row">
+                            <div class="bar-label" style="width: 100px;">Magpie</div>
+                            <div class="bar-track">
+                                <div class="bar-fill primary" style="width: 71%;">110.8 ms</div>
+                            </div>
+                        </div>
+                        <div class="bar-row">
+                            <div class="bar-label" style="width: 100px;">PyTorch</div>
+                            <div class="bar-track">
+                                <div class="bar-fill secondary" style="width: 100%;">155.9 ms</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- GPT-2 Prefill -->
+                <div class="benchmark-card fade-up delay-1">
+                    <div class="card-header">
+                        <h3>GPT-2 Prefill</h3>
+                        <span class="badge green">2.85x Speedup</span>
+                    </div>
+                    <p class="card-desc">Time for 128 tokens.</p>
+                    <div class="bar-chart">
+                        <div class="bar-row">
+                            <div class="bar-label" style="width: 100px;">Magpie</div>
+                            <div class="bar-track">
+                                <div class="bar-fill primary" style="width: 35%;">6.8 ms</div>
+                            </div>
+                        </div>
+                        <div class="bar-row">
+                            <div class="bar-label" style="width: 100px;">PyTorch</div>
+                            <div class="bar-track">
+                                <div class="bar-fill secondary" style="width: 100%;">19.4 ms</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- GPT-2 Decode -->
+                <div class="benchmark-card fade-up delay-2">
+                    <div class="card-header">
+                        <h3>GPT-2 Decode</h3>
+                        <span class="badge green">2.29x Faster</span>
+                    </div>
+                    <p class="card-desc">Tokens per second (6L/768H, greedy).</p>
+                    <div class="bar-chart">
+                        <div class="bar-row">
+                            <div class="bar-label" style="width: 100px;">Magpie</div>
+                            <div class="bar-track">
+                                <div class="bar-fill primary" style="width: 100%;">294.5 tok/s</div>
+                            </div>
+                        </div>
+                        <div class="bar-row">
+                            <div class="bar-label" style="width: 100px;">PyTorch</div>
+                            <div class="bar-track">
+                                <div class="bar-fill secondary" style="width: 43%;">128.6 tok/s</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Llama Prefill -->
+                <div class="benchmark-card fade-up delay-3">
+                    <div class="card-header">
+                        <h3>Llama-3.2-1B Prefill</h3>
+                        <span class="badge green">100k Token Capable</span>
+                    </div>
+                    <p class="card-desc">PyTorch OOMs on 100k tokens. Magpie handles it easily.</p>
+                    <div class="bar-chart">
+                        <div class="bar-row">
+                            <div class="bar-label" style="width: 100px;">Magpie</div>
+                            <div class="bar-track">
+                                <div class="bar-fill primary" style="width: 100%;">316 tok/s (100k tok)</div>
+                            </div>
+                        </div>
+                        <div class="bar-row">
+                            <div class="bar-label" style="width: 100px;">PyTorch</div>
+                            <div class="bar-track">
+                                <div class="bar-fill secondary"
+                                    style="width: 5%; overflow: visible; color: var(--text-muted); background-color: var(--border-color); padding-left: 0.5rem;">
+                                    <span style="position: absolute; left: 120px;">FAILED OOM</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+            <div style="text-align: center; margin-top: 3rem;">
+                <a href="https://github.com/magpie-lang/torch-magpie/blob/main/benchmark/report/BENCHMARK_REPORT.md"
+                    target="_blank" class="btn btn-secondary btn-large">View Detailed Report</a>
+            </div>
+        </div>
+    </section>
+
+    <!-- Architecture Section -->
+    <section id="architecture" class="features-section">
+        <div class="container" style="padding: 8rem 0;">
+            <div class="why-header">
+                <h2>3-Tier GPU Dispatch</h2>
+                <p>Every tensor operation follows a dispatch chain that maximizes GPU utilization.</p>
+            </div>
+            <div class="code-comparison" style="margin-top: 2rem;">
+                <div class="code-column" style="grid-column: 1 / -1;">
+                    <div class="code-header">
+                        <span class="code-title">Architecture Layers</span>
+                    </div>
+                    <div class="code-block magpie-code">
+                        <pre><code><span class="comment">; 1. MLX</span>
+Lazy evaluation on Apple Silicon GPU via MLX library. Operations are deferred 
+and batched into a single Metal command buffer.
+
+<span class="comment">; 2. Metal</span>
+Custom Metal Shading Language kernels for operations not covered by MLX 
+(batched matmul, elementwise ops, softmax).
+
+<span class="comment">; 3. CPU</span>
+Rust implementation as final fallback ensuring full op coverage.</code></pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container footer-container">
+            <div class="footer-cta">
+                <h2>The Future of AI Backends</h2>
+                <div class="footer-buttons">
+                    <a href="https://github.com/magpie-lang/torch-magpie" target="_blank"
+                        class="btn btn-primary btn-large">View GitHub Repo</a>
+                    <a href="/" class="btn btn-secondary btn-large">Back to Magpie</a>
+                </div>
+            </div>
+            <div class="footer-bottom">
+                <div class="logo">
+                    <span class="logo-emoji">🐦</span>
+                    <span class="logo-text">Magpie</span>
+                </div>
+                <p>&copy; 2026 Magpie Language Developers.</p>
+            </div>
+        </div>
+    </footer>
+
+    <!-- JS -->
+    <script src="../script.js"></script>
+</body>
+
+</html>
